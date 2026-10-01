@@ -38,69 +38,6 @@ extern int64_t local_sent_messages, local_recv_messages;
 extern std::unordered_set<MPI_Comm> active_comms;
 extern dmtcp::vector<mpi_message_t*> g_message_queue;
 
-// State of a single pending blocking MPI_Recv.
-//
-// MANA does not support MPI_THREAD_MULTIPLE.  Therefore at most one
-// MPI_Recv can be in flight per process at any time, and a single
-// global slot suffices to record its parameters.  If MPI_THREAD_MULTIPLE
-// support is ever added, this slot will need to become per-thread, and
-// the kvdb publish in unblockPendingRecvs() will need to publish a list.
-//
-// 'state' is changed by the MPI_Recv wrapper and by unblockPendingRecvs(),
-// which runs in the DMTCP checkpoint thread during pre-suspend:
-//   PENDING_RECV_IDLE:   no MPI_Recv is in the lower half.
-//   PENDING_RECV_ACTIVE: an MPI_Recv is in, or entering, the lower half, and
-//                        the fields below describe it.
-//   PENDING_RECV_CLOSED: unblockPendingRecvs() has taken its snapshot (or a
-//                        dummy has completed the MPI_Recv).  No MPI_Recv may
-//                        enter the lower half until resume or restart
-//                        (resetDrainCounters()) sets PENDING_RECV_IDLE.
-// Both leave PENDING_RECV_IDLE by compare-and-swap, so that exactly one
-// wins: either the MPI_Recv enters the lower half and gets a dummy, or it
-// waits in the upper half until the checkpoint is over.
-enum { PENDING_RECV_IDLE, PENDING_RECV_ACTIVE, PENDING_RECV_CLOSED };
-
-typedef struct {
-  int state;
-  // The following fields are valid only when state is PENDING_RECV_ACTIVE.
-  int source;     // user-provided value; may be MPI_ANY_SOURCE
-  int tag;        // user-provided value; may be MPI_ANY_TAG
-  MPI_Comm comm;  // virtual communicator
-  int count;      // user-provided count (needed for dummy buffer size)
-  MPI_Datatype datatype;  // virtual datatype handle (for the size of the dummy)
-} pending_recv_t;
-
-extern pending_recv_t g_pending_recv;
-
-// Set to true at the start of the pending-Recv dummy-injection phase
-// (after drainInFlightP2p() returns and global_sent ==
-// global_recv has been proven).  Cleared in resetDrainCounters() on
-// EVENT_RESUME and EVENT_RESTART.
-//
-// INVARIANT while true: no real user-issued p2p messages can arrive at
-// any rank.  Any MPI_Recv that returns from NEXT_FUNC(Recv) while this
-// flag is true has consumed a dummy message injected by
-// unblockPendingRecvs() and must be discarded.
-//
-// The MPI_Recv wrapper reads this flag once, immediately after
-// NEXT_FUNC(Recv) returns.  A single post-call read is sufficient:
-//
-//   - For a REAL message: unblockPendingRecvs() only sets
-//     p2p_dummy_phase = true after drainInFlightP2p() exits, which
-//     requires this rank's local_recv_messages to have caught up with
-//     sent.  The MPI_Recv wrapper increments local_recv_messages
-//     AFTER its post-call dummy check.  Therefore, for a real message,
-//     the wrapper's post-call read happens-before
-//     unblockPendingRecvs sets the flag, and reads false.
-//
-//   - For a DUMMY message: unblockPendingRecvs sets p2p_dummy_phase
-//     = true and then participates in dmtcp_global_barrier
-//     ("MPI:P2P-Pending-Recv-Published") BEFORE any rank dispatches
-//     any dummy.  Therefore by the time any dummy is in flight, every
-//     rank has already set its local p2p_dummy_phase to true, and the
-//     receiver's post-call read sees true.
-extern volatile bool p2p_dummy_phase;
-
 void initialize_drain_send_recv();
 void registerLocalSendsAndRecvs();
 
@@ -109,23 +46,18 @@ void registerLocalSendsAndRecvs();
 // global_recv.
 void drainInFlightP2p();
 
-// Dispatch dummy MPI_Send messages to unblock any rank that is parked
-// in blocking MPI_Recv at pre-suspend time.  Must be called after
-// drainInFlightP2p() returns (i.e., after all real in-flight messages
-// have been accounted for).  Only blocked ranks publish; each chooses
-// the rank that sends its dummy and posts the dummy to it, so the
-// coordinator serves O(ranks + blocked ranks) requests, not O(ranks^2).
-// See implementation for the full protocol.
-void unblockPendingRecvs();
-
 // Single entry point for draining all P2P communications before
-// checkpoint: drains in-flight messages, then unblocks pending recvs.
+// checkpoint: drains in-flight messages.  (Baseline P2P design: MPI_Send
+// and MPI_Recv are MPI_Isend/MPI_Irecv + MPI_Wait, so no thread is blocked
+// in the lower half and no pending-Recv exchange is needed.)
 void drainP2p();
 
 // What the drain did at one checkpoint on this rank, for measuring it.
 // Times are in microseconds.  With MANA_DRAIN_STATS set, rank 0 prints the
 // maximum times and the total counts over all ranks at every checkpoint
-// (reportDrainStats()).
+// (reportDrainStats()).  The fields are those of branch perf, so that the
+// two print the same statistics; on this branch the pending-Recv exchange
+// doesn't exist, and its times and counts (unblock, blocked, dummies) are 0.
 struct DrainStats {
   uint64_t t_collective;     // Collective Clock drain, NBCs, barrier
   uint64_t t_inflight;       // drainInFlightP2p()

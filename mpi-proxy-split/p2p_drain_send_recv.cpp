@@ -63,10 +63,6 @@ int64_t local_sent_messages = 0, local_recv_messages = 0;
 std::unordered_set<MPI_Comm> active_comms;
 dmtcp::vector<mpi_message_t*> g_message_queue;
 
-// See p2p_drain_send_recv.h for documentation of these globals.
-pending_recv_t g_pending_recv = { /*.state=*/ PENDING_RECV_IDLE };
-volatile bool p2p_dummy_phase = false;
-
 DrainStats g_drain_stats;
 
 // This checkpoint's database in the coordinator (set by drainP2p()), and the
@@ -105,38 +101,6 @@ kvIncr(const char *db, const char *key, int64_t val)
 {
   g_drain_stats.kvdb_requests++;
   kvdb::request64(KVDBRequest::INCRBY, db, key, val);
-}
-
-// Adds val to the key (0 if it doesn't exist); returns the value before.
-static inline int64_t
-kvFetchAdd(const char *db, const char *key, int64_t val)
-{
-  g_drain_stats.kvdb_requests++;
-  int64_t old = 0;
-  KVDBResponse rc = kvdb::request64(KVDBRequest::INCRBY, db, key, val, &old);
-  JASSERT(rc == KVDBResponse::SUCCESS)(db)(key);
-  return old;
-}
-
-static inline void
-kvOr(const char *db, const char *key, int64_t val)
-{
-  g_drain_stats.kvdb_requests++;
-  kvdb::request64(KVDBRequest::OR, db, key, val);
-}
-
-static inline void
-kvSetString(const char *db, const char *key, const char *val)
-{
-  g_drain_stats.kvdb_requests++;
-  kvdb::set(db, key, val);
-}
-
-static inline KVDBResponse
-kvGetString(const char *db, const char *key, dmtcp::string *val)
-{
-  g_drain_stats.kvdb_requests++;
-  return kvdb::get(db, key, val);
 }
 
 static inline void
@@ -197,14 +161,8 @@ recvMsgIntoInternalBuffer(MPI_Status status, MPI_Comm comm)
   MPI_Type_size(MPI_BYTE, &size);
   JASSERT(size == 1);
   void *buf = JALLOC_HELPER_MALLOC(count);
-  // Bypass the MPI_Recv wrapper deliberately.  The wrapper publishes
-  // g_pending_recv from a single-slot global, and the user thread's
-  // pending blocking Recv may already have written that slot.  Calling
-  // the wrapper here would clobber it, and unblockPendingRecvs would
-  // then fail to dispatch a dummy for the user's Recv, deadlocking it.
-  // The wrapper would also (incorrectly) check p2p_dummy_phase on the
-  // return value of this real drained message.  Both problems are
-  // avoided by going through NEXT_FUNC(Recv) directly.
+  // Receive the probed message directly in the lower half: the MPI_Recv
+  // wrapper would wait out the drain that is running now.
   MPI_Comm realComm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
   int retval = NEXT_FUNC(Recv)(buf, count, MPI_BYTE,
@@ -497,223 +455,6 @@ consumeMatchingMsgBuffer(void *buf, int count, MPI_Datatype datatype,
   return MPI_SUCCESS;
 }
 
-// Publish g_pending_recv to kvdb (one record per rank), then for each
-// rank that is blocked on MPI_Recv, decide whether *this* rank is the
-// designated dummy sender and, if so, issue an MPI_Send to unblock the
-// receiver.  The lower-half MPI library matches the dummy with the Recv
-// by source, tag and communicator, and returns from NEXT_FUNC(Recv).
-//
-// Virtual handles are local to a process: the same communicator or
-// datatype may have different handles on different ranks.  So the
-// blocked rank publishes its communicator by a name that all members
-// share (see mana_comm_desc), and the size of its receive in bytes; the
-// dummy is that many MPI_BYTEs.
-//
-// Must be called after drainInFlightP2p() has returned (i.e., after
-// global_sent == global_recv has been proven).  At that point, no real
-// user-issued p2p messages remain in flight, so any MPI_Send issued
-// here can only be consumed by a blocked MPI_Recv, and that Recv's
-// wrapper will recognize the dummy via p2p_dummy_phase.
-//
-// Dispatch rule (every rank computes the same answer from the same
-// kvdb snapshot, so each dummy is sent by exactly one rank):
-//   - If pr.source != MPI_ANY_SOURCE, the sender is pr.source (a rank
-//     in pr.comm).
-//   - If pr.source == MPI_ANY_SOURCE, the sender is the lowest-ranked
-//     member of pr.comm that is not itself blocked on MPI_Recv.  MANA
-//     assumes deadlock-free programs, so at least one such member
-//     exists.
-//   - Tag = pr.tag, or 0 if pr.tag == MPI_ANY_TAG.
-//
-// The dummy MPI_Send is issued directly via NEXT_FUNC(Send), bypassing
-// the MPI_Send wrapper, so it does NOT increment local_sent_messages.
-// (Otherwise the next checkpoint's drain test would start from a
-// skewed baseline.)
-// Phase B of unblockPendingRecvs(), on a rank blocked in MPI_Recv: chooses
-// the rank that sends the dummy, and posts the dummy to it in slot k of its
-// list, ndummies_<sender> counting the slots: the communicator's name (see
-// mana_comm_desc), this rank's rank in it, the tag, and the size.
-static void
-postDummy()
-{
-  // The communicator: its name, size, this rank's rank in it, and its
-  // members' world ranks (member i is world rank i if 'members' is NULL).
-  // A predefined communicator (MPI_COMM_WORLD, MPI_COMM_SELF) has the same
-  // handle everywhere: it is its name, with instance -1.
-  MPI_Comm comm = g_pending_recv.comm;
-  uint64_t comm_hash;
-  int64_t comm_instance;
-  int size, my_rank;
-  const int *members = NULL;
-  virt_id_entry *entry =
-    lookup_virt_id_entry((mana_mpi_handle){.comm = comm});
-  if (entry != NULL) {
-    mana_comm_desc *desc = (mana_comm_desc*)entry->desc;
-    comm_hash = desc->ranks_hash;
-    comm_instance = desc->instance;
-    size = desc->size;
-    my_rank = desc->rank;
-    members = desc->global_ranks;
-  } else if (comm == MPI_COMM_WORLD) {
-    comm_hash = (uint64_t)comm;
-    comm_instance = -1;
-    size = g_world_size;
-    my_rank = g_world_rank;
-  } else {
-    JASSERT(comm == MPI_COMM_SELF)(comm).Text("MPI_Recv on an unknown comm");
-    comm_hash = (uint64_t)comm;
-    comm_instance = -1;
-    size = 1;
-    my_rank = 0;
-    members = &g_world_rank;
-  }
-
-  // The sender: the MPI_Recv's source, or for MPI_ANY_SOURCE the first
-  // member that is not blocked itself (the bitmap is complete: every rank
-  // published before the barrier).
-  int source = g_pending_recv.source;
-  int sender = -1;
-  if (source != MPI_ANY_SOURCE) {
-    JASSERT(source >= 0 && source < size)(source)(size);
-    sender = source;
-  } else {
-    std::map<int, uint64_t> words;  // bitmap words read so far
-    char key[64];
-    for (int i = 0; i < size && sender < 0; i++) {
-      int rank = members != NULL ? members[i] : i;
-      if (words.find(rank / 64) == words.end()) {
-        int64_t word = 0;
-        snprintf(key, sizeof(key), "blocked_%d", rank / 64);
-        kvGet(g_drain_db, key, &word);
-        words[rank / 64] = (uint64_t)word;
-      }
-      if (!(words[rank / 64] & ((uint64_t)1 << (rank % 64)))) {
-        sender = i;
-      }
-    }
-    JASSERT(sender >= 0)(comm)
-      .Text("MPI_ANY_SOURCE Recv with no unblocked sender in comm; "
-            "user program may have deadlocked.");
-  }
-  int sender_world_rank = members != NULL ? members[sender] : sender;
-
-  MPI_Datatype realType =
-    get_real_id((mana_mpi_handle){.datatype = g_pending_recv.datatype})
-      .datatype;
-  int type_size = 0;
-  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-  NEXT_FUNC(Type_size)(realType, &type_size);
-  RETURN_TO_UPPER_HALF();
-  int64_t bytes = (int64_t)type_size * g_pending_recv.count;
-  int tag = g_pending_recv.tag == MPI_ANY_TAG ? 0 : g_pending_recv.tag;
-
-  char key[64], dummy[128];
-  snprintf(key, sizeof(key), "ndummies_%d", sender_world_rank);
-  int64_t slot = kvFetchAdd(g_drain_db, key, 1);
-  snprintf(key, sizeof(key), "dummy_%d_%lld", sender_world_rank,
-           (long long)slot);
-  snprintf(dummy, sizeof(dummy), "%llu %lld %d %d %lld",
-           (unsigned long long)comm_hash, (long long)comm_instance, my_rank,
-           tag, (long long)bytes);
-  kvSetString(g_drain_db, key, dummy);
-}
-
-// Phase C of unblockPendingRecvs(): sends the dummies posted to this rank.
-static void
-sendPostedDummies()
-{
-  char key[64];
-  int64_t count = 0;  // No key: no dummy to send
-  snprintf(key, sizeof(key), "ndummies_%d", g_world_rank);
-  kvGet(g_drain_db, key, &count);
-  for (int64_t k = 0; k < count; k++) {
-    snprintf(key, sizeof(key), "dummy_%d_%lld", g_world_rank, (long long)k);
-    dmtcp::string dummy;
-    KVDBResponse rc = kvGetString(g_drain_db, key, &dummy);
-    JASSERT(rc == KVDBResponse::SUCCESS)(key)(rc);
-    unsigned long long comm_hash;
-    long long comm_instance, bytes;
-    int dest, tag;
-    JASSERT(sscanf(dummy.c_str(), "%llu %lld %d %d %lld", &comm_hash,
-                   &comm_instance, &dest, &tag, &bytes) == 5)(dummy);
-
-    // This rank's handle of the blocked rank's communicator: it is a
-    // member, since the blocked rank chose it among the members.
-    MPI_Comm virtComm = comm_instance == -1
-                          ? (MPI_Comm)comm_hash
-                          : find_virt_comm(comm_hash,
-                                           (unsigned int)comm_instance);
-    JASSERT(virtComm != MPI_COMM_NULL)(comm_hash)(comm_instance)
-      .Text("The dummy's sender doesn't know the blocked MPI_Recv's comm");
-    MPI_Comm realComm =
-      get_real_id((mana_mpi_handle){.comm = virtComm}).comm;
-
-    void *dummy_buf = calloc(bytes > 0 ? bytes : 1, 1);
-    int ret;
-    JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-    ret = NEXT_FUNC(Send)(dummy_buf, (int)bytes, lh_info->MANA_BYTE, dest,
-                          tag, realComm);
-    RETURN_TO_UPPER_HALF();
-    JASSERT(ret == MPI_SUCCESS)(ret)(dest)(tag);
-    g_drain_stats.dummies++;
-    free(dummy_buf);
-  }
-}
-
-void
-unblockPendingRecvs()
-{
-  char key[64];
-  uint64_t t0 = drainStatsNow();
-
-  // Phase A: publish whether this rank is blocked in MPI_Recv: blocked ranks
-  // set their bit in the bitmap blocked_<rank / 64>; the others publish
-  // nothing.
-  // Close the slot first: an MPI_Recv that starts from now on waits in the
-  // upper half, since no dummy would reach it in the lower half.  If the
-  // slot is PENDING_RECV_ACTIVE instead, that MPI_Recv gets a dummy.
-  int state = PENDING_RECV_IDLE;
-  __atomic_compare_exchange_n(&g_pending_recv.state, &state,
-                              PENDING_RECV_CLOSED, false,
-                              __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
-  bool blocked = (state == PENDING_RECV_ACTIVE);
-  if (blocked) {
-    snprintf(key, sizeof(key), "blocked_%d", g_world_rank / 64);
-    kvOr(g_drain_db, key, (int64_t)((uint64_t)1 << (g_world_rank % 64)));
-  }
-  p2p_dummy_phase = true;
-  g_drain_stats.blocked = blocked;
-  uint64_t t1 = drainStatsNow();
-  g_drain_stats.t_publish = t1 - t0;
-
-  globalBarrier("MPI:P2P-Pending-Recv-Published");
-  uint64_t t2 = drainStatsNow();
-  g_drain_stats.t_published = t2 - t1;
-
-  // Phase B: each blocked rank chooses its dummy's sender and posts the
-  // dummy to it.
-  if (blocked) {
-    postDummy();
-  }
-  uint64_t t3 = drainStatsNow();
-  g_drain_stats.t_post = t3 - t2;
-
-  globalBarrier("MPI:P2P-Pending-Recv-Posted");
-  uint64_t t4 = drainStatsNow();
-  g_drain_stats.t_posted = t4 - t3;
-
-  // Phase C: send the dummies posted to this rank.  Every rank has set
-  // p2p_dummy_phase before the first barrier.
-  sendPostedDummies();
-  uint64_t t5 = drainStatsNow();
-  g_drain_stats.t_dispatch = t5 - t4;
-
-  // Phase D: wait for all dummies to have been issued globally.
-  globalBarrier("MPI:P2P-Pending-Recv-Dummies-Sent");
-  g_drain_stats.t_dispatched = drainStatsNow() - t5;
-  g_drain_stats.t_unblock = drainStatsNow() - t0;
-}
-
 void
 drainP2p()
 {
@@ -726,20 +467,14 @@ drainP2p()
            (unsigned long long)id._hostid, (unsigned long long)id._time,
            (unsigned int)id._pid, ++drains);
   g_drain_round = 0;
+  // Baseline P2P design: MPI_Recv never blocks in the lower half (it is
+  // MPI_Irecv + MPI_Wait), so there is no pending-Recv exchange.
   drainInFlightP2p();
-  unblockPendingRecvs();
 }
 
 void
 resetDrainCounters()
 {
-  // p2p_dummy_phase is cleared on EVENT_RESUME and EVENT_RESTART
-  // (where this function is called from mpi_plugin_event_hook).  This
-  // releases any MPI_Recv wrappers that were parked in their
-  // wait-for-resume loop after consuming a dummy, and reopens the
-  // pending-Recv slot.
-  p2p_dummy_phase = false;
-  __atomic_store_n(&g_pending_recv.state, PENDING_RECV_IDLE, __ATOMIC_RELEASE);
 #ifdef DEBUG_P2P
   memset(g_sendBytesByRank, 0, g_world_size * sizeof(int));
   memset(g_rsendBytesByRank, 0, g_world_size * sizeof(int));

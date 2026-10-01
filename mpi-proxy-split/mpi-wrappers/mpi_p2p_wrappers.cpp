@@ -41,28 +41,17 @@ extern "C" {
 int PMPI_Send(const void *buf, int count, MPI_Datatype datatype,
              int dest, int tag, MPI_Comm comm)
 {
-  int retval;
-  while (mana_state == CKPT_P2P) {
-    usleep(100);
+  // Baseline P2P design (branch p2p-baseline-isend-irecv), to compare with
+  // the blocking MPI_Send/MPI_Recv of branch perf: MPI_Send is MPI_Isend
+  // followed by MPI_Wait, whose loop of MPI_Test lets a checkpoint in
+  // between tests.  MPI_Isend waits out a running P2P drain and counts the
+  // message.
+  MPI_Request request;
+  int retval = PMPI_Isend(buf, count, datatype, dest, tag, comm, &request);
+  if (retval != MPI_SUCCESS) {
+    return retval;
   }
-  LOWER_HALF_DISABLE_CKPT();
-  local_sent_messages++;
-  MPI_Comm realComm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
-  MPI_Datatype realType = get_real_id((mana_mpi_handle){.datatype = datatype}).datatype;
-  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-  retval = NEXT_FUNC(Send)(buf, count, realType, dest, tag, realComm);
-  RETURN_TO_UPPER_HALF();
-  LOWER_HALF_ENABLE_CKPT();
-#ifdef DEBUG_P2P
-  if (retval == MPI_SUCCESS) {
-    // Updating global counter of send bytes
-    int size;
-    MPI_Type_size(datatype, &size);
-    int worldRank = localRankToGlobalRank(dest, comm);
-    g_sendBytesByRank[worldRank] += count * size;
-  }
-#endif
-  return retval;
+  return PMPI_Wait(&request, MPI_STATUS_IGNORE);
 }
 
 // The body of MPI_Isend.  The caller has waited out the P2P drain (see
@@ -147,74 +136,36 @@ int PMPI_Rsend(const void* ibuf, int count,
   return retval;
 }
 
+static int MPI_Irecv_internal(void *buf, int count, MPI_Datatype datatype,
+                              int source, int tag, MPI_Comm comm,
+                              MPI_Request *request);
+
 #pragma weak MPI_Recv = PMPI_Recv
 int PMPI_Recv(void *buf, int count, MPI_Datatype datatype,
              int source, int tag, MPI_Comm comm, MPI_Status *status)
 {
-  // MANA does not support MPI_THREAD_MULTIPLE.  This wrapper relies on
-  // a single global pending-Recv slot (g_pending_recv) being claimed
-  // by at most one thread at a time.
-  //
-  // Protocol overview (replaces the older MPI_Iprobe polling loop):
-  //
-  //   Steps 1 to 3 run inside LOWER_HALF_DISABLE_CKPT(), so that a
-  //   checkpoint waits until this thread is back in the upper half.  That
-  //   doesn't keep the pre-suspend hook from running while we are blocked
-  //   in the lower half: the checkpoint thread keeps threads out of the
-  //   lower half only at the end of pre-suspend, after sending the dummies
-  //   (wait_for_threads_to_leave_lower_half()).
-  //
-  //   1. Check the MANA-internal message buffer first.  Messages
-  //      drained from in-flight Sends during a previous checkpoint's
-  //      pre-suspend (via recvMsgIntoInternalBuffer) are served here.
-  //
-  //   2. Publish (source, tag, comm, count, datatype) to g_pending_recv,
-  //      and move its state from PENDING_RECV_IDLE to PENDING_RECV_ACTIVE,
-  //      so that unblockPendingRecvs(), running on the DMTCP checkpoint
-  //      thread during a future pre-suspend, can identify this rank as
-  //      blocked and arrange for a matching dummy MPI_Send to unblock us.
-  //      If unblockPendingRecvs() has already taken its snapshot, the
-  //      state is PENDING_RECV_CLOSED, and no dummy would reach us in the
-  //      lower half: wait in the upper half for the checkpoint to finish,
-  //      and retry.
-  //
-  //   3. Call NEXT_FUNC(Recv).  When it returns, read p2p_dummy_phase,
-  //      still before leaving the no-checkpoint section (resume and
-  //      restart clear it).
-  //
-  //   4. If p2p_dummy_phase was true, the message we just received was a
-  //      dummy injected by unblockPendingRecvs; discard it, park until
-  //      mana_state == RUNNING (resume/restart complete), and retry.
-  //      Otherwise the message is real: go back to PENDING_RECV_IDLE,
-  //      increment local_recv_messages, deliver status, and return.
-  //
-  // The reason a single post-call read of p2p_dummy_phase is sufficient
-  // is documented at the declaration of p2p_dummy_phase in
-  // p2p_drain_send_recv.h.  Briefly: unblockPendingRecvs only sets
-  // p2p_dummy_phase = true AFTER drainInFlightP2p() exits, which requires
-  // this rank's local_recv_messages to have caught up with local_send_messages
-  // which only happens after we have already incremented for any real
-  // message; hence the post-call read is correctly false for real
-  // messages and (by the dispatch-after-barrier ordering in
-  // unblockPendingRecvs) correctly true for dummies.
-
-  int retval = MPI_SUCCESS;
-  int flag = 0;
-
-retry:
+  // Baseline P2P design (see MPI_Send): MPI_Recv is MPI_Irecv followed by
+  // MPI_Wait, a loop of MPI_Test, so that no thread is ever blocked in the
+  // lower half.  At a checkpoint, the P2P drain completes the pending
+  // receive if its message is in flight; otherwise restart posts it again.
+  int retval;
+  MPI_Request request;
+  // Don't post a receive while the P2P drain runs, as MPI_Isend doesn't
+  // start a send.
+  while (mana_state == CKPT_P2P) {
+    usleep(100);
+  }
   LOWER_HALF_DISABLE_CKPT();
-  // Step 1: serve from the MANA-internal buffer if a matching message
-  // was drained during a previous pre-suspend cycle.
-  // The buffer functions write a status, and 'status' may be
-  // MPI_STATUS_IGNORE: use a local one.
+  // A message that an earlier checkpoint's drain moved to MANA's buffer is
+  // served here, with its status (MPI_Irecv's buffer path drops it).
   MPI_Status buffered_status;
+  int flag = 0;
   if (mana_state == RUNNING &&
       existsMatchingMsgBuffer(source, tag, comm, &flag, &buffered_status)) {
     int type_size;
     MPI_Type_size(datatype, &type_size);
-    int msg_size = type_size * count;
     consumeMatchingMsgBuffer(buf, count, datatype, source, tag, comm,
-                             &buffered_status, msg_size);
+                             &buffered_status, type_size * count);
     // Don't count the message in local_recv_messages: the P2P drain counted
     // it when it moved it to the buffer (recvMsgIntoInternalBuffer()).
     if (status != MPI_STATUS_IGNORE && status != FORTRAN_MPI_STATUS_IGNORE) {
@@ -223,76 +174,13 @@ retry:
     LOWER_HALF_ENABLE_CKPT();
     return MPI_SUCCESS;
   }
-
-  // Step 2: publish the pending-Recv slot.  The compare-and-swap publishes
-  // the fields, and decides the race with unblockPendingRecvs(), which
-  // moves the state from PENDING_RECV_IDLE to PENDING_RECV_CLOSED.
-  g_pending_recv.source = source;
-  g_pending_recv.tag = tag;
-  g_pending_recv.comm = comm;
-  g_pending_recv.count = count;
-  g_pending_recv.datatype = datatype;
-  int idle = PENDING_RECV_IDLE;
-  if (!__atomic_compare_exchange_n(&g_pending_recv.state, &idle,
-                                   PENDING_RECV_ACTIVE, false,
-                                   __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
-    // PENDING_RECV_CLOSED: this checkpoint's unblockPendingRecvs() has
-    // taken its snapshot.  Wait here, in the upper half, until the
-    // checkpoint is over; then start over (the message may be in the
-    // MANA-internal buffer by then).
-    LOWER_HALF_ENABLE_CKPT();
-    while (mana_state != RUNNING) {
-      usleep(100);
-    }
-    goto retry;
-  }
-
-  // Step 3: resolve virtual handles and call into the lower half, where we
-  // may block until the message, or a dummy, arrives.
-  MPI_Status local_status;
-  MPI_Comm realComm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
-  MPI_Datatype realType = get_real_id((mana_mpi_handle){.datatype = datatype}).datatype;
-  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-  retval = NEXT_FUNC(Recv)(buf, count, realType, source, tag, realComm,
-                           &local_status);
-  RETURN_TO_UPPER_HALF();
-  bool dummy = p2p_dummy_phase;
-  if (dummy) {
-    // Do NOT increment local_recv_messages (the dummy bypassed the
-    // MPI_Send wrapper on the sender, so global counters stay balanced
-    // only if we also skip the increment here).
-    __atomic_store_n(&g_pending_recv.state, PENDING_RECV_CLOSED,
-                     __ATOMIC_RELEASE);
-  } else {
-    // Leave the slot before counting the message: once the P2P drain has
-    // counted it, unblockPendingRecvs() must not take this MPI_Recv for a
-    // blocked one (it would send a dummy that no MPI_Recv expects).
-    __atomic_store_n(&g_pending_recv.state, PENDING_RECV_IDLE,
-                     __ATOMIC_RELEASE);
-    local_recv_messages++;
-  }
+  retval = MPI_Irecv_internal(buf, count, datatype, source, tag, comm,
+                              &request);
   LOWER_HALF_ENABLE_CKPT();
-
-  // Step 4: act on the classification.
-  if (dummy) {
-    // buf and local_status contain unusable data; discard.
-    // Park until the checkpoint completes and we are back in the
-    // RUNNING state.  EVENT_RESUME and EVENT_RESTART both transition
-    // mana_state back to RUNNING after resetDrainCounters() clears
-    // p2p_dummy_phase and reopens the slot.  Checkpointing is enabled
-    // during this wait loop (we are out of LOWER_HALF_DISABLE_CKPT), so
-    // DMTCP can suspend the user thread here cleanly.
-    while (mana_state != RUNNING) {
-      usleep(100);
-    }
-    goto retry;
+  if (retval != MPI_SUCCESS) {
+    return retval;
   }
-
-  // Real message.
-  if (status != MPI_STATUS_IGNORE) {
-    *status = local_status;
-  }
-  return retval;
+  return PMPI_Wait(&request, status);
 }
 
 // The body of MPI_Irecv.  The caller has called LOWER_HALF_DISABLE_CKPT().
