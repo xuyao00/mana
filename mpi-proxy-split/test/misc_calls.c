@@ -23,7 +23,9 @@
 // MPI_Alloc_mem and MPI_Free_mem, for a buffer allocated at start (which
 // must keep its content across checkpoints and restarts) and one per
 // iteration; MPI_Allreduce with MPI_MINLOC and MPI_MAXLOC on MPI_DOUBLE_INT
-// and MPI_2INT; MPI_Wtime; MPI_Initialized and MPI_Finalized.
+// and MPI_2INT; MPI_Wtime; MPI_Initialized and MPI_Finalized; and the
+// variables that the MPI library defines (MPI_UNWEIGHTED, ...), which a
+// program can use only by address.
 
 #include "mana_test.h"
 
@@ -103,6 +105,18 @@ check_minloc_maxloc(long it)
   }
 }
 
+static void
+check_library_variables(void)
+{
+  MT_CHECK(MPI_UNWEIGHTED != NULL && MPI_WEIGHTS_EMPTY != NULL &&
+           MPI_UNWEIGHTED != MPI_WEIGHTS_EMPTY,
+           "MPI_UNWEIGHTED %p, MPI_WEIGHTS_EMPTY %p", (void *)MPI_UNWEIGHTED,
+           (void *)MPI_WEIGHTS_EMPTY);
+  // NULL in C programs; only their addresses can be checked.
+  MT_CHECK((void *)&MPI_F_STATUS_IGNORE != (void *)&MPI_F_STATUSES_IGNORE,
+           "MPI_F_STATUS_IGNORE and MPI_F_STATUSES_IGNORE are one variable");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -112,6 +126,7 @@ main(int argc, char **argv)
   mt_init(&argc, &argv, "misc_calls");
   MT_CHECK(initialized_before == 0, "MPI_Initialized before MPI_Init: %d",
            initialized_before);
+  check_library_variables();
   int right = (mt_rank + 1) % mt_size;
   int left = (mt_rank + mt_size - 1) % mt_size;
   int *kept;  // filled in each iteration, checked in the next one

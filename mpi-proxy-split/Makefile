@@ -96,7 +96,8 @@ check-unit: libmana.so
 
 ${MANA_ROOT}/lib/dmtcp/libmana.so: libmana.so
 	cp -f $< $@
-${MANA_ROOT}/lib/dmtcp/libmpistub.so:
+${MANA_ROOT}/lib/dmtcp/libmpistub.so: ${WRAPPERS_SRCDIR}/mpi_stub_wrappers.txt \
+                                      ${WRAPPERS_SRCDIR}/mpi_stub_data.c
 	+ make -C ${WRAPPERS_SRCDIR} install
 ${MANA_ROOT}/bin/mana_p2p_update_logs: ${WRAPPERS_SRCDIR}/mana_p2p_update_logs.c
 	+ make -C ${WRAPPERS_SRCDIR} install

@@ -116,8 +116,8 @@ mpi_fortran_wrappers.cpp: generate-mpi-fortran-wrappers.py \
 mpi_stub_wrappers.o: mpi_stub_wrappers.c
 	${MPICC} ${CFLAGS} -c -o $@ $<
 
-libmpistub.so: mpi_stub_wrappers.o
-	${CC} -fPIC $< -shared -o $@
+libmpistub.so: mpi_stub_wrappers.o mpi_stub_data.o
+	${CC} -fPIC $^ -shared -o $@
 
 libmpich_gnu_82.so.3.0.1: libmpistub.so
 	ln -sf $< $@
@@ -156,7 +156,7 @@ install: libmpistub.so mana_p2p_update_logs
 
 clean: tidy
 	rm -f ${LIBWRAPPER_OBJS}
-	rm -f ${LIBNAME}.a libmpistub.so
+	rm -f ${LIBNAME}.a libmpistub.so mpi_stub_data.o
 	rm -f ${MANA_ROOT}/lib/dmtcp/libmpistub.so
 	rm -f mpi_stub_wrappers.c
 	rm -f p2p-deterministic.h
