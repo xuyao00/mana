@@ -62,6 +62,21 @@ TESTS = [
   Test("p2p_blocking", 3,
        known_bug="a checkpoint with messages in flight crashes or loses a "
                  "message"),
+  Test("p2p_nonblocking", 4,
+       known_bug="the P2P drain calls an undefined MPI_Test_internal; "
+                 "restart finds a pending MPI_Isend"),
+  Test("p2p_ring", 4,
+       known_bug="a receive that starts during a checkpoint can take a "
+                 "message ahead of one that the drain buffered"),
+  Test("p2p_any_source", 4),
+  Test("p2p_probe", 4,
+       known_bug="MPI_Probe and MPI_Iprobe do not see the messages that a "
+                 "checkpoint drained"),
+  Test("p2p_large", 2),
+  Test("p2p_proc_null", 4,
+       known_bug="a send to MPI_PROC_NULL makes the P2P drain wait forever"),
+  Test("fortran_p2p", 2,
+       known_bug="a Fortran MPI_RECV writes through MPI_STATUS_IGNORE"),
 ]
 
 
