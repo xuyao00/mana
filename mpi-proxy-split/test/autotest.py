@@ -87,6 +87,26 @@ TESTS = [
   Test("datatypes", 2,
        known_bug="MPI_Type_create_hindexed calls itself; MPI_Type_vector "
                  "uses the size, not the extent"),
+  Test("memory", 2,
+       known_bug="a message can be lost across a restart"),
+  Test("init_thread", 2, kind="run", expect="init_thread: PASS",
+       known_bug="MPI_Init_thread does not set 'provided'"),
+  Test("exit_after_finalize", 4, args=["8"], kind="run", restart=True,
+       expect="exit_after_finalize: PASS", native_args=["1"],
+       known_bug="the process manager kills a rank that runs on after "
+                 "MPI_Finalize"),
+  Test("file_io", 2,
+       known_bug="MPI_File_close does not set MPI_FILE_NULL; restart "
+                 "cannot restore open files"),
+  Test("attributes", 2,
+       known_bug="MPI_Comm_free_keyval does not set MPI_KEYVAL_INVALID"),
+  Test("misc_calls", 2),
+  Test("fortran_nonblocking", 2),
+  Test("finalize_unsync", 4, args=["8"], kind="run", restart=True,
+       native_args=["1"],
+       known_bug="the process manager kills a rank that runs on after "
+                 "MPI_Finalize"),
+  Test("abort", 2, kind="run", fails=True, expect="abort: calling MPI_Abort"),
 ]
 
 
