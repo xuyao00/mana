@@ -23,9 +23,9 @@
 // MPI_Alloc_mem and MPI_Free_mem, for a buffer allocated at start (which
 // must keep its content across checkpoints and restarts) and one per
 // iteration; MPI_Allreduce with MPI_MINLOC and MPI_MAXLOC on MPI_DOUBLE_INT
-// and MPI_2INT; MPI_Wtime; MPI_Initialized and MPI_Finalized; and the
-// variables that the MPI library defines (MPI_UNWEIGHTED, ...), which a
-// program can use only by address.
+// and MPI_2INT; MPI_Wtime; MPI_Initialized and MPI_Finalized; the tool
+// information interface (MPI_T); and the variables that the MPI library
+// defines (MPI_UNWEIGHTED, ...), which a program can use only by address.
 
 #include "mana_test.h"
 
@@ -105,6 +105,23 @@ check_minloc_maxloc(long it)
   }
 }
 
+// The calls a program makes to look for a control variable (MANA has none),
+// between MPI_T_init_thread() at start and MPI_T_finalize() at the end.
+// (MPICH 5.0.1 crashes in a later collective if MPI_T_finalize() ends the
+// interface while MPI runs.)
+static void
+check_tools_interface(long it)
+{
+  int num = -1, index = -1;
+  MT_MPI(MPI_T_cvar_get_num(&num));
+  MT_CHECK(num >= 0, "iteration %ld: MPI_T_cvar_get_num: %d", it, num);
+  MT_MPI(MPI_T_pvar_get_num(&num));
+  MT_CHECK(num >= 0, "iteration %ld: MPI_T_pvar_get_num: %d", it, num);
+  int rc = MPI_T_cvar_get_index("MANA_TEST_NO_SUCH_VARIABLE", &index);
+  MT_CHECK(rc == MPI_T_ERR_INVALID_NAME,
+           "iteration %ld: MPI_T_cvar_get_index: %d", it, rc);
+}
+
 static void
 check_library_variables(void)
 {
@@ -127,6 +144,8 @@ main(int argc, char **argv)
   MT_CHECK(initialized_before == 0, "MPI_Initialized before MPI_Init: %d",
            initialized_before);
   check_library_variables();
+  int provided = -1;
+  MT_MPI(MPI_T_init_thread(MPI_THREAD_SINGLE, &provided));
   int right = (mt_rank + 1) % mt_size;
   int left = (mt_rank + mt_size - 1) % mt_size;
   int *kept;  // filled in each iteration, checked in the next one
@@ -164,6 +183,7 @@ main(int argc, char **argv)
     MT_MPI(MPI_Free_mem(recv));
 
     check_minloc_maxloc(it);
+    check_tools_interface(it);
 
     flag = -1;
     MT_MPI(MPI_Initialized(&flag));
@@ -185,6 +205,10 @@ main(int argc, char **argv)
   if (flag != 1) {
     fprintf(stderr, "misc_calls: rank %d: MPI_Finalized after MPI_Finalize:"
             " %d\n", mt_rank, flag);
+    return 1;
+  }
+  if (MPI_T_finalize() != MPI_SUCCESS) {
+    fprintf(stderr, "misc_calls: rank %d: MPI_T_finalize failed\n", mt_rank);
     return 1;
   }
   return 0;
