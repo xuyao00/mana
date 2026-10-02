@@ -1,0 +1,57 @@
+name: MANA tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  e2e:
+    name: Ubuntu ${{ matrix.ubuntu }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Ubuntu's MPICH 4.0 (ch4:ofi).  Not yet 26.04: with its MPICH 4.3
+        # (ch4:ucx), some tests do not come back from a restart.
+        ubuntu: ["22.04"]
+    container:
+      image: ubuntu:${{ matrix.ubuntu }}
+      # DMTCP turns off address space randomization, which Docker's default
+      # seccomp profile forbids; MPICH needs more than 64 MB of /dev/shm.
+      options: --security-opt seccomp=unconfined --shm-size=2g
+    steps:
+      - name: Install packages
+        run: |
+          apt-get update
+          # libc6-dbg: MANA needs the symbols of ld.so, which Ubuntu strips.
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            --no-install-recommends build-essential gfortran git \
+            ca-certificates python3 mpich libmpich-dev libc6-dbg
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Build
+        run: |
+          ./configure
+          make -j"$(nproc)" mana
+
+      - name: Check the tests without MANA
+        run: mpi-proxy-split/test/autotest.py --native
+
+      - name: Test MANA
+        run: >
+          mpi-proxy-split/test/autotest.py --retry-once
+          --workdir /tmp/autotest
+
+      - name: Keep the logs of failed tests
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autotest-logs-ubuntu-${{ matrix.ubuntu }}
+          path: /tmp/autotest/
+          if-no-files-found: ignore
