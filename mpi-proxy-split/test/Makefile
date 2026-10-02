@@ -58,7 +58,20 @@ LDFLAGS_DUMMY=-L$$PWD/../mpi-wrappers -lmpistub
 default: default_prereqs
 	+ $(MAKE) default_part2
 
-default_part2: ${TESTS} ${TESTS_DUMMY}
+default_part2: ${TESTS} ${TESTS_DUMMY} e2e
+
+# End-to-end tests, run by autotest.py natively and under MANA.  Each test is
+# one program, named after the test and linked as any MPI program.
+E2E_TESTS = p2p_blocking
+E2E_FORTRAN =
+
+e2e: ${E2E_TESTS} ${E2E_FORTRAN}
+
+${E2E_TESTS}: %: %.c mana_test.h
+	$(MPICC) -g3 -O0 -o $@ $< $(MPI_CFLAGS) ${MPI_LDFLAGS}
+
+check-e2e: e2e
+	./autotest.py
 
 default_prereqs:
 	@ # The darshan module is used at NERSC.
@@ -182,3 +195,4 @@ tidy:
 
 clean: tidy
 	rm -f $(TESTS) ${OBJS} ${TESTS_DUMMY} *.pyc *.so
+	rm -f ${E2E_TESTS} ${E2E_FORTRAN}
