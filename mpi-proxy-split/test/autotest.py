@@ -77,6 +77,16 @@ TESTS = [
        known_bug="a send to MPI_PROC_NULL makes the P2P drain wait forever"),
   Test("fortran_p2p", 2,
        known_bug="a Fortran MPI_RECV writes through MPI_STATUS_IGNORE"),
+  Test("collectives", 4),
+  Test("nonblocking_collectives", 4,
+       known_bug="a checkpoint during MPI_Ibcast can hang"),
+  Test("communicators", 4),
+  Test("cartesian", 4,
+       known_bug="restart rebuilds a Cartesian communicator without its "
+                 "topology"),
+  Test("datatypes", 2,
+       known_bug="MPI_Type_create_hindexed calls itself; MPI_Type_vector "
+                 "uses the size, not the extent"),
 ]
 
 
