@@ -26,11 +26,6 @@ import time
 TEST_DIR = os.path.dirname(os.path.abspath(__file__))
 MANA_ROOT = os.path.abspath(os.path.join(TEST_DIR, "..", ".."))
 
-# The test programs are linked with the MPI library, which MANA's upper half
-# loads too.  With an MPICH on UCX, UCX's memory hooks break there under
-# DMTCP.
-NO_UCX_HOOKS = {"UCX_MEM_MMAP_HOOK_MODE": "none", "UCX_MEM_EVENTS": "no"}
-
 
 class Test:
   """A test program and how to run it.
@@ -168,8 +163,6 @@ class Run:
     os.mkdir(home)
     self.port = free_port()
     self.env = dict(os.environ)
-    if not opts.native:
-      self.env.update(NO_UCX_HOOKS)
     # A private HOME keeps ~/.mana.rc of this run away from the user's.
     self.env.update({
       "HOME": home,
