@@ -1,6 +1,8 @@
 name: MANA tests
 
 on:
+  push:
+    branches: [ ci-trial ]
   pull_request:
     branches: [ main ]
 
