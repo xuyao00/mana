@@ -50,11 +50,7 @@ default: ${TEST_BINS} ${PLAIN_TEST_BINS}
 ../record-replay.o ../drain_send_recv_packets.o:
 	@make -C ..
 
-# NOTE:  The objects files split_process.o and procmapsutils.o
-# below are required only when MANA is configured with SINGLE_CART_REORDER
-# C/C++ flag. One should remove these two obj files when we decide to remove
-# the SINGLE_CART_REORDER macro implementation entirely from MANA.
-%.exe: %.o ../record-replay.o  ../split_process.o ../lower-half/procmapsutils.o
+%.exe: %.o ../record-replay.o
 	${MPICXX} -fPIC -g3 -O0 -o $@ $^ ${TEST_LD_FLAGS}
 
 drain-send-recv-test.exe: ${DRAIN_TEST_OBJS}
