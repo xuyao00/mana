@@ -11,12 +11,6 @@ MPICC = mpicc
 MPICXX = mpic++
 endif
 
-TESTS = record-replay-comm-test \
-        record-replay-group-test \
-        record-replay-types-test
-
-TEST_OBJS=$(addsuffix .o, ${TESTS})
-TEST_BINS=$(addsuffix .exe, ${TESTS})
 # Tests that don't need gtest.
 PLAIN_TEST_BINS=virtual-id-test.exe
 
@@ -45,13 +39,7 @@ TEST_LD_FLAGS=${DMTCP_ROOT}/src/libdmtcpinternal.a \
 DRAIN_TEST_OBJS = drain-send-recv-test.o ../p2p_drain_send_recv.cpp \
                   ../p2p_log_replay.cpp ${DMTCP_ROOT}/src/lookup_service.o
 
-default: ${TEST_BINS} ${PLAIN_TEST_BINS}
-
-../record-replay.o ../drain_send_recv_packets.o:
-	@make -C ..
-
-%.exe: %.o ../record-replay.o
-	${MPICXX} -fPIC -g3 -O0 -o $@ $^ ${TEST_LD_FLAGS}
+default: ${PLAIN_TEST_BINS}
 
 drain-send-recv-test.exe: ${DRAIN_TEST_OBJS}
 	${MPICXX} -fPIC -g3 -O0 ${CXXFLAGS} -o $@ $^ ${TEST_LD_FLAGS}
@@ -73,14 +61,11 @@ virtual-id-test.exe: virtual-id-test.cpp lh_constants.inc ../virtual_id.cpp \
 .cpp.o:
 	${MPICXX} ${CXXFLAGS} -g3 -O0 -c -o $@ $<
 
-gdb-%: ${TEST_BINS}
-	gdb --args ./record-replay-$*-test.exe
-
-check: ${TEST_BINS} ${PLAIN_TEST_BINS}
+check: ${PLAIN_TEST_BINS}
 	@for x in $^; do ${MPIRUN} -n 1 ./$$x; done
 
 clean: tidy
-	rm -f ${TEST_BINS} ${PLAIN_TEST_BINS} ${TEST_OBJS} lh_constants.inc
+	rm -f ${PLAIN_TEST_BINS} lh_constants.inc
 
 distclean: clean
 
@@ -88,4 +73,4 @@ dist: distclean
 	dir=`basename $$PWD` && cd .. && tar czvf $$dir.tgz ./$$dir
 	dir=`basename $$PWD` && ls -l ../$$dir.tgz
 
-.PHONY: default clean dist distclean vi vim touch gdb tidy check
+.PHONY: default clean dist distclean vi vim touch tidy check
