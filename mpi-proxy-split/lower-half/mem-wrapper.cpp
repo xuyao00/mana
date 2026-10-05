@@ -63,6 +63,8 @@ static void updateMmaps(char *, size_t);
 static void patchSbrk(char *, char *, size_t);
 
 off_t get_symbol_offset(const char *pathame, const char *symbol);
+void *mmap_fixed_noreplace(void *addr, size_t length, int prot, int flags,
+                           int fd, off_t offset);
 
 bool mem_compare (MmapInfo_t &a, MmapInfo_t &b) {
   return (a.addr < b.addr);
@@ -213,6 +215,40 @@ void *next_free_addr(char *addr, size_t length) {
   return NULL;
 }
 
+// Takes the mappings that overlap [addr, addr + length) out of free_blocks.
+// Called when the arena's choice collides with a mapping that was not made
+// through the mmap wrapper.
+static void remove_foreign_mappings(char *addr, size_t length)
+{
+  int fd = open("/proc/self/maps", O_RDONLY);
+  if (fd < 0) {
+    return;
+  }
+  char buf[4096];
+  char line[512];
+  size_t len = 0;
+  ssize_t n;
+  while ((n = read(fd, buf, sizeof buf)) > 0) {
+    for (ssize_t i = 0; i < n; i++) {
+      if (buf[i] != '\n') {
+        if (len < sizeof line - 1) {
+          line[len++] = buf[i];
+        }
+        continue;
+      }
+      line[len] = '\0';
+      len = 0;
+      char *end;
+      char *start = (char*)strtoul(line, &end, 16);
+      char *stop = (char*)strtoul(end + 1, NULL, 16);
+      if (start < addr + length && stop > addr) {
+        remove_overlap_blocks({start, (size_t)(stop - start)}, free_blocks);
+      }
+    }
+  }
+  close(fd);
+}
+
 void init_mem_arena(char *base)
 {
   arena_base = base;
@@ -222,6 +258,11 @@ void init_mem_arena(char *base)
   // The wrapper allocates memories starting from the arena_base address.
   // We are not really mapping this region in the memory now at this moment.
   free_blocks.push_back({arena_base, SIZE_MAX / 2});
+  // CUDA: keep the CUDA driver's preferred UVA range out of the
+  // arena, so that the upper half's CUDA reserves it as in a native process.
+  // cuCheckpointProcessRestore() fails (CUDA_ERROR_OUT_OF_MEMORY) for a
+  // process whose driver had to place its UVA range elsewhere.
+  remove_overlap_blocks({(char*)0x200000000UL, 0x100200000UL}, free_blocks);
 }
 
 // At restart, after restore_mmap() has mapped the upper half's areas, the
@@ -398,21 +439,58 @@ static void* __mmap_wrapper(void *addr, size_t length, int prot,
   static char *libc_base_addr = NULL;
   void *ret = MAP_FAILED;
   length = ROUND_UP(length, PAGE_SIZE);
-  if (arena_base != NULL) {
-    if (addr == NULL ||
-        (flags & MAP_FIXED) == 0 ||
-        (max_allocated_addr != NULL && (char*)addr > max_allocated_addr)) {
-      addr = next_free_addr((char*)addr, length);
-      if ((char*)addr + length > max_allocated_addr) {
-        max_allocated_addr = (char*)addr + length;
-      }
-    }
 #ifdef MAP_FIXED_NOREPLACE
-    flags &= ~MAP_FIXED_NOREPLACE;
+  if (addr != NULL && (flags & MAP_FIXED_NOREPLACE) && !(flags & MAP_FIXED)) {
+    // "Exactly here, or fail with EEXIST": the caller checks the address.
+    // The CUDA driver reserves its UVA ranges this way, and on restore
+    // (cuCheckpointProcessRestore) it must get the original addresses back,
+    // so the arena must not move the request.
+    ret = _real_mmap(addr, length, prot, flags, fd, offset);
+    if (ret != MAP_FAILED && (char*)ret + length > max_allocated_addr) {
+      max_allocated_addr = (char*)ret + length;
+    }
+  } else
 #endif
-    flags |= MAP_FIXED;
+  if (arena_base != NULL && addr != NULL && !(flags & MAP_FIXED) &&
+      (uintptr_t)addr < 0x7f0000000000UL &&
+      (ret = mmap_fixed_noreplace(addr, length, prot, flags, fd, offset))
+        != MAP_FAILED) {
+    // Honor a hint whose range is free.  The CUDA driver
+    // asks for its UVA range at 0x200000000 with a plain hint.  (Below the
+    // lower half's libraries, so a later restart's lower half can't be there.)
+    if ((char*)ret + length > max_allocated_addr) {
+      max_allocated_addr = (char*)ret + length;
+    }
+  } else if (arena_base != NULL &&
+      (addr == NULL ||
+       (flags & MAP_FIXED) == 0 ||
+       (max_allocated_addr != NULL && (char*)addr > max_allocated_addr))) {
+    // The arena picks the address.  free_blocks knows only the upper half's
+    // regions, but the lower half maps memory there too (e.g. the CUDA
+    // driver's UVA reservation at 0x200000000, made in MPI_Init() by a
+    // CUDA-aware MPI).  So never clobber: on EEXIST, take the regions in the
+    // way out of free_blocks and try the next free address.
+    char *hint = (char*)addr;
+    while (1) {
+      addr = next_free_addr(hint, length);
+      ret = mmap_fixed_noreplace(addr, length, prot, flags, fd, offset);
+      if (ret != MAP_FAILED || errno != EEXIST) {
+        break;
+      }
+      remove_foreign_mappings((char*)addr, length);
+    }
+    if (ret != MAP_FAILED && (char*)ret + length > max_allocated_addr) {
+      max_allocated_addr = (char*)ret + length;
+    }
+  } else {
+    if (arena_base != NULL) {
+#ifdef MAP_FIXED_NOREPLACE
+      flags &= ~MAP_FIXED_NOREPLACE;
+#endif
+      flags |= MAP_FIXED;
+    }
+    ret = _real_mmap(addr, length, prot, flags, fd, offset);
   }
-  ret = _real_mmap(addr, length, prot, flags, fd, offset);
   if (ret != MAP_FAILED) {
     DLOG(NOISE, "LH: mmap (%lu): addr %p (%p) @ 0x%zx\n",
          allocated_blocks.size(), ret, addr, length);

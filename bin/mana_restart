@@ -4,15 +4,35 @@ import os
 import shutil
 
 help_msg = '''
-  USAGE: [srun/mpirun] mana_restart [--verbose] [--timing] [DMTCP_OPTIONS ...]
+  USAGE: [srun/mpirun] mana_restart [--verbose] [--timing] [--cuda] [DMTCP_OPTIONS ...]
                                     [--restartdir DIR] [--ckptdir DIR]
           For DMTCP options, do: dmtcp_restart --help
 '''
 
 # dmtcp options that requires a value
 verbose = False
+cuda = False
 gdb = False
 mana_root_path = os.path.dirname(os.path.realpath(__file__)) + "/../"
+
+# --cuda: CUDA-aware MPI (see mpi-proxy-split/cuda-forward/fwd-runtime.c).
+# The lower half's libcuda/libcudart/libnvidia-ml are forwarding shims to
+# the application's (one CUDA driver per process, as the CUDA checkpoint API
+# requires), and the lower half initializes MPI after the application's CUDA
+# is there.  CUDA IPC (UCX's cuda_ipc) cannot be checkpointed.
+def setup_cuda_forwarding():
+  fwd_dir = mana_root_path + "lib/dmtcp/cuda-forward"
+  if not os.path.exists(fwd_dir + "/libcuda.so.1"):
+    print("MANA: --cuda: " + fwd_dir + " not found; build mpi-proxy-split/cuda-forward")
+    sys.exit(1)
+  os.environ["MANA_CUDA_FORWARD"] = "1"
+  os.environ["MANA_LH_ONLY_LIBRARY_PATH"] = fwd_dir
+  old = os.environ.get("LD_LIBRARY_PATH", "")
+  os.environ["LD_LIBRARY_PATH"] = fwd_dir + (":" + old if old else "")
+  # The CUDA checkpoint API identifies the process by its name.
+  os.environ.setdefault("DMTCP_DISABLE_PRGNAME_PREFIX", "1")
+  if os.environ.get("MANA_CUDA_VMM_ALLOC", "1") == "0":
+    os.environ.setdefault("UCX_TLS", "^cuda_ipc")
 
 dmtcp_flags = sys.argv[1:]
 
@@ -26,6 +46,11 @@ if "--help" in dmtcp_flags:
 if "--verbose" in dmtcp_flags:
   verbose = True
   dmtcp_flags.remove("--verbose")
+if "--cuda" in dmtcp_flags:
+  cuda = True
+  dmtcp_flags.remove("--cuda")
+if os.environ.get("MANA_CUDA") == "1":   # Same as --cuda.
+  cuda = True
 if "--timing" in dmtcp_flags:
   os.environ["MANA_TIMING"] = "1"
   dmtcp_flags.remove("--timing")
@@ -144,6 +169,8 @@ if gdb:
   cmd_line = shutil.which("gdb") + " --args "
 else:
   cmd_line = ""
+if cuda:
+  setup_cuda_forwarding()
 cmd_line += mana_root_path + "bin/lower-half -j --restore " + host_flag + port_flag + " ".join(dmtcp_flags)
 if verbose:
   print(cmd_line)

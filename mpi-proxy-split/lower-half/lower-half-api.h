@@ -50,6 +50,12 @@ typedef struct _LowerHalfInfo
   void *munmap;
   void *mmap_list_fptr;
   void *lh_dlsym;
+  // CUDA-aware MPI (MANA_CUDA_FORWARD set): the FwdCtl of the lower half's
+  // libcuda/libcudart forwarding shims (cuda-forward/fwd-runtime.h), and the
+  // lower half's MPI_Init(), which the upper half's MPI_Init() calls: the
+  // MPI's CUDA calls go to the upper half's CUDA, which must exist by then.
+  void *fwd_ctl;
+  void *lh_mpi_init;
   // Set by an upper-half atexit() handler: uhExit() then ends the process
   // through the lower half's exit(), so that its exit handlers run too.
   int upper_half_exiting;

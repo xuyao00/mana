@@ -61,7 +61,9 @@ extern "C" {
 
 #pragma weak MPI_Init = PMPI_Init
 int PMPI_Init(int *argc, char ***argv) {
-  // The lower half has initialized MPI already, at launch.
+  // The lower half has initialized MPI already, at launch (except with
+  // MANA_CUDA_FORWARD).
+  mana_lower_half_mpi_init();
   int retval = MPI_SUCCESS;
   if (isUsingCollectiveToP2p()) {
     fprintf(stderr, collective_p2p_string);
@@ -95,7 +97,9 @@ int PMPI_Init(int *argc, char ***argv) {
 
 #pragma weak MPI_Init_thread = PMPI_Init_thread
 int PMPI_Init_thread(int *argc, char ***argv, int required, int *provided) {
-  // The lower half has initialized MPI already, at launch.
+  // The lower half has initialized MPI already, at launch (except with
+  // MANA_CUDA_FORWARD).
+  mana_lower_half_mpi_init();
   *provided = required < MPI_THREAD_FUNNELED ? required : MPI_THREAD_FUNNELED;
   int retval = MPI_SUCCESS;
   if (isUsingCollectiveToP2p()) {

@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUDA-aware MANA</title>
+<style>
+:root {
+  color-scheme: light;
+  --surface-0: #f4f4f2;
+  --surface-1: #fcfcfb;
+  --surface-2: #f0efec;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: #dddcd5;
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --upper: #e6effb;
+  --upper-edge: #2a78d6;
+  --lower: #fdeee6;
+  --lower-edge: #eb6834;
+  --gpu: #e8f6ef;
+  --gpu-edge: #1baf7a;
+  --code-bg: #f0efec;
+  --good: #1a7f37;
+  --bad: #c62828;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --surface-0: #121211;
+    --surface-1: #1a1a19;
+    --surface-2: #232321;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: #383835;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --upper: #16263b;
+    --upper-edge: #3987e5;
+    --lower: #3a2117;
+    --lower-edge: #d95926;
+    --gpu: #12301f;
+    --gpu-edge: #199e70;
+    --code-bg: #232321;
+    --good: #4cc26a;
+    --bad: #ef6b6b;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-0: #121211;
+  --surface-1: #1a1a19;
+  --surface-2: #232321;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: #383835;
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --upper: #16263b;
+  --upper-edge: #3987e5;
+  --lower: #3a2117;
+  --lower-edge: #d95926;
+  --gpu: #12301f;
+  --gpu-edge: #199e70;
+  --code-bg: #232321;
+  --good: #4cc26a;
+  --bad: #ef6b6b;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+main { max-width: 1040px; margin: 0 auto; padding: 32px 16px 64px; }
+header h1 { font-size: 28px; line-height: 1.2; margin: 0 0 6px; letter-spacing: -0.01em; }
+header p.lede { color: var(--text-secondary); margin: 0 0 4px; max-width: 760px; }
+header .meta { color: var(--text-muted); font-size: 13px; }
+h2 { font-size: 20px; margin: 44px 0 10px; letter-spacing: -0.005em; }
+h3 { font-size: 16px; margin: 24px 0 8px; }
+p, li { max-width: 820px; }
+p { margin: 8px 0; }
+ul { padding-left: 20px; }
+li { margin: 4px 0; }
+code { font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+       background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+.card { background: var(--surface-1); border: 1px solid var(--border);
+        border-radius: 12px; padding: 18px 20px; margin: 14px 0; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+         gap: 12px; margin: 22px 0 6px; }
+.tile { background: var(--surface-1); border: 1px solid var(--border);
+        border-radius: 12px; padding: 14px 16px; }
+.tile .num { font-size: 28px; font-weight: 650; line-height: 1.1;
+             font-variant-numeric: tabular-nums; }
+.tile .lbl { color: var(--text-secondary); font-size: 13px; margin-top: 4px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } }
+figure { margin: 0; }
+figcaption { color: var(--text-secondary); font-size: 13px; margin-top: 8px; }
+svg.diagram { width: 100%; height: auto; display: block; }
+svg.diagram text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.d-text { fill: var(--text-primary); font-size: 13px; }
+.d-sub { fill: var(--text-secondary); font-size: 11.5px; }
+.d-title { fill: var(--text-primary); font-size: 14px; font-weight: 650; }
+.d-mono { fill: var(--text-primary); font-size: 11.5px;
+          font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important; }
+.d-upper { fill: var(--upper); stroke: var(--upper-edge); stroke-width: 1.5; }
+.d-lower { fill: var(--lower); stroke: var(--lower-edge); stroke-width: 1.5; }
+.d-gpu { fill: var(--gpu); stroke: var(--gpu-edge); stroke-width: 1.5; }
+.d-box { fill: var(--surface-1); stroke: var(--axis); stroke-width: 1.2; }
+.d-box-strong { fill: var(--surface-1); stroke: var(--text-secondary); stroke-width: 1.4; }
+.d-line { stroke: var(--text-secondary); stroke-width: 1.5; fill: none; }
+.d-line-u { stroke: var(--upper-edge); stroke-width: 2; fill: none; }
+.d-line-l { stroke: var(--lower-edge); stroke-width: 2; fill: none; }
+.d-dash { stroke-dasharray: 5 4; }
+.d-arrow { fill: var(--text-secondary); }
+.d-arrow-u { fill: var(--upper-edge); }
+.d-arrow-l { fill: var(--lower-edge); }
+.d-step { fill: var(--surface-2); stroke: var(--axis); stroke-width: 1; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 4px 0 8px;
+          font-size: 13px; color: var(--text-secondary); }
+.legend span.sw { display: inline-block; width: 22px; height: 0; border-top: 2px solid;
+                  vertical-align: middle; margin-right: 6px; }
+.chart { position: relative; }
+.chart svg { width: 100%; height: auto; display: block; overflow: visible; }
+.chart .tick { fill: var(--text-muted); font-size: 11px; }
+.chart .axis-title { fill: var(--text-secondary); font-size: 12px; }
+.chart .gridline { stroke: var(--grid); stroke-width: 1; }
+.chart .baseline { stroke: var(--axis); stroke-width: 1; }
+.chart .dlabel { font-size: 11.5px; fill: var(--text-secondary); }
+.tip { position: absolute; pointer-events: none; background: var(--surface-1);
+       border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
+       font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.12); display: none;
+       min-width: 190px; z-index: 2; }
+.tip .t { font-weight: 650; margin-bottom: 4px; }
+.tip .r { display: flex; justify-content: space-between; gap: 12px;
+          font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+.tip .r b { color: var(--text-primary); font-weight: 600; }
+.tip .k { display: inline-block; width: 10px; height: 2px; vertical-align: middle;
+          margin-right: 6px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px;
+        font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+th:first-child, td:first-child { text-align: left; }
+table.text th, table.text td { text-align: left; }
+th { color: var(--text-secondary); font-weight: 600; }
+.tablewrap { overflow-x: auto; }
+details { margin-top: 10px; }
+summary { cursor: pointer; color: var(--text-secondary); font-size: 13px; }
+.ok { color: var(--good); font-weight: 600; }
+.no { color: var(--bad); font-weight: 600; }
+.theme { float: right; font-size: 12px; color: var(--text-secondary);
+         background: var(--surface-1); border: 1px solid var(--border);
+         border-radius: 8px; padding: 4px 10px; cursor: pointer; }
+.pill { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 10px;
+        border: 1px solid var(--border); color: var(--text-secondary); margin-right: 4px; }
+</style>
+</head>
+<body>
+<main>
+<header>
+  <button class="theme" id="theme" type="button">Theme</button>
+  <h1>CUDA-aware MPI in MANA</h1>
+  <p class="lede">Checkpoint-restart of CUDA-aware MPI programs, with the lower half's UCX working
+  directly on the application's device memory, CUDA IPC included. Prototype design,
+  results and plan.</p>
+  <div class="meta">Prototype machine: 1&times; RTX 3070 Laptop, driver 595.91.07, CUDA 13.1,
+  MPICH 5.0.1 (ch4:ucx), UCX 1.24, DMTCP CUDA plugin. Local report, branch <code>cuda-aware</code>
+  (uncommitted).</div>
+</header>
+
+<div class="tiles">
+  <div class="tile"><div class="num">96%</div><div class="lbl">of native bandwidth at 16&nbsp;MB, under MANA with virtual IPC</div></div>
+  <div class="tile"><div class="num">17&times;</div><div class="lbl">faster than MANA without CUDA IPC (16&nbsp;MB)</div></div>
+  <div class="tile"><div class="num">+8&nbsp;&micro;s</div><div class="lbl">median small-message latency over native (8&nbsp;B&ndash;4&nbsp;KB)</div></div>
+  <div class="tile"><div class="num">20&nbsp;ns</div><div class="lbl">per forwarded CUDA call (was 190&nbsp;ns; 4.5&nbsp;ns direct)</div></div>
+  <div class="tile"><div class="num">23/24</div><div class="lbl">MANA suite passes in CUDA mode (1 known, unrelated bug)</div></div>
+</div>
+
+<h2>1. The problem</h2>
+<p>MANA splits each MPI rank into an <b>upper half</b> (the application, checkpointed) and a
+<b>lower half</b> (the MPI library and network, thrown away at checkpoint and re-created at
+restart). A CUDA-aware MPI puts a second CUDA user in the process: the MPI's UCX reads and writes
+the application's device buffers. Four facts, all verified on this machine, shape the design:</p>
+<div class="card">
+<ul>
+  <li><b>One CUDA driver per process.</b> NVIDIA's checkpoint API (<code>cuCheckpointProcess*</code>)
+  handles one driver instance. With an MPI that loads its own <code>libcuda</code> in the lower half,
+  the API checkpointed the MPI's driver and ignored the application's GPU state.</li>
+  <li><b>The lower half is replaced at restart</b>, so no CUDA state may belong to it.</li>
+  <li><b>CUDA IPC handles do not survive a checkpoint.</b> A live legacy export
+  (<code>cuIpcGetMemHandle</code>) makes the checkpoint fail (304) and the process die; a VMM
+  POSIX-fd export can be checkpointed, but importers must hold no mapping, and an old handle maps
+  the <i>old</i> memory after restore.</li>
+  <li><b>The GPU restore needs running threads</b> (it hangs before DMTCP resumes them) and the
+  driver's original address-space layout.</li>
+</ul>
+</div>
+
+<h2>2. Architecture</h2>
+<p>The application's CUDA driver is the only one. The lower half's CUDA libraries are generated
+<b>forwarding shims</b>: every call from UCX or MPICH jumps into the upper half's real library, with
+the thread's upper-half TLS. UCX therefore uses the application's context and device pointers,
+exactly as in a native process, and the DMTCP CUDA plugin checkpoints that one driver.</p>
+<figure class="card">
+<svg class="diagram" viewBox="0 0 960 470" role="img" aria-label="Architecture of CUDA-aware MANA"><defs><marker id="ar-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker><marker id="ar-u" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow-u"/></marker><marker id="ar-l" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow-l"/></marker></defs><rect x="20" y="36" width="742" height="198" rx="12" class="d-upper"/><text x="36" y="58" class="d-title">Upper half &#183; checkpointed (application)</text><rect x="20" y="248" width="742" height="210" rx="12" class="d-lower"/><text x="36" y="270" class="d-title">Lower half &#183; re-created at restart (MPI)</text><rect x="784" y="36" width="156" height="422" rx="12" class="d-gpu"/><text x="862" y="62" text-anchor="middle" class="d-title">GPU</text><text x="862" y="96" text-anchor="middle" class="d-sub">one CUDA context:</text><text x="862" y="113" text-anchor="middle" class="d-sub">the application's</text><text x="862" y="130" text-anchor="middle" class="d-sub"></text><text x="862" y="147" text-anchor="middle" class="d-sub">app buffers</text><text x="862" y="164" text-anchor="middle" class="d-sub">(VMM memory)</text><text x="862" y="181" text-anchor="middle" class="d-sub"></text><text x="862" y="198" text-anchor="middle" class="d-sub">UCX streams,</text><text x="862" y="215" text-anchor="middle" class="d-sub">staging buffers</text><text x="862" y="232" text-anchor="middle" class="d-sub"></text><text x="862" y="249" text-anchor="middle" class="d-sub">peers' buffers</text><text x="862" y="266" text-anchor="middle" class="d-sub">mapped by IPC</text><rect x="40" y="74" width="160" height="48" rx="8" class="d-box-strong"/><text x="120.0" y="94.0" text-anchor="middle" class="d-text">Application</text><text x="120.0" y="109.0" text-anchor="middle" class="d-sub">CUDA + MPI calls</text><rect x="215" y="74" width="180" height="48" rx="8" class="d-box"/><text x="305.0" y="94.0" text-anchor="middle" class="d-text">libmana.so</text><text x="305.0" y="109.0" text-anchor="middle" class="d-sub">MPI wrappers, virtual ids</text><rect x="410" y="74" width="160" height="48" rx="8" class="d-box"/><text x="490.0" y="94.0" text-anchor="middle" class="d-text">DMTCP + CUDA plugin</text><text x="490.0" y="109.0" text-anchor="middle" class="d-sub">cuCheckpointProcess*</text><rect x="585" y="74" width="160" height="48" rx="8" class="d-box"/><text x="665.0" y="94.0" text-anchor="middle" class="d-text">libmana_cuda_vmm.so</text><text x="665.0" y="109.0" text-anchor="middle" class="d-sub">cudaMalloc &#8594; VMM</text><rect x="40" y="150" width="160" height="52" rx="8" class="d-box"/><text x="120.0" y="172.0" text-anchor="middle" class="d-text">libcudart</text><text x="120.0" y="187.0" text-anchor="middle" class="d-sub">the app's runtime</text><rect x="215" y="150" width="160" height="52" rx="8" class="d-box"/><text x="295.0" y="172.0" text-anchor="middle" class="d-text">libnvidia-ml</text><text x="295.0" y="187.0" text-anchor="middle" class="d-sub">real NVML</text><rect x="390" y="150" width="355" height="52" rx="8" class="d-box-strong"/><text x="567.5" y="172.0" text-anchor="middle" class="d-text">libcuda.so.1 &#8212; the only CUDA driver</text><text x="567.5" y="187.0" text-anchor="middle" class="d-sub">real; checkpointed by the CUDA plugin</text><rect x="40" y="284" width="160" height="50" rx="8" class="d-box"/><text x="120.0" y="305.0" text-anchor="middle" class="d-text">libcudart.so.13 shim</text><text x="120.0" y="320.0" text-anchor="middle" class="d-sub">kernel registrations</text><rect x="215" y="284" width="160" height="50" rx="8" class="d-box"/><text x="295.0" y="305.0" text-anchor="middle" class="d-text">libnvidia-ml.so.1 shim</text><text x="295.0" y="320.0" text-anchor="middle" class="d-sub">export tables</text><rect x="390" y="284" width="355" height="50" rx="8" class="d-box"/><text x="567.5" y="305.0" text-anchor="middle" class="d-text">libcuda.so.1 shim</text><text x="567.5" y="320.0" text-anchor="middle" class="d-sub">trampolines &#183; virtual IPC handles &#183; host regs</text><rect x="40" y="360" width="160" height="48" rx="8" class="d-box"/><text x="120.0" y="380.0" text-anchor="middle" class="d-text">libmana_fwd.so</text><text x="120.0" y="395.0" text-anchor="middle" class="d-sub">thread FS, records</text><rect x="215" y="360" width="255" height="48" rx="8" class="d-box"/><text x="342.5" y="380.0" text-anchor="middle" class="d-text">MPICH</text><text x="342.5" y="395.0" text-anchor="middle" class="d-sub">lazy MPI_Init, replay at restart</text><rect x="485" y="360" width="260" height="48" rx="8" class="d-box"/><text x="615.0" y="380.0" text-anchor="middle" class="d-text">UCX</text><text x="615.0" y="395.0" text-anchor="middle" class="d-sub">cuda_copy, cuda_ipc</text><path d="M200 98 H213" class="d-line" marker-end="url(#ar-a)"/><path d="M120 122 V148" class="d-line" marker-end="url(#ar-a)"/><path d="M170 202 V216 H560 V204" class="d-line" marker-end="url(#ar-a)"/><path d="M490 122 V148" class="d-line" marker-end="url(#ar-a)"/><path d="M745 176 H782" class="d-line" marker-end="url(#ar-a)"/><path d="M330 122 V136 H770 V430 H340 V410" class="d-line-u" marker-end="url(#ar-u)"/><text x="756" y="448" text-anchor="end" class="d-sub" style="fill:var(--upper-edge)">MPI calls: JUMP_TO_LOWER_HALF</text><path d="M470 384 H483" class="d-line" marker-end="url(#ar-a)"/><path d="M615 360 V336" class="d-line" marker-end="url(#ar-a)"/><path d="M500 360 V350 H300 V336" class="d-line" marker-end="url(#ar-a)"/><path d="M232 360 V348 H120 V336" class="d-line" marker-end="url(#ar-a)"/><path d="M110 284 V204" class="d-line-l" marker-end="url(#ar-l)"/><path d="M295 284 V204" class="d-line-l" marker-end="url(#ar-l)"/><path d="M650 284 V204" class="d-line-l" marker-end="url(#ar-l)"/><text x="470" y="242" class="d-sub" style="fill:var(--lower-edge)">forwarded calls (FS &#8594; upper TLS)</text></svg>
+<figcaption>One process, two halves. Blue: the checkpointed upper half; orange: the lower half,
+re-created at restart. Orange arrows: the shims' forwarded calls. The DMTCP CUDA plugin checkpoints
+the GPU through the one driver (<code>cuCheckpointProcess*</code>).</figcaption>
+</figure>
+
+<h3>A forwarded call</h3>
+<p>Each shim symbol is a two-instruction trampoline into a common entry. It needs no function
+prototypes, leaves stack arguments in place (<code>cuLaunchKernel</code>'s 11 arguments pass
+through), and finds the calling thread by its stack pointer, so no system call is involved.
+Functions that hand out pointers or tables (<code>cuGetProcAddress</code>,
+<code>cuGetExportTable</code>, kernel registration) get small hand-written wrappers.</p>
+<figure class="card">
+<svg class="diagram" viewBox="0 0 960 250" role="img" aria-label="A forwarded CUDA call"><defs><marker id="fc-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker><marker id="fc-u" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow-u"/></marker><marker id="fc-l" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow-l"/></marker></defs><rect x="20" y="40" width="140" height="92" rx="8" class="d-lower"/><text x="90.0" y="70" text-anchor="middle" class="d-text" style="font-weight:600">UCX calls</text><text x="90.0" y="92" text-anchor="middle" class="d-sub">cuMemcpyAsync()</text><text x="90.0" y="112" text-anchor="middle" class="d-sub">in the lower half</text><text x="30" y="30" class="d-sub">1</text><path d="M162 86.0 H176" class="d-line" marker-end="url(#fc-a)"/><rect x="178" y="40" width="140" height="92" rx="8" class="d-lower"/><text x="248.0" y="70" text-anchor="middle" class="d-text" style="font-weight:600">shim symbol</text><text x="248.0" y="92" text-anchor="middle" class="d-sub">mov $idx, %r11d</text><text x="248.0" y="112" text-anchor="middle" class="d-sub">jmp common</text><text x="188" y="30" class="d-sub">2</text><path d="M320 86.0 H334" class="d-line" marker-end="url(#fc-a)"/><rect x="336" y="40" width="140" height="92" rx="8" class="d-lower"/><text x="406.0" y="70" text-anchor="middle" class="d-text" style="font-weight:600">mana_fwd_enter()</text><text x="406.0" y="92" text-anchor="middle" class="d-sub">find thread by stack</text><text x="406.0" y="112" text-anchor="middle" class="d-sub">push a record</text><text x="346" y="30" class="d-sub">3</text><path d="M478 86.0 H492" class="d-line" marker-end="url(#fc-a)"/><rect x="494" y="40" width="140" height="92" rx="8" class="d-lower"/><text x="564.0" y="70" text-anchor="middle" class="d-text" style="font-weight:600">into the upper half</text><text x="564.0" y="92" text-anchor="middle" class="d-sub">swap return address</text><text x="564.0" y="112" text-anchor="middle" class="d-sub">FS := upper TLS</text><text x="504" y="30" class="d-sub">4</text><path d="M636 86.0 H650" class="d-line" marker-end="url(#fc-a)"/><rect x="652" y="40" width="140" height="92" rx="8" class="d-upper"/><text x="722.0" y="70" text-anchor="middle" class="d-text" style="font-weight:600">real function</text><text x="722.0" y="92" text-anchor="middle" class="d-sub">upper half's libcuda</text><text x="722.0" y="112" text-anchor="middle" class="d-sub">the app's context</text><text x="662" y="30" class="d-sub">5</text><path d="M794 86.0 H808" class="d-line" marker-end="url(#fc-a)"/><rect x="810" y="40" width="140" height="92" rx="8" class="d-lower"/><text x="880.0" y="70" text-anchor="middle" class="d-text" style="font-weight:600">fwd_return</text><text x="880.0" y="92" text-anchor="middle" class="d-sub">FS := lower TLS</text><text x="880.0" y="112" text-anchor="middle" class="d-sub">pop record, return</text><text x="820" y="30" class="d-sub">6</text><text x="20" y="176" class="d-text" style="font-weight:600">Cost per forwarded call</text><rect x="20" y="188" width="380" height="14" rx="3" fill="var(--series-5)"/><text x="408" y="200" class="d-sub">190 ns: thread found with gettid() &#215; 2</text><rect x="20" y="210" width="40" height="14" rx="3" fill="var(--series-2)"/><text x="68" y="222" class="d-sub">20 ns: thread found by its stack range (direct call: 4.5 ns)</text></svg>
+<figcaption>The return address is swapped so that the target returns through the trampoline, which
+switches FS back. The saved state lives in a per-thread record that <code>r12</code> (callee-saved)
+points to.</figcaption>
+</figure>
+
+<h2>3. CUDA IPC with virtual handles</h2>
+<p>Intra-node GPU-to-GPU transfers use CUDA IPC. The shim gives the MPI <b>virtual IPC
+handles</b>, the same idea as MANA's virtual MPI ids. UCX only ever sees a handle naming
+<i>(exporter pid, fd number, size)</i> and the address where the shim mapped the peer's buffer.
+The real export and mapping behind them are dropped before each checkpoint and re-created after it,
+at the same fd number and the same address. UCX's IPC cache therefore stays valid, and stays on.</p>
+<figure class="card">
+<svg class="diagram" viewBox="0 0 960 420" role="img" aria-label="Virtual CUDA IPC handles"><defs><marker id="ip-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker><marker id="ip-u" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow-u"/></marker><marker id="ip-l" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow-l"/></marker></defs><text x="20" y="26" class="d-title">Rank A (exporter)</text><rect x="20" y="36" width="340" height="108" rx="10" class="d-upper"/><text x="32" y="54" class="d-sub">upper half</text><rect x="20" y="156" width="340" height="150" rx="10" class="d-lower"/><text x="32" y="174" class="d-sub">lower half</text><text x="600" y="26" class="d-title">Rank B (importer)</text><rect x="600" y="36" width="340" height="108" rx="10" class="d-upper"/><text x="612" y="54" class="d-sub">upper half</text><rect x="600" y="156" width="340" height="150" rx="10" class="d-lower"/><text x="612" y="174" class="d-sub">lower half</text><rect x="36" y="62" width="308" height="66" rx="8" class="d-box"/><text x="190.0" y="91.0" text-anchor="middle" class="d-text">cudaMalloc &#8594; VMM allocation</text><text x="190.0" y="106.0" text-anchor="middle" class="d-sub">POSIX-fd shareable (libmana_cuda_vmm.so)</text><rect x="36" y="184" width="148" height="56" rx="8" class="d-box"/><text x="110.0" y="208.0" text-anchor="middle" class="d-text">UCX cuda_ipc</text><text x="110.0" y="223.0" text-anchor="middle" class="d-sub">cuIpcGetMemHandle</text><rect x="196" y="184" width="148" height="56" rx="8" class="d-box-strong"/><text x="270.0" y="208.0" text-anchor="middle" class="d-text">shim: export</text><text x="270.0" y="223.0" text-anchor="middle" class="d-sub">real fd 86 (refreshed)</text><rect x="616" y="62" width="308" height="66" rx="8" class="d-box"/><text x="770.0" y="91.0" text-anchor="middle" class="d-text">reserved VA 0x1303000000</text><text x="770.0" y="106.0" text-anchor="middle" class="d-sub">stable: UCX caches this pointer</text><rect x="616" y="184" width="148" height="56" rx="8" class="d-box"/><text x="690.0" y="208.0" text-anchor="middle" class="d-text">UCX cuda_ipc</text><text x="690.0" y="223.0" text-anchor="middle" class="d-sub">cuIpcOpenMemHandle</text><rect x="776" y="184" width="148" height="56" rx="8" class="d-box-strong"/><text x="850.0" y="208.0" text-anchor="middle" class="d-text">shim: import</text><text x="850.0" y="223.0" text-anchor="middle" class="d-sub">pidfd_getfd &#8594; map</text><rect x="380" y="180" width="200" height="72" rx="10" class="d-step"/><text x="480" y="202" text-anchor="middle" class="d-text" style="font-weight:600">virtual handle</text><text x="480" y="222" text-anchor="middle" class="d-mono">{MANAIPC1, pid A,</text><text x="480" y="238" text-anchor="middle" class="d-mono">fd 86, 2 MB}</text><path d="M184 212 H194" class="d-line" marker-end="url(#ip-a)"/><path d="M270 184 V130" class="d-line-u" marker-end="url(#ip-u)"/><text x="278" y="176" class="d-sub">export</text><path d="M344 216 H378" class="d-line" marker-end="url(#ip-a)"/><path d="M580 216 H614" class="d-line" marker-end="url(#ip-a)"/><path d="M764 212 H774" class="d-line" marker-end="url(#ip-a)"/><path d="M850 184 V130" class="d-line-u" marker-end="url(#ip-u)"/><text x="858" y="176" class="d-sub">map</text><path d="M344 95 H614" class="d-line d-dash" marker-end="url(#ip-a)"/><text x="480" y="86" text-anchor="middle" class="d-sub">the same GPU memory</text><rect x="20" y="322" width="920" height="28" rx="6" class="d-step"/><text x="32" y="340" class="d-text" style="font-weight:600;font-size:12px">before a checkpoint</text><text x="180" y="340" class="d-sub">importer unmaps and releases (the VA stays reserved); exporter parks fd 86 on /dev/null</text><rect x="20" y="354" width="920" height="28" rx="6" class="d-step"/><text x="32" y="372" class="d-text" style="font-weight:600;font-size:12px">on resume</text><text x="180" y="372" class="d-sub">exporter re-exports, dup2 onto fd 86; global barrier; importer re-imports and maps at the same VA</text><rect x="20" y="386" width="920" height="28" rx="6" class="d-step"/><text x="32" y="404" class="d-text" style="font-weight:600;font-size:12px">at restart</text><text x="180" y="404" class="d-sub">new lower half and new UCX cache: nothing to restore</text></svg>
+<figcaption>Only VMM memory exported as a POSIX fd can be shared checkpointably, so the upper half's
+allocator makes <code>cudaMalloc</code> return such memory (right). Legacy <code>cudaMalloc</code>
+memory, if any, is reported not IPC-capable and UCX uses its copy protocol.</figcaption>
+</figure>
+<div class="grid2">
+  <div class="card">
+    <h3 style="margin-top:0">The VMM allocator (upper half)</h3>
+    <p>The driver's exported entry points are stubs: <code>cmpl</code>, <code>je</code>,
+    <code>call *slot(%rip)</code>. <code>libmana_cuda_vmm.so</code> decodes the stub and writes its
+    wrapper into the slot of <code>cuMemAlloc_v2</code>, <code>cuMemAllocPitch_v2</code> and
+    <code>cuMemFree_v2</code>. This is one pointer store, with no code patching, and it catches a
+    statically linked cudart and <code>cuGetProcAddress</code> users too.</p>
+    <p>Allocations of 1&nbsp;MB and larger get their own VMM allocation. Smaller ones are carved
+    out of 2&nbsp;MB VMM chunks, first fit, 512-byte aligned.</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">How UCX is steered</h3>
+    <p>UCX's <code>cuda_ipc</code> asks one pointer-attribute question per buffer. If the answer to
+    <code>IS_LEGACY_CUDA_IPC_CAPABLE</code> is yes, it calls <code>cuIpcGetMemHandle</code>. The shim
+    answers yes for VMM POSIX-fd memory, so UCX lands in the virtual handles. For real
+    <code>cudaMalloc</code> memory it answers no, because a real legacy export would make the process
+    impossible to checkpoint.</p>
+    <p>The same handles should serve Cray's GTL, which also speaks legacy IPC.</p>
+  </div>
+</div>
+
+<h2>4. Checkpoint, resume and restart</h2>
+<p>DMTCP runs pre-checkpoint hooks in plugin order (MANA first) and resume/restart hooks in reverse
+order (the CUDA plugin first). The design uses that order. MANA's lower-half gate keeps application
+threads out of MPI while the shims and MPI state are not ready; their CUDA calls wait on the CUDA
+lock.</p>
+<figure class="card">
+<svg class="diagram" viewBox="0 0 960 330" role="img" aria-label="Checkpoint, resume and restart sequence"><defs><marker id="tl-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow"/></marker><marker id="tl-u" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow-u"/></marker><marker id="tl-l" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="d-arrow-l"/></marker></defs><text x="20" y="50" class="d-title">Checkpoint</text><rect x="120" y="20" width="190" height="50" rx="8" style="fill:var(--upper);stroke:var(--upper-edge);stroke-width:1.5"/><text x="215.0" y="42" text-anchor="middle" class="d-text" style="font-size:12.5px;font-weight:600">drain MPI</text><text x="215.0" y="58" text-anchor="middle" class="d-sub">progressing barrier</text><path d="M311 45 H323" class="d-line" marker-end="url(#tl-a)"/><rect x="325" y="20" width="190" height="50" rx="8" style="fill:var(--lower);stroke:var(--lower-edge);stroke-width:1.5"/><text x="420.0" y="42" text-anchor="middle" class="d-text" style="font-size:12.5px;font-weight:600">release CUDA state</text><text x="420.0" y="58" text-anchor="middle" class="d-sub">IPC maps, host regs</text><path d="M516 45 H528" class="d-line" marker-end="url(#tl-a)"/><rect x="530" y="20" width="190" height="50" rx="8" style="fill:var(--gpu);stroke:var(--gpu-edge);stroke-width:1.5"/><text x="625.0" y="42" text-anchor="middle" class="d-text" style="font-size:12.5px;font-weight:600">lock + checkpoint</text><text x="625.0" y="58" text-anchor="middle" class="d-sub">GPU memory to host</text><path d="M721 45 H733" class="d-line" marker-end="url(#tl-a)"/><rect x="735" y="20" width="190" height="50" rx="8" style="fill:var(--surface-2);stroke:var(--axis);stroke-width:1.5"/><text x="830.0" y="42" text-anchor="middle" class="d-text" style="font-size:12.5px;font-weight:600">write image</text><text x="830.0" y="58" text-anchor="middle" class="d-sub">upper half only</text><text x="20" y="130" class="d-title">Resume</text><rect x="120" y="100" width="152" height="50" rx="8" style="fill:var(--gpu);stroke:var(--gpu-edge);stroke-width:1.5"/><text x="196.0" y="122" text-anchor="middle" class="d-text" style="font-size:12.5px;font-weight:600">restore + unlock</text><text x="196.0" y="138" text-anchor="middle" class="d-sub">RUNNING_AFTER</text><path d="M273 125 H285" class="d-line" marker-end="url(#tl-a)"/><rect x="287" y="100" width="152" height="50" rx="8" style="fill:var(--lower);stroke:var(--lower-edge);stroke-width:1.5"/><text x="363.0" y="122" text-anchor="middle" class="d-text" style="font-size:12.5px;font-weight:600">re-export, re-register</text><text x="363.0" y="138" text-anchor="middle" class="d-sub">same fd numbers</text><path d="M440 125 H452" class="d-line" marker-end="url(#tl-a)"/><rect x="454" y="100" width="152" height="50" rx="8" style="fill:var(--upper);stroke:var(--upper-edge);stroke-width:1.5"/><text x="530.0" y="122" text-anchor="middle" class="d-text" style="font-size:12.5px;font-weight:600">global barrier</text><path d="M607 125 H619" class="d-line" marker-end="url(#tl-a)"/><rect x="621" y="100" width="152" height="50" rx="8" style="fill:var(--lower);stroke:var(--lower-edge);stroke-width:1.5"/><text x="697.0" y="122" text-anchor="middle" class="d-text" style="font-size:12.5px;font-weight:600">re-map imports</text><text x="697.0" y="138" text-anchor="middle" class="d-sub">same VA</text><path d="M774 125 H786" class="d-line" marker-end="url(#tl-a)"/><rect x="788" y="100" width="152" height="50" rx="8" style="fill:var(--upper);stroke:var(--upper-edge);stroke-width:1.5"/><text x="864.0" y="122" text-anchor="middle" class="d-text" style="font-size:12.5px;font-weight:600">open the gate</text><text x="864.0" y="138" text-anchor="middle" class="d-sub">threads enter MPI</text><text x="20" y="210" class="d-title">Restart</text><rect x="120" y="180" width="152" height="50" rx="8" style="fill:var(--surface-2);stroke:var(--axis);stroke-width:1.5"/><text x="196.0" y="202" text-anchor="middle" class="d-text" style="font-size:12.5px;font-weight:600">rank from env</text><text x="196.0" y="218" text-anchor="middle" class="d-sub">PMI / Slurm variables</text><path d="M273 205 H285" class="d-line" marker-end="url(#tl-a)"/><rect x="287" y="180" width="152" height="50" rx="8" style="fill:var(--surface-2);stroke:var(--axis);stroke-width:1.5"/><text x="363.0" y="202" text-anchor="middle" class="d-text" style="font-size:12.5px;font-weight:600">restore memory</text><text x="363.0" y="218" text-anchor="middle" class="d-sub">no MPI_Init yet</text><path d="M440 205 H452" class="d-line" marker-end="url(#tl-a)"/><rect x="454" y="180" width="152" height="50" rx="8" style="fill:var(--gpu);stroke:var(--gpu-edge);stroke-width:1.5"/><text x="530.0" y="202" text-anchor="middle" class="d-text" style="font-size:12.5px;font-weight:600">restore GPU</text><text x="530.0" y="218" text-anchor="middle" class="d-sub">RUNNING_AFTER</text><path d="M607 205 H619" class="d-line" marker-end="url(#tl-a)"/><rect x="621" y="180" width="152" height="50" rx="8" style="fill:var(--upper);stroke:var(--upper-edge);stroke-width:1.5"/><text x="697.0" y="202" text-anchor="middle" class="d-text" style="font-size:12.5px;font-weight:600">MPI_Init + replay</text><text x="697.0" y="218" text-anchor="middle" class="d-sub">MANA's RUNNING_AFTER</text><path d="M774 205 H786" class="d-line" marker-end="url(#tl-a)"/><rect x="788" y="180" width="152" height="50" rx="8" style="fill:var(--upper);stroke:var(--upper-edge);stroke-width:1.5"/><text x="864.0" y="202" text-anchor="middle" class="d-text" style="font-size:12.5px;font-weight:600">open the gate</text><text x="20" y="262" class="d-sub">lower-half gate</text><rect x="120" y="252" width="822" height="10" rx="3" style="fill:var(--surface-2);stroke:var(--axis)"/><text x="128" y="278" class="d-sub">closed from the drain until "open the gate": application MPI calls wait in the upper half; their CUDA calls wait on the CUDA lock</text><rect x="120" y="300" width="16" height="12" rx="3" style="fill:var(--upper);stroke:var(--upper-edge);stroke-width:1.5"/><text x="142" y="310" class="d-sub">MANA</text><rect x="290" y="300" width="16" height="12" rx="3" style="fill:var(--gpu);stroke:var(--gpu-edge);stroke-width:1.5"/><text x="312" y="310" class="d-sub">DMTCP CUDA plugin</text><rect x="460" y="300" width="16" height="12" rx="3" style="fill:var(--lower);stroke:var(--lower-edge);stroke-width:1.5"/><text x="482" y="310" class="d-sub">shims</text><rect x="630" y="300" width="16" height="12" rx="3" style="fill:var(--surface-2);stroke:var(--axis);stroke-width:1.5"/><text x="652" y="310" class="d-sub">DMTCP</text></svg>
+<figcaption>Per rank. "Gate closed" means application threads that call MPI wait in the upper half.
+The DMTCP CUDA plugin is unmodified.</figcaption>
+</figure>
+
+<h2>5. Results</h2>
+<h3>Ping-pong on device buffers</h3>
+<p>Two ranks on one GPU, <code>MPI_Send</code>/<code>MPI_Recv</code> of a device buffer; median of
+three runs per configuration. <i>Native + VMM allocator</i> runs without MANA, with only the
+allocator preloaded, which isolates its cost: none measurable.</p>
+<div class="card">
+  <div class="legend" id="leg-bw"></div>
+  <div class="chart" id="chart-bw"></div>
+  <figcaption>Bandwidth (log scale) from 4&nbsp;KB on; for smaller messages see the latency
+chart. MANA without IPC (the earlier prototype state)
+  sits with native without IPC; MANA with virtual IPC sits with native.</figcaption>
+</div>
+<div class="grid2">
+  <div class="card">
+    <div class="legend" id="leg-lat"></div>
+    <div class="chart" id="chart-lat"></div>
+    <figcaption>Latency for small messages. The device path costs about 88&nbsp;&micro;s natively
+    on this laptop GPU (host buffers: 0.5&nbsp;&micro;s). MANA adds about 7.5&nbsp;&micro;s (25&nbsp;&micro;s at 8&nbsp;B), from
+    forwarding the roughly 370 CUDA calls UCX makes per message.</figcaption>
+  </div>
+  <div class="card">
+    <div class="legend" id="leg-ck"></div>
+    <div class="chart" id="chart-ck"></div>
+    <figcaption>Checkpoint time by device memory per rank, 2 ranks. The VMM allocator does not
+    change it. Images are about 450&nbsp;MB of process state plus the device memory.</figcaption>
+  </div>
+</div>
+<details class="card">
+  <summary>Data tables</summary>
+  <div class="tablewrap"><table><tr><th>size</th><th>Native, CUDA IPC</th><th>Native, no IPC</th><th>Native + VMM allocator</th><th>MANA, no IPC</th><th>MANA, virtual IPC</th></tr><tr><td>8 B</td><td>89.8 &micro;s &middot; 0.00 GB/s</td><td>108.1 &micro;s &middot; 0.00 GB/s</td><td>90.3 &micro;s &middot; 0.00 GB/s</td><td>140.1 &micro;s &middot; 0.00 GB/s</td><td>114.4 &micro;s &middot; 0.00 GB/s</td></tr><tr><td>64 B</td><td>87.8 &micro;s &middot; 0.00 GB/s</td><td>91.6 &micro;s &middot; 0.00 GB/s</td><td>88.3 &micro;s &middot; 0.00 GB/s</td><td>104.8 &micro;s &middot; 0.00 GB/s</td><td>95.3 &micro;s &middot; 0.00 GB/s</td></tr><tr><td>512 B</td><td>87.8 &micro;s &middot; 0.01 GB/s</td><td>91.6 &micro;s &middot; 0.01 GB/s</td><td>88.4 &micro;s &middot; 0.01 GB/s</td><td>102.3 &micro;s &middot; 0.01 GB/s</td><td>95.3 &micro;s &middot; 0.01 GB/s</td></tr><tr><td>4 KB</td><td>87.8 &micro;s &middot; 0.05 GB/s</td><td>92.1 &micro;s &middot; 0.04 GB/s</td><td>88.3 &micro;s &middot; 0.05 GB/s</td><td>102.9 &micro;s &middot; 0.04 GB/s</td><td>95.3 &micro;s &middot; 0.04 GB/s</td></tr><tr><td>32 KB</td><td>87.9 &micro;s &middot; 0.37 GB/s</td><td>16.9 &micro;s &middot; 1.94 GB/s</td><td>88.4 &micro;s &middot; 0.37 GB/s</td><td>27.3 &micro;s &middot; 1.20 GB/s</td><td>95.5 &micro;s &middot; 0.34 GB/s</td></tr><tr><td>256 KB</td><td>88.3 &micro;s &middot; 2.97 GB/s</td><td>86.4 &micro;s &middot; 3.03 GB/s</td><td>88.7 &micro;s &middot; 2.95 GB/s</td><td>98.0 &micro;s &middot; 2.68 GB/s</td><td>95.9 &micro;s &middot; 2.73 GB/s</td></tr><tr><td>1 MB</td><td>89.5 &micro;s &middot; 11.71 GB/s</td><td>258.2 &micro;s &middot; 4.06 GB/s</td><td>90.3 &micro;s &middot; 11.61 GB/s</td><td>271.6 &micro;s &middot; 3.86 GB/s</td><td>97.5 &micro;s &middot; 10.76 GB/s</td></tr><tr><td>4 MB</td><td>112.7 &micro;s &middot; 37.23 GB/s</td><td>837.7 &micro;s &middot; 5.01 GB/s</td><td>113.4 &micro;s &middot; 37.00 GB/s</td><td>859.1 &micro;s &middot; 4.88 GB/s</td><td>120.6 &micro;s &middot; 34.79 GB/s</td></tr><tr><td>16 MB</td><td>184.2 &micro;s &middot; 91.08 GB/s</td><td>3167.0 &micro;s &middot; 5.30 GB/s</td><td>184.5 &micro;s &middot; 90.95 GB/s</td><td>3232.9 &micro;s &middot; 5.19 GB/s</td><td>191.8 &micro;s &middot; 87.48 GB/s</td></tr></table></div>
+  <div class="tablewrap" style="margin-top:14px"><table><tr><th>device memory / rank</th><th>allocator</th><th>checkpoint</th><th>image / rank</th><th>restart</th></tr><tr><td>64 MB</td><td>cudaMalloc</td><td>0.67 s</td><td>514 MB</td><td>2.29 s</td></tr><tr><td>64 MB</td><td>VMM</td><td>0.66 s</td><td>514 MB</td><td>2.25 s</td></tr><tr><td>512 MB</td><td>cudaMalloc</td><td>1.28 s</td><td>962 MB</td><td>2.95 s</td></tr><tr><td>512 MB</td><td>VMM</td><td>1.07 s</td><td>962 MB</td><td>2.90 s</td></tr><tr><td>2048 MB</td><td>cudaMalloc</td><td>3.39 s</td><td>2498 MB</td><td>4.26 s</td></tr><tr><td>2048 MB</td><td>VMM</td><td>3.18 s</td><td>2498 MB</td><td>4.73 s</td></tr></table></div>
+</details>
+
+<h3>Correctness</h3>
+<div class="card tablewrap">
+<table>
+<tr><th>Test</th><th>Result</th></tr>
+<tr><td>MANA end-to-end suite, default mode</td><td class="ok">23/24 (known <code>cartesian</code> bug)</td></tr>
+<tr><td>MANA suite with <code>MANA_CUDA=1</code> (every test through lazy init and deferred restart)</td><td class="ok">23/24 (same)</td></tr>
+<tr><td><code>cuda_aware</code>: device Sendrecv, a device Irecv pending across checkpoints, in-place Allreduce, 3 cycles</td><td class="ok">10/10 runs</td></tr>
+<tr><td>Plain <code>cudaMalloc</code> app, virtual IPC with UCX cache on, 3 generations of checkpoint, resume, checkpoint, restart</td><td class="ok">passes, data checked every iteration</td></tr>
+<tr><td>VMM allocator with shared and static cudart</td><td class="ok">passes</td></tr>
+<tr><td>Checkpoint/restart with 64&nbsp;MB to 2&nbsp;GB device memory per rank</td><td class="ok">passes, contents verified</td></tr>
+<tr><td>Managed memory (<code>cudaMallocManaged</code>)</td><td class="no">checkpoint API returns 801 (also without MANA)</td></tr>
+</table>
+</div>
+
+<h2>6. Problems found on the way</h2>
+<div class="card tablewrap">
+<table class="text">
+<tr><th>Problem</th><th>Cause</th><th>Fix</th></tr>
+<tr><td>Every MANA restart hung with a CUDA-enabled MPI (CUDA or not)</td><td style="text-align:left">The upper-half mmap arena mapped over the driver's UVA reservation with <code>MAP_FIXED</code></td><td style="text-align:left">Arena never clobbers; retries past foreign mappings</td></tr>
+<tr><td>GPU restore: <code>CUDA_ERROR_OUT_OF_MEMORY</code></td><td style="text-align:left">The arena moved the driver's hinted / <code>MAP_FIXED_NOREPLACE</code> mappings; the restored layout differed</td><td style="text-align:left">Honor <code>NOREPLACE</code> and free hints; keep <code>0x200000000</code> free</td></tr>
+<tr><td>Checkpoint crashed in the driver</td><td style="text-align:left">An NVML in the lower half exchanged tables with the upper half's driver</td><td style="text-align:left">Shim <code>libnvidia-ml</code> too</td></tr>
+<tr><td>Restore failed (<code>INVALID_VALUE</code>)</td><td style="text-align:left">UCX/MPICH had pinned lower-half memory (<code>cuMemHostRegister</code>)</td><td style="text-align:left">Shims release registrations before checkpoint, restore on resume</td></tr>
+<tr><td>Restore hung</td><td style="text-align:left">Called before DMTCP resumed the driver's helper thread</td><td style="text-align:left">MPI init and replay deferred to <code>RUNNING_AFTER</code></td></tr>
+<tr><td>Intermittent checkpoint hang (3/5)</td><td style="text-align:left">MANA's drain: a blocking barrier while a peer's rendezvous needed this rank's progress</td><td style="text-align:left">The drain round's barrier keeps MPI progressing</td></tr>
+<tr><td>190&nbsp;ns per forwarded call</td><td style="text-align:left">Two <code>gettid</code> system calls to find the thread</td><td style="text-align:left">Threads found by stack range: 20&nbsp;ns</td></tr>
+</table>
+</div>
+
+<h2>7. Limits and next steps</h2>
+<div class="grid2">
+  <div class="card">
+    <h3 style="margin-top:0">Open items</h3>
+    <ul>
+      <li>CUDA calls from threads that the lower half creates get "no device" (none seen with UCX); fix with an upper-half proxy thread.</li>
+      <li>Small allocations share a chunk: an IPC export exposes neighbors within the process; up to 2&nbsp;MB extra per device.</li>
+      <li>UCX's memory hooks warn on suballocated frees natively (they are off under MANA).</li>
+      <li>CUDA objects of an old lower half are restored and leak at each restart (small).</li>
+      <li>Multi-GPU peer access, other drivers' UVA layout: to verify.</li>
+      <li>Ask NVIDIA about legacy-IPC support in the checkpoint API.</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">Perlmutter (Cray MPICH)</h3>
+    <ul>
+      <li>Check <code>cuCheckpointProcess*</code> with plain DMTCP on the A100 nodes.</li>
+      <li>Regenerate the shims for <code>libcudart.so.12</code>; list what GTL loads.</li>
+      <li>GTL uses legacy IPC: verify the virtual handles and allocator apply unchanged.</li>
+      <li>4 ranks per node, one GPU each; GPU binding at restart.</li>
+      <li><b>Main risk:</b> inter-node GPU RDMA registers device memory with the NIC. Whether the
+      checkpoint API accepts that is unknown; if not, release registrations after the drain, like the
+      host registrations.</li>
+    </ul>
+  </div>
+</div>
+<p class="meta" style="color:var(--text-muted);font-size:13px;margin-top:28px">
+Code: <code>mpi-proxy-split/cuda-forward/</code> (shims, runtime, virtual IPC, VMM allocator) and
+MANA changes listed in <code>cuda/PLAN-cuda-aware-mana.md</code>. Benchmark programs:
+<code>cuda/experiments/</code>.</p>
+</main>
+
+<script>
+const DATA = {"sizes": [8, 64, 512, 4096, 32768, 262144, 1048576, 4194304, 16777216], "pp": {"mana_noipc": {"8": {"lat": 140.07, "bw": 0.1}, "64": {"lat": 104.79, "bw": 0.6}, "512": {"lat": 102.34, "bw": 5.0}, "4096": {"lat": 102.88, "bw": 39.8}, "32768": {"lat": 27.27, "bw": 1201.4}, "262144": {"lat": 97.97, "bw": 2675.9}, "1048576": {"lat": 271.6, "bw": 3860.7}, "4194304": {"lat": 859.07, "bw": 4882.4}, "16777216": {"lat": 3232.88, "bw": 5189.6}}, "mana_virtual_ipc": {"8": {"lat": 114.43, "bw": 0.1}, "64": {"lat": 95.31, "bw": 0.7}, "512": {"lat": 95.32, "bw": 5.4}, "4096": {"lat": 95.26, "bw": 43.0}, "32768": {"lat": 95.5, "bw": 343.1}, "262144": {"lat": 95.92, "bw": 2732.9}, "1048576": {"lat": 97.48, "bw": 10756.6}, "4194304": {"lat": 120.56, "bw": 34788.6}, "16777216": {"lat": 191.78, "bw": 87484.0}}, "native_ipc": {"8": {"lat": 89.78, "bw": 0.1}, "64": {"lat": 87.83, "bw": 0.7}, "512": {"lat": 87.8, "bw": 5.8}, "4096": {"lat": 87.77, "bw": 46.7}, "32768": {"lat": 87.91, "bw": 372.8}, "262144": {"lat": 88.3, "bw": 2968.7}, "1048576": {"lat": 89.51, "bw": 11714.8}, "4194304": {"lat": 112.65, "bw": 37234.4}, "16777216": {"lat": 184.21, "bw": 91077.7}}, "native_noipc": {"8": {"lat": 108.07, "bw": 0.1}, "64": {"lat": 91.63, "bw": 0.7}, "512": {"lat": 91.62, "bw": 5.6}, "4096": {"lat": 92.09, "bw": 44.5}, "32768": {"lat": 16.89, "bw": 1940.6}, "262144": {"lat": 86.42, "bw": 3033.5}, "1048576": {"lat": 258.19, "bw": 4061.2}, "4194304": {"lat": 837.68, "bw": 5007.1}, "16777216": {"lat": 3166.97, "bw": 5297.6}}, "native_vmm_alloc": {"8": {"lat": 90.3, "bw": 0.1}, "64": {"lat": 88.26, "bw": 0.7}, "512": {"lat": 88.37, "bw": 5.8}, "4096": {"lat": 88.33, "bw": 46.4}, "32768": {"lat": 88.36, "bw": 370.8}, "262144": {"lat": 88.73, "bw": 2954.5}, "1048576": {"lat": 90.33, "bw": 11608.3}, "4194304": {"lat": 113.36, "bw": 36999.8}, "16777216": {"lat": 184.47, "bw": 90946.9}}}, "ck_mb": [64, 512, 2048], "ck": {"mana_cudamalloc": {"64": {"ckpt": 0.671183825, "image": 514.0, "restart": 2.285171896}, "512": {"ckpt": 1.280617191, "image": 962.0, "restart": 2.948149153}, "2048": {"ckpt": 3.387695776, "image": 2498.0, "restart": 4.262124738}}, "mana_vmm_alloc": {"64": {"ckpt": 0.656792969, "image": 514.0, "restart": 2.253101555}, "512": {"ckpt": 1.072962183, "image": 962.0, "restart": 2.90272949}, "2048": {"ckpt": 3.180192968, "image": 2498.0, "restart": 4.730406612}}}};
+
+// Theme toggle (per viewer; storage may be unavailable).
+(function () {
+  const root = document.documentElement;
+  try { const t = localStorage.getItem("mana-report-theme"); if (t) root.dataset.theme = t; } catch (e) {}
+  document.getElementById("theme").addEventListener("click", () => {
+    const dark = root.dataset.theme
+      ? root.dataset.theme === "dark"
+      : matchMedia("(prefers-color-scheme: dark)").matches;
+    root.dataset.theme = dark ? "light" : "dark";
+    try { localStorage.setItem("mana-report-theme", root.dataset.theme); } catch (e) {}
+  });
+})();
+
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent, text) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text !== undefined) e.textContent = text;
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function fmtBytes(n) {
+  if (n >= 1 << 20) return (n / (1 << 20)) + " MB";
+  if (n >= 1024) return (n / 1024) + " KB";
+  return n + " B";
+}
+function legend(id, series) {
+  const box = document.getElementById(id);
+  box.innerHTML = series.map(s =>
+    `<span><span class="sw" style="border-color:var(${s.color});${s.dash ? "border-top-style:dashed" : ""}"></span>${s.name}</span>`).join("");
+}
+
+// A line chart: x categorical-in-order or numeric (log), y linear or log.
+function lineChart(opts) {
+  const host = document.getElementById(opts.id);
+  const W = opts.width || 960, H = opts.height || 360, m = { l: 64, r: opts.right || 120, t: 14, b: 46 };
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": opts.label }, host);
+  const xs = opts.x, n = xs.length;
+  // Evenly spaced categories, or (xnumeric) positions proportional to x.
+  const x0 = xs[0], x1 = xs[n - 1];
+  const xpos = i => m.l + (n === 1 ? 0 : (opts.xnumeric ? (xs[i] - x0) / (x1 - x0) : i / (n - 1)) * (W - m.l - m.r));
+  const vals = opts.series.flatMap(s => s.values.filter(v => v != null));
+  let ymin = opts.ymin != null ? opts.ymin : Math.min(...vals);
+  let ymax = opts.ymax != null ? opts.ymax : Math.max(...vals);
+  const log = opts.ylog;
+  if (log) { ymin = Math.pow(10, Math.floor(Math.log10(ymin))); ymax = Math.pow(10, Math.ceil(Math.log10(ymax))); }
+  const yv = v => log ? Math.log10(v) : v;
+  const ypos = v => H - m.b - (yv(v) - yv(ymin)) / (yv(ymax) - yv(ymin)) * (H - m.t - m.b);
+  // grid + y ticks
+  const ticks = log ? (() => { const t = []; for (let e = Math.log10(ymin); e <= Math.log10(ymax) + 1e-9; e++) t.push(Math.pow(10, e)); return t; })()
+                    : opts.yticks;
+  ticks.forEach(t => {
+    el("line", { x1: m.l, x2: W - m.r, y1: ypos(t), y2: ypos(t), class: "gridline" }, svg);
+    el("text", { x: m.l - 8, y: ypos(t) + 4, "text-anchor": "end", class: "tick" }, svg, opts.yfmt(t));
+  });
+  el("line", { x1: m.l, x2: W - m.r, y1: H - m.b, y2: H - m.b, class: "baseline" }, svg);
+  xs.forEach((x, i) => el("text", { x: xpos(i), y: H - m.b + 18, "text-anchor": "middle", class: "tick" }, svg, opts.xfmt(x)));
+  el("text", { x: (m.l + W - m.r) / 2, y: H - 6, "text-anchor": "middle", class: "axis-title" }, svg, opts.xtitle);
+  el("text", { x: 14, y: (m.t + H - m.b) / 2, "text-anchor": "middle", class: "axis-title",
+               transform: `rotate(-90 14 ${(m.t + H - m.b) / 2})` }, svg, opts.ytitle);
+  // lines + markers
+  opts.series.forEach(s => {
+    const pts = s.values.map((v, i) => v == null ? null : [xpos(i), ypos(v)]).filter(p => p);
+    el("path", { d: "M" + pts.map(p => p.join(",")).join(" L"), fill: "none",
+                 stroke: `var(${s.color})`, "stroke-width": 2, "stroke-linejoin": "round",
+                 "stroke-dasharray": s.dash || "none" }, svg);
+    pts.forEach(p => el("circle", { cx: p[0], cy: p[1], r: 3.5, fill: `var(${s.color})`,
+                                    stroke: "var(--surface-1)", "stroke-width": 1.5 }, svg));
+  });
+  // direct labels at the right end, de-collided
+  const ends = opts.series.map(s => ({ s, y: ypos(s.values[s.values.length - 1]) })).sort((a, b) => a.y - b.y);
+  for (let i = 1; i < ends.length; i++) if (ends[i].y - ends[i - 1].y < 14) ends[i].y = ends[i - 1].y + 14;
+  ends.forEach(e => el("text", { x: W - m.r + 10, y: e.y + 4, class: "dlabel" }, svg, e.s.short || e.s.name));
+  // hover: crosshair + tooltip
+  const cross = el("line", { y1: m.t, y2: H - m.b, stroke: "var(--axis)", "stroke-width": 1, visibility: "hidden" }, svg);
+  const tip = document.createElement("div"); tip.className = "tip"; host.appendChild(tip);
+  const hit = el("rect", { x: m.l - 20, y: m.t, width: W - m.l - m.r + 40, height: H - m.t - m.b, fill: "transparent" }, svg);
+  hit.addEventListener("mousemove", ev => {
+    const r = svg.getBoundingClientRect(), sx = (ev.clientX - r.left) * W / r.width;
+    let i = 0;
+    for (let j = 1; j < n; j++) if (Math.abs(xpos(j) - sx) < Math.abs(xpos(i) - sx)) i = j;
+    cross.setAttribute("x1", xpos(i)); cross.setAttribute("x2", xpos(i)); cross.setAttribute("visibility", "visible");
+    tip.innerHTML = `<div class="t">${opts.xfmt(xs[i])}</div>` + opts.series.map(s =>
+      `<div class="r"><span><span class="k" style="background:var(${s.color})"></span>${s.name}</span><b>${s.values[i] == null ? "-" : opts.tipfmt(s.values[i])}</b></div>`).join("");
+    tip.style.display = "block";
+    const px = xpos(i) * r.width / W, left = px > r.width * 0.6 ? px - tip.offsetWidth - 14 : px + 14;
+    tip.style.left = left + "px"; tip.style.top = "10px";
+  });
+  hit.addEventListener("mouseleave", () => { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); });
+}
+
+const CFG = [
+  { key: "native_ipc", name: "Native, CUDA IPC", short: "Native", color: "--series-1" },
+  { key: "native_vmm_alloc", name: "Native + VMM allocator", short: "Native + VMM", color: "--series-3", dash: "6 4" },
+  { key: "mana_virtual_ipc", name: "MANA, virtual IPC", short: "MANA, virtual IPC", color: "--series-2" },
+  { key: "native_noipc", name: "Native, no IPC", short: "Native, no IPC", color: "--series-4", dash: "2 4" },
+  { key: "mana_noipc", name: "MANA, no IPC", short: "MANA, no IPC", color: "--series-5", dash: "8 3 2 3" },
+];
+const sizes = DATA.sizes;
+const series = (field, pick) => CFG.map(c => ({ ...c, values: pick.map(n => DATA.pp[c.key][n] ? DATA.pp[c.key][n][field] : null) }));
+
+legend("leg-bw", CFG);
+const big = sizes.filter(n => n >= 4096);
+lineChart({ id: "chart-bw", label: "Bandwidth by message size", x: big, ylog: true,
+  series: series("bw", big).map(s => ({ ...s, values: s.values.map(v => v / 1000) })),
+  xfmt: fmtBytes, yfmt: v => v + " GB/s", tipfmt: v => v.toFixed(v < 1 ? 3 : 1) + " GB/s",
+  xtitle: "message size", ytitle: "bandwidth (GB/s)", right: 150 });
+
+const small = sizes.filter(n => n <= 4096);
+legend("leg-lat", CFG);
+lineChart({ id: "chart-lat", label: "Latency for small messages", x: small, width: 520, height: 380,
+  series: series("lat", small), ymin: 0, ymax: 160, yticks: [0, 40, 80, 120, 160],
+  xfmt: fmtBytes, yfmt: v => v + " µs", tipfmt: v => v.toFixed(1) + " µs",
+  xtitle: "message size", ytitle: "one-way latency (µs)", right: 128 });
+
+const CK = [
+  { key: "mana_cudamalloc", name: "cudaMalloc memory", short: "cudaMalloc", color: "--series-1" },
+  { key: "mana_vmm_alloc", name: "VMM allocator", short: "VMM", color: "--series-2", dash: "6 4" },
+];
+legend("leg-ck", CK);
+lineChart({ id: "chart-ck", label: "Checkpoint time by device memory", x: DATA.ck_mb, xnumeric: true, width: 520, height: 380,
+  series: CK.map(c => ({ ...c, values: DATA.ck_mb.map(mb => DATA.ck[c.key][mb].ckpt) })),
+  ymin: 0, ymax: 4, yticks: [0, 1, 2, 3, 4],
+  xfmt: v => v >= 1024 ? (v / 1024) + " GB" : v + " MB", yfmt: v => v + " s", tipfmt: v => v.toFixed(2) + " s",
+  xtitle: "device memory per rank", ytitle: "checkpoint time (s)", right: 90 });
+</script>
+</body>
+</html>

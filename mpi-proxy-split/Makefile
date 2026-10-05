@@ -22,6 +22,10 @@ endif
 #   mana_coordinator.o (needed to compile dmtcp_coordinator)
 
 # Subdirectories needed to install
+# CUDA-aware MPI support is built if there are cuda.h and libcuda.so.1.
+CUDA_HOME ?= $(shell d=$$(dirname $$(command -v nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc))/..; echo $$d)
+HAVE_CUDA = $(and $(wildcard $(CUDA_HOME)/include/cuda.h),$(shell /sbin/ldconfig -p 2>/dev/null | grep -q 'libcuda.so.1 ' && echo yes))
+
 LOWER_HALF_SRCDIR=lower-half
 WRAPPERS_SRCDIR=mpi-wrappers
 LH_SRCDIR=lower-half
@@ -116,6 +120,12 @@ install: ${MANA_COORD_OBJS}
 	+ make ${MANA_ROOT}/lib/dmtcp/libmpistub.so
 	+ make ${MANA_ROOT}/lib/dmtcp/libmpistub_audit.so
 	+ make -C ${LH_SRCDIR} install
+	@ # CUDA-aware MPI (mana_launch --cuda): with a CUDA toolkit and driver.
+	+ if [ -n "$(HAVE_CUDA)" ]; then \
+	    make -C cuda-forward install && \
+	    make -C ${DMTCP_ROOT}/plugin/cuda libdmtcp_cuda.so && \
+	    cp -f ${DMTCP_ROOT}/plugin/cuda/libdmtcp_cuda.so ${MANA_ROOT}/lib/dmtcp/; \
+	  fi
 
 tidy:
 	rm -f *~ .*.swp dmtcp_restart_script*.sh ckpt_*.dmtcp
@@ -123,6 +133,7 @@ tidy:
 	rm -rf dmtcp_coordinator_db-*.json
 
 clean: tidy
+	- make -C cuda-forward clean
 	rm -f ${LIBOBJS} ${MANA_COORD_OBJS}
 	rm -f libmana.so
 	rm -f ${MANA_ROOT}/lib/dmtcp/libmana.so

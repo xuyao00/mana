@@ -33,6 +33,10 @@
 #include "lower-half-api.h"
 #include "dmtcp.h"
 #include "mpi_plugin.h"
+#include "cuda-forward/fwd-runtime.h"
+#include "switch-context.h"
+#include <dlfcn.h>
+#include <pthread.h>
 
 int initialized = 0;
 
@@ -133,4 +137,105 @@ static void readLhInfoAddr() {
     }
   }
   pdlsym = (proxyDlsym_t)lh_info->lh_dlsym;
+}
+
+// CUDA-aware MPI (MANA_CUDA_FORWARD; see cuda-forward/fwd-runtime.c): the
+// lower half's libcuda/libcudart are shims forwarding to these libraries of
+// the upper half.  Runs in the upper half, with its FS.
+static void *
+mana_uh_dlsym(const char *soname, const char *symbol)
+{
+  void *handle = dlopen(soname, RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
+  if (handle == NULL) {
+    handle = dlopen(soname, RTLD_NOW | RTLD_GLOBAL);
+  }
+  return handle != NULL ? dlsym(handle, symbol) : NULL;
+}
+
+// Tells the forwarding shims the upper half's FS of thread 'real_tid'.
+void
+mana_fwd_note_thread(pid_t real_tid, unsigned long fs)
+{
+  initialize_wrappers();
+  FwdCtl *ctl = (FwdCtl *)lh_info->fwd_ctl;
+  if (ctl == NULL) {
+    return;
+  }
+  ctl->uh_dlsym = mana_uh_dlsym;
+  // The thread's stack, by which the shims find the thread without a
+  // system call.  Called on the thread itself.
+  unsigned long lo = 0, hi = 0;
+  if (real_tid == dmtcp_get_real_pid()) {
+    lo = (unsigned long)lh_info->uh_stack_start;
+    hi = (unsigned long)lh_info->uh_stack_end;
+  } else {
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+      void *addr;
+      size_t size;
+      if (pthread_attr_getstack(&attr, &addr, &size) == 0) {
+        lo = (unsigned long)addr;
+        hi = lo + size;
+      }
+      pthread_attr_destroy(&attr);
+    }
+  }
+  if (ctl->register_thread_stack != NULL) {
+    ctl->register_thread_stack(real_tid, fs, lo, hi);
+  } else {
+    ctl->register_thread(real_tid, fs);
+  }
+}
+
+// With MANA_CUDA_FORWARD, the lower half initializes MPI when the upper half
+// asks (lh_info->lh_mpi_init): at the application's MPI_Init(), and at
+// restart after the CUDA plugin restored the GPU (DMTCP_EVENT_RESTART runs in
+// reverse plugin order), since the MPI's CUDA calls go to this half's CUDA.
+extern "C" pid_t dmtcp_get_real_tid() __attribute((weak));
+
+void
+mana_lower_half_mpi_init()
+{
+  initialize_wrappers();
+  if (lh_info->lh_mpi_init != NULL) {
+    mana_fwd_note_thread(dmtcp_get_real_tid(), getFS());
+    JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+    ((void (*)(void))lh_info->lh_mpi_init)();
+    RETURN_TO_UPPER_HALF();
+  }
+}
+
+// MANA_CUDA_FORWARD: see FwdCtl::before_ckpt/after_resume.  Run with the
+// lower half's FS (they are lower-half code that uses its libc).
+void
+mana_fwd_before_ckpt()
+{
+  FwdCtl *ctl = lh_info != NULL ? (FwdCtl *)lh_info->fwd_ctl : NULL;
+  if (ctl != NULL && ctl->before_ckpt != NULL) {
+    JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+    ctl->before_ckpt();
+    RETURN_TO_UPPER_HALF();
+  }
+}
+
+void
+mana_fwd_after_resume()
+{
+  FwdCtl *ctl = lh_info != NULL ? (FwdCtl *)lh_info->fwd_ctl : NULL;
+  if (ctl != NULL && ctl->after_resume != NULL) {
+    JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+    ctl->after_resume();
+    RETURN_TO_UPPER_HALF();
+  }
+}
+
+void
+mana_fwd_after_resume_peers()
+{
+  FwdCtl *ctl = lh_info != NULL ? (FwdCtl *)lh_info->fwd_ctl : NULL;
+  if (ctl != NULL && ctl->after_resume_peers != NULL) {
+    JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+    ctl->after_resume_peers();
+    RETURN_TO_UPPER_HALF();
+  }
 }

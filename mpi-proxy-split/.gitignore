@@ -2,6 +2,7 @@
 # sources.
 test/*
 !test/*.c
+!test/*.cu
 !test/*.f90
 !test/*.h
 !test/*.py

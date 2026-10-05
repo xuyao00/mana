@@ -794,6 +794,37 @@ close_lower_half_except_blocked()
   g_drain_stats.t_wait_lower_half += drainStatsNow() - t;
 }
 
+static bool g_restart_mpi_deferred = false;
+// A checkpoint released the lower half's CUDA host registrations; see
+// mana_fwd_before_ckpt().
+static bool g_fwd_resume_pending = false;
+
+// The MPI part of restart: virtual ids, the logged MPI state, the drained
+// messages, MPI files.
+static void
+restore_mpi_state_on_restart()
+{
+  dmtcp_local_barrier("MPI:updateEnviron");
+  seq_num_reset();
+  dmtcp_local_barrier("MPI:seq_num_reset");
+  init_predefined_virt_ids();
+  reconstruct_descriptors();
+  dmtcp_local_barrier("MPI:Reset-Drain-Send-Recv-Counters");
+  resetDrainCounters(); // p2p_drain_send_recv.cpp
+  char str[1];
+  MPI_MANA_Internal(str); // This does nothing.  Modify in lower-half
+                         // for easy debugging of lower half during restart.
+                         // See definition in mpi-wrappers/mpi_wrappers.cpp
+  mana_state = RESTART_REPLAY;
+  dmtcp_global_barrier("MPI:replayMpiP2pOnRestart");
+  replayMpiP2pOnRestart(); // p2p_log_replay.cpp
+  dmtcp_local_barrier("MPI:p2p_log_replay.cpp-void");
+  const char *file = get_mpi_file_filename();
+  restore_mpi_files(file);
+  dmtcp_local_barrier("MPI:Restore-MPI-Files");
+  mana_state = RUNNING;
+}
+
 static void
 mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 {
@@ -817,6 +848,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       pid_t real_tid = dmtcp_get_real_tid();
       unsigned long fs = getFS();
       g_upper_half_fsbase->insert(std::make_pair(real_tid, fs));
+      mana_fwd_note_thread(real_tid, fs);
 
       if (g_file_flags_map != NULL) {
         delete g_file_flags_map;
@@ -871,6 +903,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       unsigned long fs = getFS();
       g_upper_half_fsbase->insert(std::make_pair(real_tid, fs));
       DmtcpMutexUnlock(&g_upper_half_fsbase_lock);
+      mana_fwd_note_thread(real_tid, fs);
       break;
     }
 
@@ -893,6 +926,8 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       while (!__atomic_load_n(&g_libmpi_is_initialized, __ATOMIC_ACQUIRE)) {
         usleep(1000);
       }
+      // The checkpoint thread calls MPI in the drain, and so the MPI's CUDA.
+      mana_fwd_note_thread(dmtcp_get_real_tid(), getFS());
       resetDrainStats();  // p2p_drain_send_recv.cpp
       uint64_t t0 = drainStatsNow();
       mana_state = CKPT_COLLECTIVE;
@@ -934,6 +969,11 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
         g_drain_stats.t_collective += drainStatsNow() - t_nbc;
       }
       reportDrainStats();  // With MANA_DRAIN_STATS set
+      // MPI is quiet now; next, the CUDA plugin checkpoints the GPU (its
+      // PRESUSPEND runs after ours).  Leave out the lower half's CUDA state
+      // that refers to lower-half memory.
+      mana_fwd_before_ckpt();
+      g_fwd_resume_pending = true;
       printEventToStderr("EVENT_PRESUSPEND (done)");
       break;
     }
@@ -941,8 +981,11 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
     case DMTCP_EVENT_PRECHECKPOINT: {
       printEventToStderr("EVENT_PRECHECKPOINT (drain send/recv)");
       // The threads are suspended now; let them back into the lower half
-      // when they resume.
-      allow_threads_to_enter_lower_half();
+      // when they resume.  With MANA_CUDA_FORWARD, not before the lower
+      // half's CUDA state (IPC mappings) is back, in RUNNING_AFTER.
+      if (lh_info->fwd_ctl == NULL) {
+        allow_threads_to_enter_lower_half();
+      }
       // dmtcp_skip_memory_region_ckpting() saves only the regions in
       // uh_mmaps and refetches it when empty.  A stale list would miss the
       // regions mapped since the last checkpoint.
@@ -993,27 +1036,46 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 
       g_upper_half_fsbase->clear();
       g_upper_half_fsbase->insert(std::make_pair(dmtcp_get_real_tid(), getFS()));
-
-      dmtcp_local_barrier("MPI:updateEnviron");
-      seq_num_reset();
-      dmtcp_local_barrier("MPI:seq_num_reset");
-      init_predefined_virt_ids();
-      reconstruct_descriptors();
-      dmtcp_local_barrier("MPI:Reset-Drain-Send-Recv-Counters");
-      resetDrainCounters(); // p2p_drain_send_recv.cpp
-      char str[1];
-      MPI_MANA_Internal(str); // This does nothing.  Modify in lower-half
-                             // for easy debugging of lower half during restart.
-                             // See definition in mpi-wrappers/mpi_wrappers.cpp
-      mana_state = RESTART_REPLAY;
-      dmtcp_global_barrier("MPI:replayMpiP2pOnRestart");
-      replayMpiP2pOnRestart(); // p2p_log_replay.cpp
-      dmtcp_local_barrier("MPI:p2p_log_replay.cpp-void");
-      const char *file = get_mpi_file_filename();
-      restore_mpi_files(file);
-      dmtcp_local_barrier("MPI:Restore-MPI-Files");
-      mana_state = RUNNING;
+      mana_fwd_note_thread(dmtcp_get_real_tid(), getFS());
+      if (lh_info->lh_mpi_init != NULL) {
+        // MANA_CUDA_FORWARD: the MPI uses the application's CUDA, which the
+        // CUDA plugin restores in DMTCP_EVENT_RUNNING_AFTER (CUDA's restore
+        // needs the threads running).  So restore the MPI state after it, in
+        // our DMTCP_EVENT_RUNNING_AFTER (that event runs in reverse plugin
+        // order), and keep the threads out of the lower half until then.
+        g_restart_mpi_deferred = true;
+        wait_for_threads_to_leave_lower_half();  // lower_half_ckpt.cpp
+        printEventToStderr("EVENT_RESTART (MPI deferred)");
+        break;
+      }
+      restore_mpi_state_on_restart();
       printEventToStderr("EVENT_RESTART (done)");
+      break;
+    }
+
+    case DMTCP_EVENT_RUNNING_AFTER: {
+      if (g_fwd_resume_pending && !g_restart_mpi_deferred) {
+        // Resume: the CUDA plugin restored the GPU (its RUNNING_AFTER runs
+        // before ours).  Give the lower half its CUDA state back: its own
+        // (host registrations, CUDA IPC exports), then, once every rank has
+        // exported again, its IPC imports of the other ranks' memory.
+        // The threads wait outside the lower half until then.
+        mana_fwd_after_resume();
+        dmtcp_global_barrier("MPI:cuda-ipc-exported");
+        mana_fwd_after_resume_peers();
+        allow_threads_to_enter_lower_half();
+      }
+      g_fwd_resume_pending = false;
+      if (g_restart_mpi_deferred) {
+        // See DMTCP_EVENT_RESTART.  The CUDA plugin restored the GPU; the
+        // application's threads wait outside the lower half.
+        g_restart_mpi_deferred = false;
+        wait_for_threads_to_leave_lower_half();
+        mana_lower_half_mpi_init();
+        restore_mpi_state_on_restart();
+        allow_threads_to_enter_lower_half();
+        printEventToStderr("EVENT_RUNNING_AFTER (MPI restored)");
+      }
       break;
     }
 
@@ -1027,6 +1089,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       DmtcpMutexLock(&g_upper_half_fsbase_lock);
       g_upper_half_fsbase->insert(std::make_pair(dmtcp_get_real_tid(), getFS()));
       DmtcpMutexUnlock(&g_upper_half_fsbase_lock);
+      mana_fwd_note_thread(dmtcp_get_real_tid(), getFS());
       break;
     }
 
