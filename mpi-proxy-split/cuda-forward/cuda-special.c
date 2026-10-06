@@ -606,6 +606,18 @@ vmm_posix_fd_memory(CUdeviceptr p)
   return rc == CUDA_SUCCESS && (types & CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
 }
 
+// MANA_FWD_TRACE_ATTR: log the pointer attributes.  Read once: UCX queries
+// the attributes of each message's buffers.
+static int
+trace_attr(void)
+{
+  static int on = -1;
+  if (on < 0) {
+    on = getenv("MANA_FWD_TRACE_ATTR") != NULL;
+  }
+  return on;
+}
+
 CUresult
 cuPointerGetAttribute(void *data, CUpointer_attribute attribute, CUdeviceptr ptr)
 {
@@ -616,7 +628,7 @@ cuPointerGetAttribute(void *data, CUpointer_attribute attribute, CUdeviceptr ptr
       attribute == CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE) {
     *(int *)data = vmm_posix_fd_memory(ptr);
   }
-  if (getenv("MANA_FWD_TRACE_ATTR")) {
+  if (trace_attr()) {
     fprintf(stderr, "[mana-fwd] cuPointerGetAttribute(%d, %#llx) -> %d\n",
             (int)attribute, (unsigned long long)ptr, (int)rc);
   }
@@ -631,7 +643,7 @@ cuPointerGetAttributes(unsigned int numAttributes, CUpointer_attribute *attribut
   CUresult rc;
   CALL(rc, real(numAttributes, attributes, data, ptr));
   for (unsigned i = 0; rc == CUDA_SUCCESS && i < numAttributes; i++) {
-    if (getenv("MANA_FWD_TRACE_ATTR")) {
+    if (trace_attr()) {
       fprintf(stderr, "[mana-fwd] cuPointerGetAttributes[%u] = %d (%#llx)\n",
               i, (int)attributes[i], (unsigned long long)ptr);
     }
