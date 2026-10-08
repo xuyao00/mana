@@ -521,10 +521,16 @@ static void* __mmap_wrapper(void *addr, size_t length, int prot,
       int found = checkLibrary(fd, "libc.so", glibcFullPath, PATH_MAX) ||
                   checkLibrary(fd, "libc-", glibcFullPath, PATH_MAX);
       if (found) {
-        if (libc_base_addr == NULL) {
+        // ld.so starts every load of libc by mapping it at file offset 0;
+        // later segments come at other offsets, with MAP_FIXED.  Take the
+        // base only from that first mapping: a data segment (no PROT_EXEC)
+        // would otherwise leave its address here, and the next libc loaded
+        // (the upper half has one per link namespace) would be patched at
+        // that stale base -- in some other library's memory.
+        if (offset == 0) {
           libc_base_addr = static_cast<char*>(ret);
         }
-        if (prot & PROT_EXEC) {
+        if ((prot & PROT_EXEC) && libc_base_addr != NULL) {
           int rc = mprotect(ret, length, prot | PROT_WRITE);
           if (rc < 0) {
             DLOG(ERROR,
