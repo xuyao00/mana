@@ -465,19 +465,19 @@ static void* __mmap_wrapper(void *addr, size_t length, int prot,
   static char *libc_base_addr = NULL;
   void *ret = MAP_FAILED;
   length = ROUND_UP(length, PAGE_SIZE);
-#ifdef MAP_FIXED_NOREPLACE
-  if (addr != NULL && (flags & MAP_FIXED_NOREPLACE) && !(flags & MAP_FIXED)) {
-    // "Exactly here, or fail with EEXIST": the caller checks the address.
-    // The CUDA driver reserves its UVA ranges this way, and on restore
-    // (cuCheckpointProcessRestore) it must get the original addresses back,
-    // so the arena must not move the request.
+#ifndef MAP_FIXED_NOREPLACE
+# define MAP_FIXED_NOREPLACE 0
+#endif
+  if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
+    // The caller chose the address ("exactly here", replacing what is there
+    // or failing with EEXIST): never move it, never change the flags.  The
+    // CUDA driver reserves its UVA ranges with MAP_FIXED_NOREPLACE, and on
+    // restore (cuCheckpointProcessRestore) it must get the same addresses.
     ret = _real_mmap(addr, length, prot, flags, fd, offset);
     if (ret != MAP_FAILED && (char*)ret + length > max_allocated_addr) {
       max_allocated_addr = (char*)ret + length;
     }
-  } else
-#endif
-  if (arena_base != NULL && addr != NULL && !(flags & MAP_FIXED) &&
+  } else if (arena_base != NULL && addr != NULL &&
       (uintptr_t)addr < 0x7f0000000000UL &&
       (ret = mmap_fixed_noreplace(addr, length, prot, flags, fd, offset))
         != MAP_FAILED) {
@@ -487,10 +487,7 @@ static void* __mmap_wrapper(void *addr, size_t length, int prot,
     if ((char*)ret + length > max_allocated_addr) {
       max_allocated_addr = (char*)ret + length;
     }
-  } else if (arena_base != NULL &&
-      (addr == NULL ||
-       (flags & MAP_FIXED) == 0 ||
-       (max_allocated_addr != NULL && (char*)addr > max_allocated_addr))) {
+  } else if (arena_base != NULL) {
     // The arena picks the address.  free_blocks knows only the upper half's
     // regions, but the lower half maps memory there too (e.g. the CUDA
     // driver's UVA reservation at 0x200000000, made in MPI_Init() by a
@@ -509,12 +506,6 @@ static void* __mmap_wrapper(void *addr, size_t length, int prot,
       max_allocated_addr = (char*)ret + length;
     }
   } else {
-    if (arena_base != NULL) {
-#ifdef MAP_FIXED_NOREPLACE
-      flags &= ~MAP_FIXED_NOREPLACE;
-#endif
-      flags |= MAP_FIXED;
-    }
     ret = _real_mmap(addr, length, prot, flags, fd, offset);
   }
   if (ret != MAP_FAILED) {
