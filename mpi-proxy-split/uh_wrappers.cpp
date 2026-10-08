@@ -159,8 +159,12 @@ mana_uh_dlsym(const char *soname, const char *symbol)
 // thread of the lower half can make CUDA calls with the TLS of one.  They
 // are ordinary upper-half threads: checkpointed and restored with their TLS
 // at the same address, so the same FS values serve a restarted lower half.
+// Their stacks, which hold their TLS, come from mmap() above, the upper
+// half's: glibc's own stack allocation reaches the upper half's arena only
+// if the patched libc mmap() is the one it calls, which depends on glibc.
 #define N_DONORS_DEFAULT 16
 #define MAX_DONORS 256
+#define DONOR_STACK_SIZE (256 * 1024)
 static unsigned long donor_fs[MAX_DONORS];
 static int n_donors = 0;
 
@@ -207,21 +211,29 @@ mana_fwd_provide_donors()
   }
   pthread_attr_t attr;
   pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 256 * 1024);
   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
   int made = 0;
   for (int i = 0; i < n; i++) {
-    pthread_t thread;
-    if (pthread_create(&thread, &attr, donor_main, &donor_fs[made]) == 0) {
-      while (__atomic_load_n(&donor_fs[made], __ATOMIC_ACQUIRE) == 0) {
-        sched_yield();
-      }
-      made++;
+    void *stack = mmap(NULL, DONOR_STACK_SIZE, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+    if (stack == MAP_FAILED) {
+      break;
     }
+    pthread_attr_setstack(&attr, stack, DONOR_STACK_SIZE);
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, donor_main, &donor_fs[made]) != 0) {
+      munmap(stack, DONOR_STACK_SIZE);
+      continue;
+    }
+    while (__atomic_load_n(&donor_fs[made], __ATOMIC_ACQUIRE) == 0) {
+      sched_yield();
+    }
+    made++;
   }
   pthread_attr_destroy(&attr);
   n_donors = made;
   give_donors(ctl);
+
 }
 
 // Tells the forwarding shims the upper half's FS of thread 'real_tid'.
