@@ -4,3 +4,4 @@ nccl_stub.c
 nccl_stub_names.txt
 libmananccl.a
 libmana_ncclstub.so
+libmana_lh_audit.so

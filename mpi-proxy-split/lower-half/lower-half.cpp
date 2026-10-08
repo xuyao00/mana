@@ -219,9 +219,17 @@ lh_nccl_dlsym(const char *name)
 {
   static void *handle = NULL;
   if (handle == NULL) {
+    // A libnccl with a static CUDA runtime gets the libcudart shim's
+    // functions in its place (nccl/nccl_lh_audit.c): load the shim first.
+    if (getenv("MANA_CUDA_FORWARD") != NULL) {
+      dlopen("libcudart.so.13", RTLD_NOW | RTLD_GLOBAL);
+    }
     const char *lib = getenv("MANA_NCCL_LIBRARY");
+    // RTLD_DEEPBIND: the MPI library may link with another libnccl (MPICH
+    // with CCL support), already in the global scope; NCCL's calls to its
+    // own functions must not go to that one.
     handle = dlopen(lib != NULL && lib[0] != '\0' ? lib : "libnccl.so.2",
-                    RTLD_NOW | RTLD_LOCAL);
+                    RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
     if (handle == NULL) {
       fprintf(stderr, "MANA: cannot load NCCL in the lower half: %s\n",
               dlerror());
@@ -555,8 +563,17 @@ void set_addr_no_randomize(char *argv[]) {
   extern char **environ;
   const char *first_time = "MANA_FIRST_TIME";
   char *env = getenv(first_time);
+  // MANA_LH_AUDIT: the lower half's audit module (nccl/nccl_lh_audit.c),
+  // for the lower half only: set for the exec.  update_library_path() leaves
+  // it out of the upper half's LD_AUDIT.  (Not unsetenv(): it would shift the
+  // environment on the stack, which the upper half's stack copies, auxv
+  // included -- see deepCopyStack().)
+  const char *lh_audit = getenv("MANA_LH_AUDIT");
   if (env == NULL) {
     setenv(first_time, "1", 1);
+    if (lh_audit != NULL && lh_audit[0] != '\0') {
+      setenv("LD_AUDIT", lh_audit, 1);
+    }
     personality(ADDR_NO_RANDOMIZE);
     execvpe(argv[0], argv, environ);
   } else {
@@ -1295,6 +1312,10 @@ void update_library_path(const char *argv0)
     exit(1);
   }
   const char *old_audit = getenv("LD_AUDIT");
+  const char *lh_audit = getenv("MANA_LH_AUDIT");
+  if (old_audit != NULL && lh_audit != NULL && strcmp(old_audit, lh_audit) == 0) {
+    old_audit = NULL;   // The lower half's own (set_addr_no_randomize()).
+  }
   if (old_audit != NULL && old_audit[0] != '\0') {
     audit = audit + ":" + old_audit;
   }

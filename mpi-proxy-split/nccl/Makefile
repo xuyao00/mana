@@ -31,7 +31,7 @@ HIDDEN_OBJS = vcomm.o inflight.o nccl_ckpt.o nccl_cuda.o dmtcp_kvdb_c.o \
 API_OBJS = nccl_wrappers.o nccl_forward.o
 OBJS = ${HIDDEN_OBJS} ${API_OBJS}
 
-default: libmananccl.a libmana_ncclstub.so
+default: libmananccl.a libmana_ncclstub.so libmana_lh_audit.so
 
 libmananccl.a: ${OBJS}
 	rm -f $@
@@ -62,11 +62,17 @@ dmtcp_kvdb_c.o: dmtcp_kvdb_c.cpp
 nccl_lh.o nccl_lh_thunks.o: %.o: %.cpp
 	${MPICXX} ${FLAGS} ${HIDDEN} -c -o $@ $<
 
+# The lower half's LD_AUDIT module (no libc; see the file).
+libmana_lh_audit.so: nccl_lh_audit.c
+	gcc -shared -fPIC -O2 -nostdlib -fno-stack-protector -fno-builtin \
+	  -Wl,--no-undefined -o $@ $<
+
 install: default
-	cp -f libmana_ncclstub.so ${MANA_ROOT}/lib/dmtcp/
+	cp -f libmana_ncclstub.so libmana_lh_audit.so ${MANA_ROOT}/lib/dmtcp/
 
 clean:
-	rm -f *.o libmananccl.a libmana_ncclstub.so nccl_lh_thunks.cpp \
+	rm -f *.o libmananccl.a libmana_ncclstub.so libmana_lh_audit.so \
+	      nccl_lh_thunks.cpp \
 	      nccl_forward.c nccl_stub.c nccl_stub_names.txt
 
 .PHONY: default install clean

@@ -27,6 +27,11 @@ def setup_cuda_forwarding():
     sys.exit(1)
   os.environ["MANA_CUDA_FORWARD"] = "1"
   os.environ["MANA_LH_ONLY_LIBRARY_PATH"] = fwd_dir
+  # The lower half's audit module: a library with a static CUDA runtime
+  # (NVIDIA's libnccl) uses the application's (nccl/nccl_lh_audit.c).
+  audit = mana_root_path + "lib/dmtcp/libmana_lh_audit.so"
+  if os.path.exists(audit):
+    os.environ["MANA_LH_AUDIT"] = os.path.realpath(audit)
   old = os.environ.get("LD_LIBRARY_PATH", "")
   os.environ["LD_LIBRARY_PATH"] = fwd_dir + (":" + old if old else "")
   # The CUDA checkpoint API identifies the process by its name.

@@ -28,18 +28,42 @@ Files
   vcomm.*, inflight.*, dmtcp_kvdb_c.*   From nccl-mana-ckpt, unchanged.
   gen-nccl-wrappers.py  Generates the thunks, the forwarders and the stub.
 
+  nccl_lh_audit.c     The lower half's audit module (libmana_lh_audit.so):
+                      redirects a static CUDA runtime in libnccl (below).
+
   The upper half loads libmana_ncclstub.so in place of libnccl (the audit
   module, ../mpi-wrappers/mpi_stub_audit.c): libmana.so defines the
   functions.  The lower half loads MANA_NCCL_LIBRARY (default libnccl.so.2)
-  on the first NCCL call (lower-half/lower-half.cpp, lh_nccl_dlsym()).
+  on the first NCCL call (lower-half/lower-half.cpp, lh_nccl_dlsym()), with
+  RTLD_DEEPBIND: the MPI library may link with another libnccl.
+
+NVIDIA's binary libnccl
+-----------------------
+  It has a CUDA runtime linked in statically, whose integrity check fails
+  against the lower half's libcuda, the forwarding shim
+  (cudaErrorSoftwareValidityNotEstablished at ncclCommInitRank).  The lower
+  half therefore runs with an audit module (LD_AUDIT=MANA_LH_AUDIT, set by
+  mana_launch/mana_restart --cuda and only for the lower half's exec): once
+  libnccl is mapped, before its relocation and constructors, every function
+  of the embedded runtime (the local cuda* and __cuda* functions of its
+  .symtab) that the libcudart.so shim also exports jumps to the shim's.  So
+  libnccl uses the application's runtime, like a libnccl linked with
+  libcudart.so, and its constructors' kernel registrations reach the shim,
+  which replays them into the application's runtime.  This needs the
+  library's .symtab (NVIDIA's libnccl has it).  A libnccl linked with
+  libcudart.so (CUDARTLIB=cudart) is left alone.
 
 Checkpoint and restart (../mpi_plugin.cpp)
 ------------------------------------------
-  PRESUSPEND   mana_nccl_ckpt_cut(): sequence consensus; the application's
-               threads then wait in the NCCL wrappers.  MANA's MPI drain
-               (the lower half closes).  mana_nccl_ckpt_teardown(): drain
-               NCCL point-to-point messages, destroy every communicator.
-               Then the CUDA plugin checkpoints the GPU.
+  PRESUSPEND   One cut of MPI and NCCL collectives: mana_nccl_ckpt_begin(),
+               then MANA's MPI drain, each round of which is also a round
+               of the NCCL consensus (mana_nccl_consensus_round(); see
+               ../seq_num.h).  A thread waits at the NCCL gate or the MPI
+               gate only if both its NCCL and MPI communicators are at their
+               targets.  mana_nccl_ckpt_quiesce(); the lower half closes;
+               mana_nccl_ckpt_teardown(): drain NCCL point-to-point
+               messages, destroy every communicator.  Then the CUDA plugin
+               checkpoints the GPU.
   RESUME/RESTART  reset the sequence numbers; at restart, forget the
                lower half's NCCL functions and the real handles.
   RUNNING_AFTER  after the CUDA plugin restored the GPU and, at restart,
@@ -53,17 +77,15 @@ Checkpoint and restart (../mpi_plugin.cpp)
 
 Requirements and limits
 -----------------------
-  * The lower half's NCCL must use a shared CUDA runtime (NCCL built with
-    CUDARTLIB=cudart), so that its CUDA runtime calls go to the
-    application's runtime through the libcudart shim.  NVIDIA's binary
-    libnccl links the CUDA runtime statically; that runtime's integrity
-    check fails against the forwarding shim of libcuda
-    (cudaErrorSoftwareValidityNotEstablished, at ncclCommInitRank).
+  * A libnccl with a static CUDA runtime and no .symtab (stripped) cannot
+    be redirected, and fails as above.
   * One GPU per process, and one application thread in NCCL or MPI at a
     time: the lower half's TLS is shared by the threads that enter it.
-  * NCCL and MPI have separate checkpoint cuts: a program whose ranks call
-    NCCL and MPI collectives in different orders can deadlock at a
-    checkpoint.
+  * Tested on one GPU: each rank has a communicator of its own, so NCCL
+    traffic between ranks, its point-to-point drain, and several nodes are
+    not tested yet.
+  * The communicators are destroyed and created again at every checkpoint,
+    resume included (the CUDA checkpoint cannot take NCCL's CUDA IPC).
   * From nccl-mana-ckpt: communicator creation in progress during a
     checkpoint, ncclCommShrink/Grow, windows, registered buffers and custom
     reduction ops across a checkpoint are not supported; the p2p drain
