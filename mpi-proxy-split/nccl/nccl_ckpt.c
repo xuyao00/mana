@@ -713,6 +713,8 @@ static void rebuild_create_comms(void) {
 
 static void *rebuild_worker(void *arg) {
     (void)arg;
+    /* Before any CUDA call: see mana_nccl_note_thread(). */
+    mana_nccl_note_thread();
     mana_nccl_internal_begin();
     rebuild_create_comms();
     mana_nccl_internal_end();

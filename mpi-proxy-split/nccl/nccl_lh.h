@@ -30,6 +30,12 @@ int mana_nccl_gate_enter(void);
 void mana_nccl_gate_leave(int gated);
 void mana_nccl_internal_begin(void);
 void mana_nccl_internal_end(void);
+// Registers the calling thread with the CUDA forwarding shims
+// (mana_fwd_note_thread()).  A thread that MANA's NCCL code creates itself,
+// like the rebuild's helper, is otherwise taken for a thread of the lower half:
+// its CUDA calls from the lower half (NCCL's cudaGetDevice()) run with a
+// donor's TLS, whose current device is 0 whatever the thread set.
+void mana_nccl_note_thread(void);
 
 void mana_nccl_missing(const char *name);
 void mana_nccl_refuse(const char *name);

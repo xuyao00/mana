@@ -10,6 +10,8 @@
 
 extern void initialize_wrappers();
 extern void mana_fwd_provide_donors();
+extern void mana_fwd_note_thread(pid_t real_tid, unsigned long fs);
+extern "C" pid_t dmtcp_get_real_tid() __attribute((weak));
 
 // Nesting depth of mana_nccl_internal_begin() on this thread.
 static __thread int t_internal ATTR_TLS_INITIAL_EXEC;
@@ -60,6 +62,12 @@ extern "C" void
 mana_nccl_internal_end(void)
 {
   t_internal--;
+}
+
+extern "C" void
+mana_nccl_note_thread(void)
+{
+  mana_fwd_note_thread(dmtcp_get_real_tid(), getFS());
 }
 
 extern "C" void
