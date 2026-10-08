@@ -47,6 +47,9 @@
 #include "mpi_nextfunc.h"
 #include "virtual_id.h"
 #include "uh_wrappers.h"
+#ifdef MANA_NCCL
+# include "nccl/nccl_ckpt.h"
+#endif
 #include "logging.h"
 
 #include "config.h"
@@ -825,6 +828,37 @@ restore_mpi_state_on_restart()
   mana_state = RUNNING;
 }
 
+// NCCL in the lower half (nccl/): its communicators are checkpointed with
+// MANA_CUDA_FORWARD (mana_launch --cuda), unless MANA_NCCL=0.  The same on
+// every rank, since each phase has global barriers.
+static bool
+nccl_enabled()
+{
+#ifdef MANA_NCCL
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char *v = getenv("MANA_NCCL");
+    enabled = lh_info != NULL && lh_info->fwd_ctl != NULL &&
+              !(v != NULL && strcmp(v, "0") == 0);
+  }
+  return enabled;
+#else
+  return false;
+#endif
+}
+
+#ifndef MANA_NCCL
+static void mana_nccl_init() {}
+static void mana_nccl_ckpt_begin() {}
+static int mana_nccl_consensus_round(int) { return 1; }
+static int mana_nccl_settled() { return 1; }
+static void mana_nccl_ckpt_quiesce() {}
+static void mana_nccl_ckpt_teardown() {}
+static void mana_nccl_resume() {}
+static void mana_nccl_restart() {}
+static void mana_nccl_rebuild() {}
+#endif
+
 static void
 mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 {
@@ -837,6 +871,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       initialize_segv_handler();
       seq_num_init();
       init_lower_half_ckpt();
+      mana_nccl_init();
       mana_state = RUNNING;
 
       DmtcpMutexInit(&g_upper_half_fsbase_lock, DMTCP_MUTEX_LLL);
@@ -928,12 +963,22 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       }
       // The checkpoint thread calls MPI in the drain, and so the MPI's CUDA.
       mana_fwd_note_thread(dmtcp_get_real_tid(), getFS());
+      // One cut of the MPI and the NCCL collectives: each round of the MPI
+      // drain is also a round of NCCL's (seq_num.h, g_drain_round_hook).
+      if (nccl_enabled()) {
+        mana_nccl_ckpt_begin();
+        g_drain_round_hook = mana_nccl_consensus_round;
+        g_other_settled = mana_nccl_settled;
+      }
       resetDrainStats();  // p2p_drain_send_recv.cpp
       uint64_t t0 = drainStatsNow();
       mana_state = CKPT_COLLECTIVE;
       // preSuspendBarrier() will send coord response and get worker state.
       // FIXME:  See commant at: dmtcpplugin.cpp:'case DMTCP_EVENT_PRESUSPEND'
       drain_mpi_collective();
+      if (nccl_enabled()) {
+        mana_nccl_ckpt_quiesce();
+      }
       // From here on, the checkpoint thread calls MPI.  With
       // MANA_P2P_WAIT=polling, no thread waits in the lower half for the
       // drain, so close it now (the lower half runs as MPI_THREAD_SINGLE).  In
@@ -969,6 +1014,12 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
         g_drain_stats.t_collective += drainStatsNow() - t_nbc;
       }
       reportDrainStats();  // With MANA_DRAIN_STATS set
+      // The lower half is closed: drain NCCL's point-to-point messages and
+      // destroy its communicators, which hold CUDA IPC and network state that
+      // the CUDA checkpoint cannot take, and which refer to the lower half.
+      if (nccl_enabled()) {
+        mana_nccl_ckpt_teardown();
+      }
       // MPI is quiet now; next, the CUDA plugin checkpoints the GPU (its
       // PRESUSPEND runs after ours).  Leave out the lower half's CUDA state
       // that refers to lower-half memory.
@@ -1016,6 +1067,11 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       dmtcp_local_barrier("MPI:Reset-Drain-Send-Recv-Counters");
       resetDrainCounters(); // p2p_drain_send_recv.cpp
       seq_num_reset();
+      g_drain_round_hook = NULL;
+      g_other_settled = NULL;
+      if (nccl_enabled()) {
+        mana_nccl_resume();
+      }
       dmtcp_local_barrier("MPI:seq_num_reset");
       mana_state = RUNNING;
       printEventToStderr("EVENT_RESUME (done)");
@@ -1033,6 +1089,11 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 
       mpiInitLhAreas->clear();
       uh_mmaps.clear();
+      g_drain_round_hook = NULL;
+      g_other_settled = NULL;
+      if (nccl_enabled()) {
+        mana_nccl_restart();
+      }
 
       g_upper_half_fsbase->clear();
       g_upper_half_fsbase->insert(std::make_pair(dmtcp_get_real_tid(), getFS()));
@@ -1063,6 +1124,9 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
         mana_fwd_after_resume();
         dmtcp_global_barrier("MPI:cuda-ipc-exported");
         mana_fwd_after_resume_peers();
+        if (nccl_enabled()) {
+          mana_nccl_rebuild();
+        }
         allow_threads_to_enter_lower_half();
       }
       g_fwd_resume_pending = false;
@@ -1073,6 +1137,9 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
         wait_for_threads_to_leave_lower_half();
         mana_lower_half_mpi_init();
         restore_mpi_state_on_restart();
+        if (nccl_enabled()) {
+          mana_nccl_rebuild();
+        }
         allow_threads_to_enter_lower_half();
         printEventToStderr("EVENT_RUNNING_AFTER (MPI restored)");
       }

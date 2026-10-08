@@ -30,6 +30,20 @@ extern int g_world_size;
 MPI_Comm g_world_comm;
 volatile bool ckpt_pending;
 int converged;
+int (*g_drain_round_hook)(int round) = NULL;
+int (*g_other_settled)(void) = NULL;
+
+static inline int
+other_settled()
+{
+  return g_other_settled == NULL || g_other_settled();
+}
+
+extern "C" int
+mana_mpi_behind_target(void)
+{
+  return ckpt_pending && !check_seq_nums();
+}
 volatile phase_t current_phase = IS_READY;
 unsigned int comm_gid;
 int num_converged;
@@ -133,7 +147,7 @@ void commit_begin(MPI_Comm comm) {
   if (mana_state == RESTART_REPLAY || comm == MPI_COMM_NULL) {
     return;
   }
-  while (ckpt_pending && check_seq_nums()) {
+  while (ckpt_pending && check_seq_nums() && other_settled()) {
     MPI_Status status;
     int flag;
     MPI_Iprobe_internal(MPI_ANY_SOURCE, MPI_ANY_TAG, g_world_comm, &flag,
@@ -178,7 +192,7 @@ void commit_finish(MPI_Comm comm) {
     return;
   }
   current_phase = IS_READY;
-  while (ckpt_pending && check_seq_nums()) {
+  while (ckpt_pending && check_seq_nums() && other_settled()) {
     MPI_Status status;
     int flag;
     MPI_Iprobe_internal(MPI_ANY_SOURCE, MPI_ANY_TAG, g_world_comm, &flag,
@@ -263,8 +277,11 @@ try_drain_mpi_collective(int attemptId)
     snprintf(barrier_id, 63, "MANA-PRESUSPEND-%06d-%06d", attemptId, round_num);
     snprintf(key, 63, "round-%06d", round_num);
 
+    int other = g_drain_round_hook == NULL ||
+                g_drain_round_hook(attemptId * MAX_DRAIN_ROUNDS + round_num);
     JASSERT(dmtcp::kvdb::request64(KVDBRequest::INCRBY, converge_id, key,
-                                   check_seq_nums()) == KVDBResponse::SUCCESS);
+                                   check_seq_nums() && other) ==
+            KVDBResponse::SUCCESS);
     JASSERT(dmtcp::kvdb::request64(KVDBRequest::OR, cs_id, key,
                                    current_phase == IN_CS) == KVDBResponse::SUCCESS);
 

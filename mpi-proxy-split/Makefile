@@ -25,6 +25,13 @@ endif
 # CUDA-aware MPI support is built if there are cuda.h and libcuda.so.1.
 CUDA_HOME ?= $(shell d=$$(dirname $$(command -v nvcc 2>/dev/null || echo /usr/local/cuda/bin/nvcc))/..; echo $$d)
 HAVE_CUDA = $(and $(wildcard $(CUDA_HOME)/include/cuda.h),$(shell /sbin/ldconfig -p 2>/dev/null | grep -q 'libcuda.so.1 ' && echo yes))
+# NCCL in the lower half (nccl/): with CUDA, if there are nccl.h and libnccl.
+NCCL_H = $(firstword $(wildcard $(NCCL_HOME)/include/nccl.h /usr/include/nccl.h /usr/local/include/nccl.h))
+HAVE_NCCL = $(and $(HAVE_CUDA),$(NCCL_H),$(or $(wildcard $(NCCL_HOME)/lib/libnccl.so.2),$(shell /sbin/ldconfig -p 2>/dev/null | grep -q 'libnccl.so.2 ' && echo yes)))
+ifneq ($(HAVE_NCCL),)
+  NCCL_ARCHIVE = nccl/libmananccl.a
+  override CXXFLAGS += -DMANA_NCCL
+endif
 
 LOWER_HALF_SRCDIR=lower-half
 WRAPPERS_SRCDIR=mpi-wrappers
@@ -68,8 +75,13 @@ default: ${MANA_COORD_OBJS}
 	make -C ${WRAPPERS_SRCDIR} libmpistub.so libmpistub_audit.so
 
 # ${WRAPPERS_SRCDIR}/libmpiwrappers.a made in install/default before libmana.so
-libmana.so: ${LIBOBJS} ${WRAPPERS_SRCDIR}/libmpiwrappers.a
-	${CXX} -shared -fPIC -g3 -O0 -o $@ ${LIBOBJS} -Wl,--whole-archive ${WRAPPERS_SRCDIR}/libmpiwrappers.a -Wl,--no-whole-archive
+libmana.so: ${LIBOBJS} ${WRAPPERS_SRCDIR}/libmpiwrappers.a ${NCCL_ARCHIVE}
+	${CXX} -shared -fPIC -g3 -O0 -o $@ ${LIBOBJS} -Wl,--whole-archive ${WRAPPERS_SRCDIR}/libmpiwrappers.a ${NCCL_ARCHIVE} -Wl,--no-whole-archive -ldl
+
+nccl/libmananccl.a: FORCE
+	+ make -C nccl libmananccl.a
+
+FORCE:
 
 mpi_unimplemented_wrappers.cpp: generate-mpi-unimplemented-wrappers.py \
                                 mpi_unimplemented_wrappers.txt
@@ -126,6 +138,7 @@ install: ${MANA_COORD_OBJS}
 	    make -C ${DMTCP_ROOT}/plugin/cuda libdmtcp_cuda.so && \
 	    cp -f ${DMTCP_ROOT}/plugin/cuda/libdmtcp_cuda.so ${MANA_ROOT}/lib/dmtcp/; \
 	  fi
+	+ if [ -n "$(HAVE_NCCL)" ]; then make -C nccl install; fi
 
 tidy:
 	rm -f *~ .*.swp dmtcp_restart_script*.sh ckpt_*.dmtcp
@@ -134,6 +147,7 @@ tidy:
 
 clean: tidy
 	- make -C cuda-forward clean
+	- make -C nccl clean
 	rm -f ${LIBOBJS} ${MANA_COORD_OBJS}
 	rm -f libmana.so
 	rm -f ${MANA_ROOT}/lib/dmtcp/libmana.so

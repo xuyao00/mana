@@ -89,6 +89,7 @@ TESTS = [
        native_args=["1"]),
   Test("abort", 2, kind="run", fails=True, expect="abort: calling MPI_Abort"),
   Test("cuda_aware", 2, cuda=True),
+  Test("nccl_lower_half", 2, cuda=True),
   Test("dlopen_mpi", 2, args=[MPI_LIBRARY, "8"], kind="run", restart=True,
        native_args=[MPI_LIBRARY, "1"]),
   # The example that the documentation uses, as its users run it.

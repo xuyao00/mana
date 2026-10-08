@@ -19,12 +19,14 @@
 
 #define _GNU_SOURCE
 #include <asm/prctl.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <sys/uio.h>
 
 #include "fwd-runtime.h"
 
@@ -94,7 +96,7 @@ fwd_log(const char *fmt, const char *a, const char *b)
 {
   if (verbose < 0) {
     const char *v = getenv("MANA_FWD_VERBOSE");
-    verbose = v != NULL && v[0] != '0';
+    verbose = v != NULL ? atoi(v) : 0;
   }
   if (verbose) {
     char buf[512];
@@ -155,6 +157,12 @@ mana_fwd_register_thread_stack(int tid, unsigned long uhfs,
   if (lo >= hi) {
     return;
   }
+  // The threads register at once after a checkpoint (THREAD_RESUME): the
+  // list of stacks is changed by one at a time.  Readers
+  // (thread_by_stack()) see a complete entry before n_by_stack covers it.
+  static volatile int lock = 0;
+  while (__sync_lock_test_and_set(&lock, 1)) {
+  }
   // A dead thread's stack may be reused by this one: drop its entries.
   for (int i = 0; i < n_by_stack; i++) {
     FwdThread *o = by_stack[i];
@@ -164,15 +172,15 @@ mana_fwd_register_thread_stack(int tid, unsigned long uhfs,
   }
   t->stack_lo = lo;
   t->stack_hi = hi;
-  for (int i = 0; i < n_by_stack; i++) {
-    if (by_stack[i] == t) {
-      return;
-    }
+  int listed = 0;
+  for (int i = 0; i < n_by_stack && !listed; i++) {
+    listed = by_stack[i] == t;
   }
-  if (n_by_stack < MAX_THREADS) {
+  if (!listed && n_by_stack < MAX_THREADS) {
     by_stack[n_by_stack] = t;
     __atomic_store_n(&n_by_stack, n_by_stack + 1, __ATOMIC_RELEASE);
   }
+  __sync_lock_release(&lock);
 }
 
 static inline FwdThread *
@@ -200,6 +208,59 @@ mana_fwd_forget_threads(void)
 {
   n_by_stack = 0;
   memset(threads, 0, sizeof threads);
+}
+
+// Donors (FwdCtl::donor_fs): the tid of the lower-half thread that has each
+// one, or 0.  A donor of a thread that has exited is taken back.
+#define MAX_DONORS 256
+static volatile int donor_owner[MAX_DONORS];
+static volatile int donor_lock;
+
+static int
+thread_alive(int tid)
+{
+  return !(syscall(SYS_tgkill, syscall(SYS_getpid), tid, 0) == -1 &&
+           errno == ESRCH);
+}
+
+// Gives thread 't', which has no upper half, a donor's.  Returns its FS or 0.
+static unsigned long
+take_donor(FwdThread *t)
+{
+  int n = mana_fwd_ctl.n_donors < MAX_DONORS ? mana_fwd_ctl.n_donors
+                                             : MAX_DONORS;
+  if (n <= 0 || mana_fwd_ctl.donor_fs == NULL) {
+    return 0;
+  }
+  while (__sync_lock_test_and_set(&donor_lock, 1)) {
+  }
+  int found = -1;
+  for (int i = 0; i < n && found < 0; i++) {
+    if (donor_owner[i] == 0) {
+      found = i;
+    }
+  }
+  for (int i = 0; i < n && found < 0; i++) {
+    if (!thread_alive(donor_owner[i])) {
+      FwdThread *old = find_thread(donor_owner[i], 0);
+      if (old != NULL) {
+        old->uhfs = 0;
+      }
+      found = i;
+    }
+  }
+  if (found >= 0) {
+    donor_owner[found] = t->tid;
+    t->uhfs = mana_fwd_ctl.donor_fs[found];
+  }
+  __sync_lock_release(&donor_lock);
+  if (found < 0) {
+    fwd_log("no donor left for a thread of the lower half%s%s\n", "", "");
+    return 0;
+  }
+  fwd_log("a thread of the lower half calls CUDA: it gets donor %s%s\n",
+          "", "");
+  return t->uhfs;
 }
 
 // The value returned by a call that cannot be forwarded: CUresult and
@@ -240,6 +301,13 @@ resolve(FwdLib *lib, int idx, unsigned long uhfs, unsigned long lhfs)
   return target;
 }
 
+extern FwdLib mana_fwd_dyn_lib;
+
+// MANA_FWD_VERBOSE=2: each forwarded call and its result (rax).
+static FwdLib *trace_lib[MAX_THREADS][MAX_DEPTH];
+static int trace_idx[MAX_THREADS][MAX_DEPTH];
+static long trace_args[MAX_THREADS][MAX_DEPTH][4];
+
 static unsigned long n_calls;
 
 __attribute__((destructor)) static void
@@ -272,6 +340,18 @@ mana_fwd_enter(FwdLib *lib, long idx, void **retslot)
             "too deep (%s)\n", fwd_gettid(), lib->names[idx]);
     abort();
   }
+  if (verbose >= 2) {
+    trace_lib[t - threads][t->depth] = lib;
+    trace_idx[t - threads][t->depth] = (int)idx;
+    // The trampoline saved rdi, rsi, rdx, rcx 72..48 bytes below retslot.
+    long *a = (long *)((char *)retslot - 72);
+    for (int k = 0; k < 4; k++) {
+      trace_args[t - threads][t->depth][k] = a[k];
+    }
+  }
+  if (t->uhfs == 0) {
+    take_donor(t);
+  }
   FwdRecord *r = &t->recs[t->depth++];
   r->ret = *retslot;
   r->lhfs = lhfs;
@@ -291,8 +371,37 @@ mana_fwd_enter(FwdLib *lib, long idx, void **retslot)
 }
 
 void
-mana_fwd_exit(FwdRecord *r)
+mana_fwd_exit(FwdRecord *r, long rax)
 {
+  if (verbose >= 2) {
+    int ti = ((char *)r - (char *)threads) / sizeof(FwdThread);
+    int d = r - threads[ti].recs;
+    FwdLib *lib = trace_lib[ti][d];
+    if (lib != NULL) {
+      char buf[256];
+      long *a = trace_args[ti][d];
+      int n = snprintf(buf, sizeof buf, "[mana-fwd %d] %s(%#lx, %#lx, %#lx, "
+                       "%#lx) -> %ld (%#lx)\n", fwd_gettid(),
+                       lib->names[trace_idx[ti][d]], a[0], a[1], a[2], a[3],
+                       rax, (unsigned long)rax);
+      if (verbose >= 3 && lib == &mana_fwd_dyn_lib) {
+        // Out-parameters: the words that pointer arguments point to.
+        for (int k = 0; k < 4; k++) {
+          unsigned long w;
+          struct iovec local = { &w, sizeof w };
+          struct iovec remote = { (void *)a[k], sizeof w };
+          if (syscall(SYS_process_vm_readv, getpid(), &local, 1, &remote, 1,
+                      0) == sizeof w) {
+            n += snprintf(buf + n, sizeof buf - n, "    *arg%d = %#lx\n", k,
+                          w);
+          }
+        }
+      }
+      if (write(2, buf, n) < 0) {
+        return;
+      }
+    }
+  }
   // The record is in its thread's FwdThread.
   FwdThread *t = &threads[((char *)r - (char *)threads) / sizeof(FwdThread)];
   if (t->depth > 0 && &t->recs[t->depth - 1] == r) {
@@ -306,7 +415,10 @@ unsigned long
 mana_fwd_uhfs(void)
 {
   int here;
-  FwdThread *t = current_thread((unsigned long)&here, 0);
+  FwdThread *t = current_thread((unsigned long)&here, 1);
+  if (t != NULL && t->uhfs == 0) {
+    take_donor(t);
+  }
   return t != NULL ? t->uhfs : 0;
 }
 
@@ -393,6 +505,8 @@ fwd_after_resume(void)
 __attribute__((constructor)) static void
 fwd_runtime_init(void)
 {
+  const char *v = getenv("MANA_FWD_VERBOSE");
+  verbose = v != NULL ? atoi(v) : 0;
   mana_fwd_ctl.before_ckpt = fwd_before_ckpt;
   mana_fwd_ctl.after_resume = fwd_after_resume;
   mana_fwd_ctl.after_resume_peers = fwd_after_resume_peers;
@@ -411,6 +525,17 @@ fwd_runtime_init(void)
 #include <fcntl.h>
 
 typedef struct { unsigned long lo, hi; } Range;
+
+static int
+in_ranges(unsigned long a, const Range *ranges, int n)
+{
+  for (int i = 0; i < n; i++) {
+    if (a >= ranges[i].lo && a < ranges[i].hi) {
+      return 1;
+    }
+  }
+  return 0;
+}
 
 // The executable mappings of the file that contains address 'a'.
 static int
@@ -465,22 +590,37 @@ mana_fwd_wrap_table(const void *table, void *lib_fn, const void *uuid)
       return tables[i].copy;
     }
   }
-  unsigned long size = *(const unsigned long *)table;
+  const unsigned long *words = (const unsigned long *)table;
+  unsigned long size = words[0];
+  Range code[16];
+  int n_code = code_ranges((unsigned long)lib_fn, code, 16);
+  // Most tables start with their size in bytes; some (e.g. c693336e...,
+  // which the static cudart in libnccl uses) are only functions up to a 0.
+  unsigned long first = 1;
+  if (in_ranges(size, code, n_code)) {
+    unsigned long n = 0;
+    while (n < 1024 && in_ranges(words[n], code, n_code)) {
+      n++;
+    }
+    size = (n + 1) * 8;   // With the terminating word.
+    first = 0;
+  }
   if (size < 8 || size > 65536 || size % 8 != 0 || n_tables == 128) {
     fprintf(stderr, "[mana-fwd] export table with first word %lu: "
             "not wrapped\n", size);
     return table;
   }
-  Range code[16];
-  int n_code = code_ranges((unsigned long)lib_fn, code, 16);
   unsigned long *copy = (unsigned long *)malloc(size);
   memcpy(copy, table, size);
   int wrapped = 0;
-  for (unsigned long i = 1; i < size / 8; i++) {
+  for (unsigned long i = first; i < size / 8; i++) {
     for (int j = 0; j < n_code; j++) {
       if (copy[i] >= code[j].lo && copy[i] < code[j].hi) {
-        copy[i] = (unsigned long)mana_fwd_wrap_ptr((void *)copy[i],
-                                                   "(export table)");
+        char name[64];
+        const unsigned char *id = (const unsigned char *)uuid;
+        snprintf(name, sizeof name, "(export table %02x%02x%02x%02x[%lu])",
+                 id[0], id[1], id[2], id[3], i);
+        copy[i] = (unsigned long)mana_fwd_wrap_ptr((void *)copy[i], name);
         wrapped++;
         break;
       }

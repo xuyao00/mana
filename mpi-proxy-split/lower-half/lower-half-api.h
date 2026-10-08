@@ -186,6 +186,10 @@ typedef struct _LowerHalfInfo
   // st_ino is 0 if nothing was reserved.
   unsigned long reserved_fd_dev;
   unsigned long reserved_fd_ino;
+  // NCCL in the lower half (see ../nccl/): returns the lower half's NCCL
+  // function 'name', loading libnccl on first use (MANA_NCCL_LIBRARY, or
+  // libnccl.so.2).  Call it with the lower half's FS.
+  void *lh_nccl_dlsym;
 } LowerHalfInfo_t;
 
 extern LowerHalfInfo_t *lh_info;

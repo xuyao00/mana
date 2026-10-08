@@ -210,6 +210,33 @@ launcher_rank()
   return -1;
 }
 
+// NCCL in the lower half: like MPI, NCCL and its network libraries are not
+// checkpointed, and they use the application's CUDA through the forwarding
+// shims (cuda-forward/).  The upper half's libnccl.so.2 is a stub (see
+// ../nccl/).  A new lower half loads NCCL again at restart.
+static void *
+lh_nccl_dlsym(const char *name)
+{
+  static void *handle = NULL;
+  if (handle == NULL) {
+    const char *lib = getenv("MANA_NCCL_LIBRARY");
+    handle = dlopen(lib != NULL && lib[0] != '\0' ? lib : "libnccl.so.2",
+                    RTLD_NOW | RTLD_LOCAL);
+    if (handle == NULL) {
+      fprintf(stderr, "MANA: cannot load NCCL in the lower half: %s\n",
+              dlerror());
+      return NULL;
+    }
+    if (dlsym(handle, "mana_nccl_stub") != NULL) {
+      fprintf(stderr, "MANA: the lower half loaded MANA's NCCL stub; set "
+              "MANA_NCCL_LIBRARY to the real libnccl.so.2\n");
+      handle = NULL;
+      return NULL;
+    }
+  }
+  return dlsym(handle, name);
+}
+
 // The lower half's MPI_Init() with MANA_CUDA_FORWARD: called by the upper
 // half's MPI_Init(), once the application can use CUDA.
 static void
@@ -569,6 +596,7 @@ void initialize_lh_info()
   lh_info->mmap = (void*)&mmap_wrapper;
   lh_info->munmap = (void*)&munmap_wrapper;
   lh_info->lh_dlsym = (void*)&lh_dlsym;
+  lh_info->lh_nccl_dlsym = (void*)&lh_nccl_dlsym;
   lh_info->mmap_list_fptr = (void*)&get_mmapped_list;
   // MPI constants values
   lh_info->MANA_GROUP_NULL = MPI_GROUP_NULL;

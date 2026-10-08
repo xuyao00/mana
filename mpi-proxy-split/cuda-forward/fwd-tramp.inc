@@ -102,6 +102,7 @@
   movq %r11, 40(%rsp)
   FWD_SETFS 16
   movq %r12, %rdi
+  movq 0(%rsp), %rsi
   call mana_fwd_exit@PLT
   movq 40(%rsp), %r11
   movq 32(%rsp), %r12

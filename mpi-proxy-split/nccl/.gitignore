@@ -1,0 +1,6 @@
+nccl_lh_thunks.cpp
+nccl_forward.c
+nccl_stub.c
+nccl_stub_names.txt
+libmananccl.a
+libmana_ncclstub.so

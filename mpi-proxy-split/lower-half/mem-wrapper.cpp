@@ -425,11 +425,37 @@ void* restore_mmap(void *addr, size_t length, int prot,
   return ret;
 }
 
+// The block lists are shared by the upper half's threads, which call these
+// wrappers concurrently (e.g. an application thread's munmap() while MANA's
+// checkpoint thread creates a thread at restart): one at a time.  A
+// spinlock, since the threads share the lower half's TLS here.
+static volatile int blocks_lock = 0;
+
+static inline void
+lock_blocks()
+{
+  while (__sync_lock_test_and_set(&blocks_lock, 1)) {
+    while (blocks_lock) {
+#if defined(__x86_64__)
+      __builtin_ia32_pause();
+#endif
+    }
+  }
+}
+
+static inline void
+unlock_blocks()
+{
+  __sync_lock_release(&blocks_lock);
+}
+
 void* mmap_wrapper(void *addr, size_t length, int prot,
                   int flags, int fd, off_t offset) {
   void *ret = MAP_FAILED;
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  lock_blocks();
   ret = __mmap_wrapper(addr, length, prot, flags, fd, offset);
+  unlock_blocks();
   RETURN_TO_UPPER_HALF();
   return ret;
 }
@@ -537,7 +563,9 @@ static void* __mmap_wrapper(void *addr, size_t length, int prot,
 int munmap_wrapper(void *addr, size_t length) {
   int ret = -1;
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  lock_blocks();
   ret = __munmap_wrapper(addr, length);
+  unlock_blocks();
   RETURN_TO_UPPER_HALF();
   return ret;
 }

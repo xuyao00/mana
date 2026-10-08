@@ -1,0 +1,70 @@
+NCCL in MANA's lower half (prototype)
+=====================================
+
+NCCL and its network libraries go into the lower half, like MPI: they are not
+checkpointed, and a restart loads them again, so the job may restart on
+another node or network.  The lower half's NCCL uses the application's CUDA
+through the forwarding shims (../cuda-forward): there is one CUDA driver in
+the process, the upper half's, which the DMTCP CUDA plugin checkpoints.  Use
+it with --cuda (mana_launch --cuda, mana_restart --cuda).
+
+The checkpointing of communicators comes from the nccl-mana-ckpt prototype
+(virtual communicators, sequence consensus, point-to-point drain, teardown
+before the GPU checkpoint, rebuild with a fresh ncclUniqueId).
+
+Files
+-----
+  nccl_wrappers.c     The application's nccl* functions that take or make a
+                      communicator (from nccl-mana-ckpt): virtual handles,
+                      the sequence gate, the byte counts of the drain.
+  nccl_forward.c      Generated: the other functions of nccl.h, forwarded.
+  nccl_lh_thunks.cpp  Generated: mana_lh_ncclX() calls the lower half's ncclX
+                      with the lower half's FS; it waits while the lower half
+                      is closed for a checkpoint, except for MANA's own calls.
+  nccl_lh.{h,cpp}     The glue of the thunks (lh_info->lh_nccl_dlsym).
+  nccl_ckpt.{h,c}     The checkpoint phases (from nccl-mana-ckpt's plugin),
+                      called by MANA's event hook (../mpi_plugin.cpp).
+  nccl_cuda.{h,c}     The application's CUDA runtime, for nccl_ckpt.c.
+  vcomm.*, inflight.*, dmtcp_kvdb_c.*   From nccl-mana-ckpt, unchanged.
+  gen-nccl-wrappers.py  Generates the thunks, the forwarders and the stub.
+
+  The upper half loads libmana_ncclstub.so in place of libnccl (the audit
+  module, ../mpi-wrappers/mpi_stub_audit.c): libmana.so defines the
+  functions.  The lower half loads MANA_NCCL_LIBRARY (default libnccl.so.2)
+  on the first NCCL call (lower-half/lower-half.cpp, lh_nccl_dlsym()).
+
+Checkpoint and restart (../mpi_plugin.cpp)
+------------------------------------------
+  PRESUSPEND   mana_nccl_ckpt_cut(): sequence consensus; the application's
+               threads then wait in the NCCL wrappers.  MANA's MPI drain
+               (the lower half closes).  mana_nccl_ckpt_teardown(): drain
+               NCCL point-to-point messages, destroy every communicator.
+               Then the CUDA plugin checkpoints the GPU.
+  RESUME/RESTART  reset the sequence numbers; at restart, forget the
+               lower half's NCCL functions and the real handles.
+  RUNNING_AFTER  after the CUDA plugin restored the GPU and, at restart,
+               after the new lower half's MPI_Init and MPI replay:
+               mana_nccl_rebuild() creates every communicator again; then
+               the application's threads may enter the lower half.
+
+  Threads that NCCL creates in the lower half (proxy threads) call CUDA with
+  the TLS of an upper-half "donor" thread (../cuda-forward/fwd-runtime.c,
+  take_donor(); ../uh_wrappers.cpp, mana_fwd_provide_donors()).
+
+Requirements and limits
+-----------------------
+  * The lower half's NCCL must use a shared CUDA runtime (NCCL built with
+    CUDARTLIB=cudart), so that its CUDA runtime calls go to the
+    application's runtime through the libcudart shim.  NVIDIA's binary
+    libnccl links the CUDA runtime statically; that runtime's integrity
+    check fails against the forwarding shim of libcuda
+    (cudaErrorSoftwareValidityNotEstablished, at ncclCommInitRank).
+  * One GPU per process, and one application thread in NCCL or MPI at a
+    time: the lower half's TLS is shared by the threads that enter it.
+  * NCCL and MPI have separate checkpoint cuts: a program whose ranks call
+    NCCL and MPI collectives in different orders can deadlock at a
+    checkpoint.
+  * From nccl-mana-ckpt: communicator creation in progress during a
+    checkpoint, ncclCommShrink/Grow, windows, registered buffers and custom
+    reduction ops across a checkpoint are not supported; the p2p drain
+    counts bytes, not messages.

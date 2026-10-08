@@ -45,6 +45,12 @@ typedef struct {
   // As register_thread, with the thread's stack [lo, hi) (no gettid then).
   void (*register_thread_stack)(int tid, unsigned long uhfs,
                                 unsigned long lo, unsigned long hi);
+  // Set by the upper half: the FS of upper-half threads that only wait
+  // ("donors").  A thread that the lower half creates (e.g. NCCL's proxy
+  // threads) has no upper half; when it calls CUDA, it gets the TLS of a
+  // donor of its own, which it keeps until it exits.
+  unsigned long *donor_fs;
+  int n_donors;
 } FwdCtl;
 
 #ifdef __cplusplus

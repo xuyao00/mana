@@ -37,6 +37,9 @@
 #include "switch-context.h"
 #include <dlfcn.h>
 #include <pthread.h>
+#include <sched.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
 
 int initialized = 0;
 
@@ -152,6 +155,75 @@ mana_uh_dlsym(const char *soname, const char *symbol)
   return handle != NULL ? dlsym(handle, symbol) : NULL;
 }
 
+// Donors (FwdCtl::donor_fs): upper-half threads that only wait, so that a
+// thread of the lower half can make CUDA calls with the TLS of one.  They
+// are ordinary upper-half threads: checkpointed and restored with their TLS
+// at the same address, so the same FS values serve a restarted lower half.
+#define N_DONORS_DEFAULT 16
+#define MAX_DONORS 256
+static unsigned long donor_fs[MAX_DONORS];
+static int n_donors = 0;
+
+static void *
+donor_main(void *arg)
+{
+  __atomic_store_n((unsigned long *)arg, getFS(), __ATOMIC_RELEASE);
+  int never = 0;
+  for (;;) {
+    syscall(SYS_futex, &never, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
+  }
+  return NULL;
+}
+
+static void
+give_donors(FwdCtl *ctl)
+{
+  if (n_donors > 0 && ctl->donor_fs == NULL) {
+    ctl->donor_fs = donor_fs;
+    __atomic_store_n(&ctl->n_donors, n_donors, __ATOMIC_RELEASE);
+  }
+}
+
+// Creates the donors, once (MANA_FWD_DONORS of them).  Call it on an
+// application thread, before the lower half can create threads that call
+// CUDA: at MPI_Init(), and before the first NCCL call.
+void
+mana_fwd_provide_donors()
+{
+  initialize_wrappers();
+  FwdCtl *ctl = (FwdCtl *)lh_info->fwd_ctl;
+  if (ctl == NULL) {
+    return;
+  }
+  static int done = 0;
+  if (!__sync_bool_compare_and_swap(&done, 0, 1)) {
+    give_donors(ctl);
+    return;
+  }
+  const char *env = getenv("MANA_FWD_DONORS");
+  int n = env != NULL ? atoi(env) : N_DONORS_DEFAULT;
+  if (n > MAX_DONORS) {
+    n = MAX_DONORS;
+  }
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 256 * 1024);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  int made = 0;
+  for (int i = 0; i < n; i++) {
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, donor_main, &donor_fs[made]) == 0) {
+      while (__atomic_load_n(&donor_fs[made], __ATOMIC_ACQUIRE) == 0) {
+        sched_yield();
+      }
+      made++;
+    }
+  }
+  pthread_attr_destroy(&attr);
+  n_donors = made;
+  give_donors(ctl);
+}
+
 // Tells the forwarding shims the upper half's FS of thread 'real_tid'.
 void
 mana_fwd_note_thread(pid_t real_tid, unsigned long fs)
@@ -162,6 +234,7 @@ mana_fwd_note_thread(pid_t real_tid, unsigned long fs)
     return;
   }
   ctl->uh_dlsym = mana_uh_dlsym;
+  give_donors(ctl);   // At restart, the lower half's FwdCtl is a new one.
   // The thread's stack, by which the shims find the thread without a
   // system call.  Called on the thread itself.
   unsigned long lo = 0, hi = 0;
@@ -199,6 +272,7 @@ mana_lower_half_mpi_init()
   initialize_wrappers();
   if (lh_info->lh_mpi_init != NULL) {
     mana_fwd_note_thread(dmtcp_get_real_tid(), getFS());
+    mana_fwd_provide_donors();
     JUMP_TO_LOWER_HALF(lh_info->fsaddr);
     ((void (*)(void))lh_info->lh_mpi_init)();
     RETURN_TO_UPPER_HALF();

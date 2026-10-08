@@ -40,6 +40,8 @@
 #include <stdint.h>
 
 #define STUB_LIBRARY "libmpistub.so"
+// NCCL is in the lower half too (../nccl/): the upper half gets a stub.
+#define NCCL_STUB_LIBRARY "libmana_ncclstub.so"
 
 // The names of MPICH-ABI MPI libraries, without ".so...": MPICH, Intel MPI,
 // MVAPICH, and Cray MPICH (libmpi_cray, libmpich_gnu_82, ...).  Not a
@@ -112,6 +114,24 @@ is_mpi_library(const char *path)
   return 0;
 }
 
+// Whether 'path' names libnccl.so (libnccl.so.2, ...).
+static int
+is_nccl_library(const char *path)
+{
+  const char *name = path;
+  const char *p;
+
+  for (p = path; *p != '\0'; p++) {
+    if (*p == '/') {
+      name = p + 1;
+    }
+  }
+  // No length: the terminating NUL differs from every character of the
+  // prefix.  (A loop computing it would compile to strlen(), and this module
+  // has no libc.)
+  return starts_with(name, (size_t)-1, "libnccl.so");
+}
+
 unsigned int
 la_version(unsigned int version)
 {
@@ -127,6 +147,9 @@ la_objsearch(const char *name, uintptr_t *cookie, unsigned int flag)
   (void)cookie;
   if (flag == LA_SER_ORIG && is_mpi_library(name)) {
     return (char *)STUB_LIBRARY;
+  }
+  if (flag == LA_SER_ORIG && is_nccl_library(name)) {
+    return (char *)NCCL_STUB_LIBRARY;
   }
   return (char *)name;
 }
@@ -236,7 +259,8 @@ la_objopen(struct link_map *map, Lmid_t lmid, uintptr_t *cookie)
   if (is_file(map->l_name, "libmana.so")) {
     libmana = map;
   }
-  return is_file(map->l_name, STUB_LIBRARY) ? LA_FLG_BINDTO : 0;
+  return is_file(map->l_name, STUB_LIBRARY) ||
+         is_file(map->l_name, NCCL_STUB_LIBRARY) ? LA_FLG_BINDTO : 0;
 }
 
 // Called for a symbol of libmpistub.so that dlsym() finds.  Returns

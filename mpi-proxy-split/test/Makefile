@@ -32,7 +32,8 @@ E2E_FORTRAN = fortran_p2p fortran_nonblocking
 
 # CUDA-aware MPI tests (run under mana_launch --cuda); built if nvcc is there.
 NVCC ?= $(shell command -v nvcc 2>/dev/null)
-E2E_CUDA = $(if $(NVCC),cuda_aware)
+NCCL_H = $(firstword $(wildcard $(NCCL_HOME)/include/nccl.h /usr/include/nccl.h /usr/local/include/nccl.h))
+E2E_CUDA = $(if $(NVCC),cuda_aware $(if $(NCCL_H),nccl_lower_half))
 
 # The suite also runs the example of ../examples (ring_example).
 e2e: ${E2E_TESTS} ${E2E_FORTRAN} dlopen_mpi ${E2E_CUDA}
@@ -42,6 +43,11 @@ e2e: ${E2E_TESTS} ${E2E_FORTRAN} dlopen_mpi ${E2E_CUDA}
 # MPI uses it too (see ../cuda-forward).
 cuda_aware: %: %.cu mana_test.h
 	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $<
+
+# NCCL is in MANA's lower half (see ../nccl); the program links it as usual.
+nccl_lower_half: %: %.cu mana_test.h
+	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared \
+	  $(if $(NCCL_HOME),-I$(NCCL_HOME)/include -L$(NCCL_HOME)/lib) -o $@ $< -lnccl
 
 ${E2E_TESTS}: %: %.c mana_test.h
 	$(MPICC) -g3 -O0 -o $@ $< $(MPI_CFLAGS) ${MPI_LDFLAGS}
@@ -84,4 +90,4 @@ tidy:
 
 clean: tidy
 	rm -f *.pyc *.so
-	rm -f ${E2E_TESTS} ${E2E_FORTRAN} ${BENCH_FILES} cuda_aware
+	rm -f ${E2E_TESTS} ${E2E_FORTRAN} ${BENCH_FILES} cuda_aware nccl_lower_half
