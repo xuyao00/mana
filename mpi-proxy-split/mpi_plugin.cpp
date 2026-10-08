@@ -197,6 +197,38 @@ void recordOpenFds()
   kvdb::set(workerPath, "ProcSelfFds", o.str());
 }
 
+// DMTCP's file plugin (libdmtcp_ipc.so); weak, in case it is not loaded.
+void dmtcp_FileConnList_EventHook(DmtcpEvent_t event, DmtcpEventData_t *data)
+  __attribute((weak));
+
+// DMTCP's file plugin records each file that the upper half opens, and
+// forgets it when DMTCP's wrappers see it closed.  An fd closed, and its
+// number reused, without them (the lower half has its own libc) leaves a
+// record whose number names an anonymous inode by now: on Perlmutter, the
+// CUDA driver's /dev/nvidiactl, its number an eventfd at checkpoint, after
+// the CUDA checkpoint.  The file plugin would checkpoint it as a
+// deleted file and copy its "contents": forever, from a non-blocking eventfd
+// (EAGAIN).  No file has such a path, so tell the file plugin, and only it,
+// that such an fd's file is closed: DMTCP's eventfd and epoll records are the
+// upper half's own anonymous inodes, which it does checkpoint.  Called in
+// PRECHECKPOINT, after the CUDA checkpoint and before the file plugin's.
+static void
+forget_reused_file_fds()
+{
+  if (dmtcp_FileConnList_EventHook == NULL) {
+    return;
+  }
+  vector<int>fds = jalib::Filesystem::ListOpenFds();
+  for (int fd : fds) {
+    string device = jalib::Filesystem::GetDeviceName(fd);
+    if (device.compare(0, strlen("anon_inode:"), "anon_inode:") == 0) {
+      DmtcpEventData_t data;
+      data.closeFd.fd = fd;
+      dmtcp_FileConnList_EventHook(DMTCP_EVENT_CLOSE_FD, &data);
+    }
+  }
+}
+
 static void
 processFileOpen(const char *path, int flags)
 {
@@ -1031,6 +1063,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 
     case DMTCP_EVENT_PRECHECKPOINT: {
       printEventToStderr("EVENT_PRECHECKPOINT (drain send/recv)");
+      forget_reused_file_fds();
       // The threads are suspended now; let them back into the lower half
       // when they resume.  With MANA_CUDA_FORWARD, not before the lower
       // half's CUDA state (IPC mappings) is back, in RUNNING_AFTER.
