@@ -15,7 +15,7 @@ CFLAGS = -g -O2 -fPIC -Wall -I. -I$(CUDA_HOME)/include
 OUT = lh-shims
 
 default: $(OUT)/libmana_fwd.so $(OUT)/libcuda.so.1 $(OUT)/libcudart.so.13 \
-  $(OUT)/libnvidia-ml.so.1 libmana_cuda_vmm.so
+  $(OUT)/libcudart.so $(OUT)/libnvidia-ml.so.1 libmana_cuda_vmm.so
 
 # The upper half's device allocator (VMM memory, for checkpointable CUDA
 # IPC); not in $(OUT), which is the lower half's library directory.
@@ -52,6 +52,12 @@ $(OUT)/libcudart.so.13: gen/cudart-tramp.S gen/cudart-desc.c cudart-special.c $(
 	$(CC) $(CFLAGS) -shared -o $@ gen/cudart-tramp.S gen/cudart-desc.c cudart-special.c \
 	  -Wl,-soname,libcudart.so.13 -Wl,--version-script,gen/cudart.map -L$(OUT) -lmana_fwd -Wl,-rpath,'$$ORIGIN'
 
+# libfabric dlopen()s the unversioned name (FI_HMEM_CUDA); without the link it
+# would get the real runtime, whose integrity check fails against the libcuda
+# shim.  A link, not a copy: a copy would be a second instance of the shim.
+$(OUT)/libcudart.so: $(OUT)/libcudart.so.13
+	ln -sfn libcudart.so.13 $@
+
 gen/nvml-tramp.S gen/nvml-desc.c: gen-forward-shim.py
 	mkdir -p gen
 	./gen-forward-shim.py $(REAL_LIBNVML) libnvidia-ml.so.1 nvml gen \
@@ -63,7 +69,7 @@ $(OUT)/libnvidia-ml.so.1: gen/nvml-tramp.S gen/nvml-desc.c nvml-special.c $(OUT)
 
 install: default
 	mkdir -p $(MANA_ROOT)/lib/dmtcp/cuda-forward
-	cp -f $(OUT)/* $(MANA_ROOT)/lib/dmtcp/cuda-forward/
+	cp -fP $(OUT)/* $(MANA_ROOT)/lib/dmtcp/cuda-forward/
 	cp -f libmana_cuda_vmm.so $(MANA_ROOT)/lib/dmtcp/
 
 clean:
