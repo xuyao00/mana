@@ -78,10 +78,19 @@ char *deepCopyStack(int argc, char **argv, char *argc_ptr, char *argv_ptr,
   char *env_ptr_addr = (char *)&__environ[0];
   char **new_env_ptrs = (char**)malloc(env_ptr_size);
   memset(new_env_ptrs, 0, env_ptr_size);
-  char *argv_strings_addr = argv[0];
-  int argv_strings_size = (argv[argc-1] + strlen(argv[argc-1]) + 1) - argv[0];
+  // ... and the size of the strings of dest_argv[].  They are in the lower
+  //   half's memory (the kernel's stack, and the heap for the ELF interpreter's
+  //   path), which is not checkpointed and is replaced at restart.  So, as for
+  //   envp[], the new argv[] points to copies of the strings on the new stack.
+  size_t *argv_strings_len = (size_t *)malloc(dest_argc * sizeof(size_t));
+  int argv_strings_size = 0;
+  for (i = 0; i < (int)dest_argc; i++) {
+    argv_strings_len[i] = strlen(dest_argv[i]);
+    argv_strings_size += argv_strings_len[i] + 1;
+  }
   int argv_ptr_size = (dest_argc + 1) * sizeof(argv[0]);
-  char *argv_ptr_addr = (char *)&dest_argv[0];
+  char **new_argv_ptrs = (char **)malloc(argv_ptr_size);
+  memset(new_argv_ptrs, 0, argv_ptr_size);
 
   for (i = 0; auxv[i].a_type != AT_NULL; i++) {};
   assert(auxv[i].a_type == AT_NULL);
@@ -203,8 +212,14 @@ dbg_env_strings_addr = dest_curr_stack;
   * argv strings
   *****************************/
   dest_curr_stack -= argv_strings_size;
-  memcpy(dest_curr_stack, argv_strings_addr, argv_strings_size);
-  // ld.so will probably reset environ and __environ anyway
+  for (i = 0; i < (int)dest_argc; i++) {
+    memcpy(dest_curr_stack, dest_argv[i], argv_strings_len[i] + 1);
+    new_argv_ptrs[i] = dest_curr_stack;
+    dest_curr_stack += argv_strings_len[i] + 1;
+  }
+  assert(dest_curr_stack == dbg_env_strings_addr);
+  free(argv_strings_len);
+  dest_curr_stack -= argv_strings_size;
 dbg_argv_strings_addr = dest_curr_stack;
 
  /*****************************
@@ -249,9 +264,10 @@ dbg_env_ptr_addr = dest_curr_stack;
   * argv pointers
   *****************************/
   dest_curr_stack -= argv_ptr_size;
-  memcpy(dest_curr_stack, argv_ptr_addr, argv_ptr_size);
-  assert( *(char **)((char *)argv_ptr_addr+argv_ptr_size - sizeof(argv[0]))
-                    == NULL );
+  // As for envp[]: new_argv_ptrs points to the copies on the new stack.
+  memcpy(dest_curr_stack, new_argv_ptrs, argv_ptr_size);
+  assert( ((char **)dest_curr_stack)[dest_argc] == NULL );
+  free(new_argv_ptrs);
 dbg_argv_ptr_addr = dest_curr_stack;
 
  /*****************************
