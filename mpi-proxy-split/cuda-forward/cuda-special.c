@@ -203,9 +203,12 @@ cuda_before_ckpt(void)
   }
 }
 
+static unsigned long long ckpt_generation;
+
 static void
 cuda_after_resume(void)
 {
+  ckpt_generation++;              // See adjust_buffer_id().
   vipc_after_resume_exports();
   for (int i = 0; i < n_hostregs; i++) {
     if (hostregs[i].on) {
@@ -618,6 +621,24 @@ trace_attr(void)
   return on;
 }
 
+/*
+ * Buffer ids across a resume.  The CUDA plugin checkpoints and restores the
+ * GPU in place, which can move device memory to other physical pages, but
+ * the driver keeps each allocation's buffer id.  The MPI's caches validate
+ * entries by buffer id: libfabric's CUDA monitor keeps NIC registrations
+ * (Slingshot/CXI), so after a resume the NIC would still DMA to the old
+ * pages.  So the buffer ids that the lower half sees change on each resume.
+ * (At restart, the lower half and its caches are new.)  ckpt_generation is
+ * bumped by cuda_after_resume().
+ */
+static void
+adjust_buffer_id(CUpointer_attribute attribute, void *data)
+{
+  if (attribute == CU_POINTER_ATTRIBUTE_BUFFER_ID && data != NULL) {
+    *(unsigned long long *)data ^= ckpt_generation << 48;
+  }
+}
+
 CUresult
 cuPointerGetAttribute(void *data, CUpointer_attribute attribute, CUdeviceptr ptr)
 {
@@ -627,6 +648,9 @@ cuPointerGetAttribute(void *data, CUpointer_attribute attribute, CUdeviceptr ptr
   if (vipc_enabled() && rc == CUDA_SUCCESS &&
       attribute == CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE) {
     *(int *)data = vmm_posix_fd_memory(ptr);
+  }
+  if (rc == CUDA_SUCCESS) {
+    adjust_buffer_id(attribute, data);
   }
   if (trace_attr()) {
     fprintf(stderr, "[mana-fwd] cuPointerGetAttribute(%d, %#llx) -> %d\n",
@@ -651,6 +675,7 @@ cuPointerGetAttributes(unsigned int numAttributes, CUpointer_attribute *attribut
         attributes[i] == CU_POINTER_ATTRIBUTE_IS_LEGACY_CUDA_IPC_CAPABLE) {
       *(int *)data[i] = vmm_posix_fd_memory(ptr);
     }
+    adjust_buffer_id(attributes[i], data[i]);
   }
   return rc;
 }
