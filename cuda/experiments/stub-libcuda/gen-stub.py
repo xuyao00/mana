@@ -20,7 +20,8 @@ import sys
 
 real = sys.argv[1] if len(sys.argv) > 1 else "/usr/lib/x86_64-linux-gnu/libcuda.so.1"
 nm = subprocess.run(["nm", "-D", "--defined-only", real],
-                    capture_output=True, text=True, check=True).stdout
+                    stdout=subprocess.PIPE, universal_newlines=True,
+                    check=True).stdout
 
 special = {
   "cuDriverGetVersion":

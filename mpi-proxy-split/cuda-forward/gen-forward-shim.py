@@ -17,22 +17,31 @@ import sys
 real, soname, prefix, out_dir = sys.argv[1:5]
 excluded = set(sys.argv[5:])
 
-nm = subprocess.run(["nm", "-D", "--defined-only", real],
-                    capture_output=True, text=True, check=True).stdout
+# readelf, not nm: some nm builds (SUSE's binutils 2.45) do not print symbol
+# versions, and the shim must have the real library's.  A line is
+#   NUM: VALUE SIZE TYPE BIND VISIBILITY [NOTES] NDX NAME[@[@]VERSION] [(IDX)]
+syms = subprocess.run(["readelf", "-W", "--dyn-syms", real],
+                      stdout=subprocess.PIPE, universal_newlines=True,
+                      check=True).stdout
 funcs, data = [], []
 versions = {}                 # version node -> symbols
-for line in nm.splitlines():
+for line in syms.splitlines():
   parts = line.split()
-  if len(parts) != 3:
+  if parts and parts[-1].startswith("(") and parts[-1].endswith(")"):
+    parts = parts[:-1]        # the version index
+  if len(parts) < 8 or not parts[0].endswith(":"):
     continue
-  kind, name = parts[1], parts[2].split("@")[0]
-  if "@@" in parts[2]:
-    versions.setdefault(parts[2].split("@@")[1], []).append(name)
+  kind, bind, ndx, full = parts[3], parts[4], parts[-2], parts[-1]
+  if ndx in ("UND", "ABS") or bind == "LOCAL":
+    continue
+  name = full.split("@")[0]
+  if "@@" in full:
+    versions.setdefault(full.split("@@")[1], []).append(name)
   if name in excluded or name in funcs or name in data:
     continue
-  if kind in ("T", "W", "i"):
+  if kind in ("FUNC", "IFUNC"):
     funcs.append(name)
-  elif kind in ("B", "D", "V", "R"):
+  elif kind == "OBJECT":
     data.append(name)
 
 desc = "mana_fwd_%s_lib" % prefix
