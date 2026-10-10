@@ -11,11 +11,13 @@ REAL_LIBCUDART ?= $(CUDA_HOME)/lib64/libcudart.so.13
 REAL_LIBNVML ?= $(shell /sbin/ldconfig -p | awk '/libnvidia-ml.so.1 / {print $$NF; exit}')
 
 CC = gcc
-CFLAGS = -g -O2 -fPIC -Wall -I. -I$(CUDA_HOME)/include
+# The shims switch the FS register (TLS): no stack protector, as in the rest
+# of MANA.
+CFLAGS = -g -O2 -fPIC -fno-stack-protector -Wall -I. -I$(CUDA_HOME)/include
 OUT = lh-shims
 
 default: $(OUT)/libmana_fwd.so $(OUT)/libcuda.so.1 $(OUT)/libcudart.so.13 \
-  $(OUT)/libnvidia-ml.so.1 libmana_cuda_vmm.so
+  $(OUT)/libcudart.so $(OUT)/libnvidia-ml.so.1 libmana_cuda_vmm.so
 
 # The upper half's device allocator (VMM memory, for checkpointable CUDA
 # IPC); not in $(OUT), which is the lower half's library directory.
@@ -52,6 +54,11 @@ $(OUT)/libcudart.so.13: gen/cudart-tramp.S gen/cudart-desc.c cudart-special.c $(
 	$(CC) $(CFLAGS) -shared -o $@ gen/cudart-tramp.S gen/cudart-desc.c cudart-special.c \
 	  -Wl,-soname,libcudart.so.13 -Wl,--version-script,gen/cudart.map -L$(OUT) -lmana_fwd -Wl,-rpath,'$$ORIGIN'
 
+# libfabric (Slingshot's CXI provider) dlopen()s "libcudart.so", without a
+# version: it must get the shim too, not a second CUDA runtime.
+$(OUT)/libcudart.so: $(OUT)/libcudart.so.13
+	ln -sf libcudart.so.13 $@
+
 gen/nvml-tramp.S gen/nvml-desc.c: gen-forward-shim.py
 	mkdir -p gen
 	./gen-forward-shim.py $(REAL_LIBNVML) libnvidia-ml.so.1 nvml gen \
@@ -63,7 +70,7 @@ $(OUT)/libnvidia-ml.so.1: gen/nvml-tramp.S gen/nvml-desc.c nvml-special.c $(OUT)
 
 install: default
 	mkdir -p $(MANA_ROOT)/lib/dmtcp/cuda-forward
-	cp -f $(OUT)/* $(MANA_ROOT)/lib/dmtcp/cuda-forward/
+	cp -df $(OUT)/* $(MANA_ROOT)/lib/dmtcp/cuda-forward/
 	cp -f libmana_cuda_vmm.so $(MANA_ROOT)/lib/dmtcp/
 
 clean:
