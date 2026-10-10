@@ -6,7 +6,9 @@
 //     (libfabric does; Cray's GTL, within a node, does not), so the test sets
 //     it on its send buffers itself: the guarantee then holds on every path.
 //     Each iteration queues the copy and the set behind a busy kernel and
-//     sends at once, without synchronizing.
+//     sends at once, without synchronizing; and it copies out of a buffer
+//     behind a busy kernel and receives into it at once: the copy must read
+//     the old data.
 //   - cudaFree waits for the device's work: a busy kernel still writes a
 //     buffer when it is freed, and the next allocation, which may reuse the
 //     memory, must not see that write.
@@ -65,12 +67,16 @@ main(int argc, char **argv)
   CUDA_CHECK(cudaSetDevice(mt_rank % ndev));
   CUDA_CHECK(cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, mt_rank % ndev));
   long long cycles = khz;      // 1 ms
-  int *state, *send, *recv, *send2, *recv2;
+  int *state, *send, *recv, *send2, *recv2, *send3, *recv3, *saved;
   CUDA_CHECK(cudaMalloc(&state, N * sizeof(int)));
   CUDA_CHECK(cudaMalloc(&send, N * sizeof(int)));
   CUDA_CHECK(cudaMalloc(&recv, N * sizeof(int)));
   CUDA_CHECK(cudaMalloc(&send2, N * sizeof(int)));
   CUDA_CHECK(cudaMalloc(&recv2, N * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&send3, N * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&recv3, N * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&saved, N * sizeof(int)));
+  CUDA_CHECK(cudaMemset(recv3, 0, N * sizeof(int)));
   h = (int *)malloc(N * sizeof(int));
   cudaStream_t other;          // does not wait for the legacy stream
   CUDA_CHECK(cudaStreamCreateWithFlags(&other, cudaStreamNonBlocking));
@@ -82,11 +88,17 @@ main(int argc, char **argv)
                                  (CUdeviceptr)send));
   CU_CHECK(cuPointerSetAttribute(&one, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS,
                                  (CUdeviceptr)send2));
+  CU_CHECK(cuPointerSetAttribute(&one, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS,
+                                 (CUdeviceptr)recv3));
   // First use: the MPI registers the buffers.
   CUDA_CHECK(cudaDeviceSynchronize());
   MT_MPI(MPI_Sendrecv(send, N, MPI_INT, right, 0, recv, N, MPI_INT, left, 0,
                       MPI_COMM_WORLD, MPI_STATUS_IGNORE));
   MT_MPI(MPI_Sendrecv(send2, N, MPI_INT, right, 1, recv2, N, MPI_INT, left, 1,
+                      MPI_COMM_WORLD, MPI_STATUS_IGNORE));
+  CUDA_CHECK(cudaMemset(recv3, 0, N * sizeof(int)));
+  CUDA_CHECK(cudaDeviceSynchronize());
+  MT_MPI(MPI_Sendrecv(send3, N, MPI_INT, right, 2, saved, N, MPI_INT, left, 2,
                       MPI_COMM_WORLD, MPI_STATUS_IGNORE));
 
   long it;
@@ -113,6 +125,22 @@ main(int argc, char **argv)
     CHECK_DATA(recv2, N, want,
                "iteration %ld: cudaMemset then MPI_Sendrecv: [%d] = %#x, not %#x",
                it, i_, h[i_], want);
+
+    // cudaMemcpy out of recv3 behind a busy kernel, then MPI receives into
+    // recv3 right away: the copy must get recv3's data of the last
+    // iteration, not the new message.
+    busy_fill<<<N / 256, 256>>>(send3, N, mt_value(mt_rank, it, 0), 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    busy_fill<<<N / 256, 256>>>(state, N, 0, cycles);
+    CUDA_CHECK(cudaMemcpy(saved, recv3, N * sizeof(int),
+                          cudaMemcpyDeviceToDevice));
+    MT_MPI(MPI_Sendrecv(send3, N, MPI_INT, right, 2, recv3, N, MPI_INT, left, 2,
+                        MPI_COMM_WORLD, MPI_STATUS_IGNORE));
+    int old = it == 0 ? 0 : mt_value(left, it - 1, 0);
+    CHECK_DATA(saved, N, it == 0 ? 0 : old + i_,
+               "iteration %ld: cudaMemcpy out of a buffer, then MPI_Sendrecv "
+               "into it: [%d] = %d, not %d", it, i_, h[i_],
+               it == 0 ? 0 : old + i_);
 
     // cudaFree while a busy kernel writes the buffer; the next allocation
     // is cleared on another stream and must stay clear.
