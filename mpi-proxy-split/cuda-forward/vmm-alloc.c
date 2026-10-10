@@ -317,26 +317,57 @@ wrap_free(CUdeviceptr dptr)
 }
 
 /*
- * Redirects the implementation slot of exported driver function 'name':
- *   +0x00  cmpl $imm32, disp32(%rip)   81 3d d d d d i i i i   (10 bytes)
- *   +0x0a  je   +off8                  74 xx
- *   +0x0c  push %rbp; mov %rsp,%rbp; sub $0x10,%rsp
- *   +0x14  call *disp32(%rip)          ff 15 d d d d -> the slot
- * Returns the old implementation, or NULL if the stub is not of that form.
+ * Finds the call through the implementation slot in the entry code of an
+ * exported driver function:
+ *          [frame setup]               (driver 580: before the cmpl)
+ *          cmpl $imm32, disp32(%rip)   81 3d d d d d i i i i   (10 bytes)
+ *          je   ...                    74 xx  or  0f 84 xx xx xx xx
+ *          [frame setup]               (driver 595: after the je)
+ *   call:  call *disp32(%rip)          ff 15 d d d d -> the slot
+ * Returns the address of the call, or NULL if the code is not of that form.
+ */
+static unsigned char *
+slot_call(unsigned char *f)
+{
+  for (int i = 0; i < 0x20; i++) {
+    if (f[i] == 0x81 && f[i + 1] == 0x3d) {
+      unsigned char *p = f + i + 10;
+      if (p[0] == 0x74) {
+        p += 2;
+      } else if (p[0] == 0x0f && p[1] == 0x84) {
+        p += 6;
+      } else {
+        return NULL;
+      }
+      for (int j = 0; j < 0x10; j++) {
+        if (p[j] == 0xff && p[j + 1] == 0x15) {
+          return p + j;
+        }
+      }
+      return NULL;
+    }
+  }
+  return NULL;
+}
+
+/*
+ * Redirects the implementation slot of exported driver function 'name'
+ * (see slot_call()).  Returns the old implementation, or NULL if the entry
+ * code is not of the expected form.
  */
 static void *
 redirect(void *lib, const char *name, void *wrapper)
 {
   unsigned char *f = (unsigned char *)dlsym(lib, name);
-  if (f == NULL || f[0] != 0x81 || f[1] != 0x3d || f[10] != 0x74 ||
-      f[0x14] != 0xff || f[0x15] != 0x15) {
+  unsigned char *call = f != NULL ? slot_call(f) : NULL;
+  if (call == NULL) {
     fprintf(stderr, "[mana-vmm] %s: unexpected entry code; not redirected\n",
             name);
     return NULL;
   }
   int32_t disp;
-  memcpy(&disp, f + 0x16, sizeof disp);
-  void **slot = (void **)(f + 0x1a + disp);
+  memcpy(&disp, call + 2, sizeof disp);
+  void **slot = (void **)(call + 6 + disp);
   void *old = *slot;
   long page = sysconf(_SC_PAGESIZE);
   void *pg = (void *)((uintptr_t)slot & ~(uintptr_t)(page - 1));
