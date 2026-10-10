@@ -138,6 +138,20 @@ int PMPI_Init_thread(int *argc, char ***argv, int required, int *provided) {
   return retval;
 }
 
+// MPICH's extension: whether the MPI supports CUDA buffers, as the lower
+// half's MPI answers.  CUDA-aware MPI programs (e.g. GROMACS) call it.
+#pragma weak MPIX_Query_cuda_support = PMPIX_Query_cuda_support
+int PMPIX_Query_cuda_support(void)
+{
+  int retval;
+  LOWER_HALF_DISABLE_CKPT();
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  retval = NEXT_FUNC(MANA_Query_cuda_support)();
+  RETURN_TO_UPPER_HALF();
+  LOWER_HALF_ENABLE_CKPT();
+  return retval;
+}
+
 #pragma weak MPI_Initialized = PMPI_Initialized
 int PMPI_Initialized(int *flag)
 {

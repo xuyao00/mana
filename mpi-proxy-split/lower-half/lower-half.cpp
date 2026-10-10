@@ -1759,3 +1759,12 @@ int MPI_MANA_Internal(char *dummy) {
   return 0;
 }
 
+// MPICH's MPIX_Query_cuda_support(), for the upper half's: whether this MPI
+// supports CUDA buffers (GROMACS asks before it uses direct GPU
+// communication).  0 if the MPI has no such function.
+int MPI_MANA_Query_cuda_support() {
+  int (*query)(void) =
+    (int (*)(void))dlsym(RTLD_DEFAULT, "MPIX_Query_cuda_support");
+  return query != NULL ? query() : 0;
+}
+
