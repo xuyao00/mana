@@ -17,6 +17,11 @@
  * Small allocations are carved out of VMM chunks (the allocation granularity
  * is 2 MB), first fit, 512-byte aligned.  An IPC export then shares the whole
  * chunk; cuMemGetAddressRange reports the chunk, as UCX expects.
+ *
+ * Two orderings of cudaMalloc memory that VMM memory lacks are kept (see
+ * wrap_free() and wrap_setattr()): cudaFree waits for the device's work, and
+ * CU_POINTER_ATTRIBUTE_SYNC_MEMOPS makes the synchronous copies and sets of a
+ * buffer wait for completion.
  */
 #define _GNU_SOURCE
 #include <cuda.h>
@@ -38,9 +43,13 @@
 typedef CUresult (*alloc_fn)(CUdeviceptr *, size_t);
 typedef CUresult (*pitch_fn)(CUdeviceptr *, size_t *, size_t, size_t, unsigned);
 typedef CUresult (*free_fn)(CUdeviceptr);
+typedef CUresult (*setattr_fn)(const void *, CUpointer_attribute, CUdeviceptr);
 static alloc_fn real_alloc;
 static pitch_fn real_pitch;
 static free_fn real_free;
+static setattr_fn real_setattr;
+static CUresult (*ctx_sync)(void);
+static CUresult (*stream_sync)(CUstream);
 
 typedef struct {                  // A VMM allocation of its own.
   CUdeviceptr base;
@@ -66,7 +75,14 @@ static Chunk chunks[MAX_CHUNKS];
 static int n_chunks;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int verbose;
-static struct { unsigned long vmm, small, fallback, frees; } stats;
+static struct { unsigned long vmm, small, fallback, frees, synced; } stats;
+
+// The allocations with CU_POINTER_ATTRIBUTE_SYNC_MEMOPS (see wrap_setattr()).
+// n_sync is read without the lock: 0 means no synchronous copy has to wait.
+#define MAX_SYNC 4096
+static struct { CUdeviceptr base; size_t size; } syncr[MAX_SYNC];
+static int n_sync;
+static int sync_all;          // syncr[] is full: all of our allocations
 
 // Whether VMM memory of 'dev' can be made GPUDirect RDMA capable.  A NIC
 // (e.g. Slingshot's, through libfabric's CXI provider) can register VMM
@@ -318,11 +334,62 @@ wrap_pitch(CUdeviceptr *dptr, size_t *pitch, size_t width, size_t height,
   return rc;
 }
 
+// The allocation of ours that contains 'p': 1 and its range, or 0.  With the
+// lock.
+static int
+find_alloc(CUdeviceptr p, CUdeviceptr *base, size_t *size)
+{
+  for (int i = 0; i < n_allocs; i++) {
+    if (allocs[i].on && p - allocs[i].base < allocs[i].size) {
+      *base = allocs[i].base;
+      *size = allocs[i].size;
+      return 1;
+    }
+  }
+  for (int c = 0; c < n_chunks; c++) {
+    Chunk *ch = &chunks[c];
+    if (!ch->on || p - ch->base >= ch->size) {
+      continue;
+    }
+    for (int b = 0; b < ch->n_blocks; b++) {
+      Block *bl = &ch->blocks[b];
+      if (bl->used && p - (ch->base + bl->off) < bl->size) {
+        *base = ch->base + bl->off;
+        *size = bl->size;
+        return 1;
+      }
+    }
+    return 0;
+  }
+  return 0;
+}
+
+// Forgets the SYNC_MEMOPS of the allocation at 'base'.  With the lock.
+static void
+forget_sync(CUdeviceptr base)
+{
+  for (int i = 0; i < n_sync; i++) {
+    if (syncr[i].base == base) {
+      syncr[i] = syncr[n_sync - 1];
+      __atomic_store_n(&n_sync, n_sync - 1, __ATOMIC_RELEASE);
+      return;
+    }
+  }
+}
+
 static CUresult
 wrap_free(CUdeviceptr dptr)
 {
+  if (dptr == 0) {
+    return real_free(dptr);
+  }
+  // cudaFree waits for the device's work (the driver's cuMemFree_v2 does),
+  // so that no kernel or copy still uses memory that a new allocation may
+  // get.  Wait as well.
+  ctx_sync();
   pthread_mutex_lock(&lock);
   stats.frees++;
+  forget_sync(dptr);
   for (int i = 0; i < n_allocs; i++) {
     if (allocs[i].on && allocs[i].base == dptr) {
       vmm_destroy(allocs[i].base, allocs[i].size, allocs[i].h);
@@ -335,6 +402,139 @@ wrap_free(CUdeviceptr dptr)
   pthread_mutex_unlock(&lock);
   return done ? CUDA_SUCCESS : real_free(dptr);
 }
+
+/*
+ * CU_POINTER_ATTRIBUTE_SYNC_MEMOPS makes the "synchronous" copies and sets
+ * that touch a buffer wait until they complete.  Without it, cudaMemcpy
+ * between device buffers and cudaMemset return before the work is done.  A
+ * CUDA-aware MPI sets it on the buffers it registers (libfabric:
+ * cuda_set_sync_memops()), so that a NIC never reads a buffer that such a
+ * copy has not written yet.  The driver refuses it for VMM memory
+ * (CUDA_ERROR_NOT_SUPPORTED), so it is emulated here: wrap_setattr() records
+ * the allocation, and the synchronous copies and sets that write or read a
+ * recorded allocation wait for their default stream (sync_memops()).
+ */
+static CUresult
+wrap_setattr(const void *value, CUpointer_attribute attribute, CUdeviceptr ptr)
+{
+  if (attribute != CU_POINTER_ATTRIBUTE_SYNC_MEMOPS || value == NULL) {
+    return real_setattr(value, attribute, ptr);
+  }
+  CUdeviceptr base;
+  size_t size;
+  pthread_mutex_lock(&lock);
+  int ours = find_alloc(ptr, &base, &size);
+  if (ours) {
+    forget_sync(base);
+    if (*(const unsigned char *)value != 0) {   // a bool or an int
+      if (n_sync < MAX_SYNC) {
+        syncr[n_sync].base = base;
+        syncr[n_sync].size = size;
+        __atomic_store_n(&n_sync, n_sync + 1, __ATOMIC_RELEASE);
+      } else {
+        sync_all = 1;
+      }
+    }
+  }
+  pthread_mutex_unlock(&lock);
+  return ours ? CUDA_SUCCESS : real_setattr(value, attribute, ptr);
+}
+
+// After a synchronous copy or set on default stream 'stream' that wrote
+// 'dst' and read 'src' (0: not device memory): waits for it if either is in
+// an allocation with SYNC_MEMOPS.
+static void
+sync_memops(CUdeviceptr dst, CUdeviceptr src, CUstream stream)
+{
+  if (__atomic_load_n(&n_sync, __ATOMIC_ACQUIRE) == 0) {
+    return;
+  }
+  int wait = 0;
+  pthread_mutex_lock(&lock);
+  for (int i = 0; i < n_sync && !wait; i++) {
+    wait = dst - syncr[i].base < syncr[i].size ||
+           src - syncr[i].base < syncr[i].size;
+  }
+  if (!wait && sync_all) {
+    CUdeviceptr b;
+    size_t s;
+    wait = (dst != 0 && find_alloc(dst, &b, &s)) ||
+           (src != 0 && find_alloc(src, &b, &s));
+  }
+  if (wait) {
+    stats.synced++;
+  }
+  pthread_mutex_unlock(&lock);
+  if (wait) {
+    stream_sync(stream);
+  }
+}
+
+static CUdeviceptr
+device_ptr(CUmemorytype type, CUdeviceptr p)
+{
+  return type == CU_MEMORYTYPE_DEVICE || type == CU_MEMORYTYPE_UNIFIED ? p : 0;
+}
+
+// The synchronous copies and sets (on the legacy and the per-thread default
+// stream): the device memory that each writes (d) and reads (s).
+#define SYNC_MEMOP(name, stream, params, args, d, s)                          \
+  static CUresult (*real_##name) params;                                      \
+  static CUresult wrap_##name params                                          \
+  {                                                                           \
+    CUresult rc = real_##name args;                                           \
+    if (rc == CUDA_SUCCESS) {                                                 \
+      sync_memops((d), (s), (stream));                                        \
+    }                                                                         \
+    return rc;                                                                \
+  }
+#define SYNC_MEMOPS(name, params, args, d, s)                                 \
+  SYNC_MEMOP(name, CU_STREAM_LEGACY, params, args, d, s)                      \
+  SYNC_MEMOP(name##_ptds, CU_STREAM_PER_THREAD, params, args, d, s)
+
+SYNC_MEMOPS(cuMemcpy, (CUdeviceptr d, CUdeviceptr s, size_t n), (d, s, n),
+            d, s)
+SYNC_MEMOPS(cuMemcpyDtoD_v2, (CUdeviceptr d, CUdeviceptr s, size_t n),
+            (d, s, n), d, s)
+SYNC_MEMOPS(cuMemcpyHtoD_v2, (CUdeviceptr d, const void *s, size_t n),
+            (d, s, n), d, 0)
+SYNC_MEMOPS(cuMemcpyPeer, (CUdeviceptr d, CUcontext dc, CUdeviceptr s,
+                           CUcontext sc, size_t n),
+            (d, dc, s, sc, n), d, s)
+SYNC_MEMOPS(cuMemcpy2D_v2, (const CUDA_MEMCPY2D *p), (p),
+            device_ptr(p->dstMemoryType, p->dstDevice),
+            device_ptr(p->srcMemoryType, p->srcDevice))
+SYNC_MEMOPS(cuMemcpy2DUnaligned_v2, (const CUDA_MEMCPY2D *p), (p),
+            device_ptr(p->dstMemoryType, p->dstDevice),
+            device_ptr(p->srcMemoryType, p->srcDevice))
+SYNC_MEMOPS(cuMemcpy3D_v2, (const CUDA_MEMCPY3D *p), (p),
+            device_ptr(p->dstMemoryType, p->dstDevice),
+            device_ptr(p->srcMemoryType, p->srcDevice))
+SYNC_MEMOPS(cuMemsetD8_v2, (CUdeviceptr d, unsigned char v, size_t n),
+            (d, v, n), d, 0)
+SYNC_MEMOPS(cuMemsetD16_v2, (CUdeviceptr d, unsigned short v, size_t n),
+            (d, v, n), d, 0)
+SYNC_MEMOPS(cuMemsetD32_v2, (CUdeviceptr d, unsigned int v, size_t n),
+            (d, v, n), d, 0)
+SYNC_MEMOPS(cuMemsetD2D8_v2, (CUdeviceptr d, size_t pitch, unsigned char v,
+                              size_t w, size_t h),
+            (d, pitch, v, w, h), d, 0)
+SYNC_MEMOPS(cuMemsetD2D16_v2, (CUdeviceptr d, size_t pitch, unsigned short v,
+                               size_t w, size_t h),
+            (d, pitch, v, w, h), d, 0)
+SYNC_MEMOPS(cuMemsetD2D32_v2, (CUdeviceptr d, size_t pitch, unsigned int v,
+                               size_t w, size_t h),
+            (d, pitch, v, w, h), d, 0)
+
+#define MEMOP(name) { #name, (void *)wrap_##name, (void **)&real_##name }
+#define MEMOPS(name) MEMOP(name), MEMOP(name##_ptds)
+static const struct { const char *name; void *wrapper; void **real; } memops[] = {
+  MEMOPS(cuMemcpy), MEMOPS(cuMemcpyDtoD_v2), MEMOPS(cuMemcpyHtoD_v2),
+  MEMOPS(cuMemcpyPeer), MEMOPS(cuMemcpy2D_v2), MEMOPS(cuMemcpy2DUnaligned_v2),
+  MEMOPS(cuMemcpy3D_v2), MEMOPS(cuMemsetD8_v2), MEMOPS(cuMemsetD16_v2),
+  MEMOPS(cuMemsetD32_v2), MEMOPS(cuMemsetD2D8_v2), MEMOPS(cuMemsetD2D16_v2),
+  MEMOPS(cuMemsetD2D32_v2),
+};
 
 /*
  * Finds the call through the implementation slot in the entry code of an
@@ -372,18 +572,19 @@ slot_call(unsigned char *f)
 
 /*
  * Redirects the implementation slot of exported driver function 'name'
- * (see slot_call()).  Returns the old implementation, or NULL if the entry
- * code is not of the expected form.
+ * (see slot_call()) to 'wrapper', and stores the old implementation in *real
+ * before: the wrapper calls it.  Returns 0 if the entry code is not of the
+ * expected form (*real is unchanged), else 1.
  */
-static void *
-redirect(void *lib, const char *name, void *wrapper)
+static int
+redirect(void *lib, const char *name, void *wrapper, void **real)
 {
   unsigned char *f = (unsigned char *)dlsym(lib, name);
   unsigned char *call = f != NULL ? slot_call(f) : NULL;
   if (call == NULL) {
     fprintf(stderr, "[mana-vmm] %s: unexpected entry code; not redirected\n",
             name);
-    return NULL;
+    return 0;
   }
   int32_t disp;
   memcpy(&disp, call + 2, sizeof disp);
@@ -393,14 +594,15 @@ redirect(void *lib, const char *name, void *wrapper)
   void *pg = (void *)((uintptr_t)slot & ~(uintptr_t)(page - 1));
   if (mprotect(pg, page, PROT_READ | PROT_WRITE) != 0) {
     fprintf(stderr, "[mana-vmm] %s: cannot write its slot\n", name);
-    return NULL;
+    return 0;
   }
+  __atomic_store_n(real, old, __ATOMIC_SEQ_CST);
   __atomic_store_n(slot, wrapper, __ATOMIC_SEQ_CST);
   if (verbose) {
     fprintf(stderr, "[mana-vmm] %s: slot %p, %p -> %p\n", name, (void *)slot,
             old, wrapper);
   }
-  return old;
+  return 1;
 }
 
 static void
@@ -408,8 +610,9 @@ report(void)
 {
   if (verbose) {
     fprintf(stderr, "[mana-vmm %d] VMM allocations: %lu large, %lu small, "
-            "%lu fallbacks, %lu frees\n", getpid(), stats.vmm, stats.small,
-            stats.fallback, stats.frees);
+            "%lu fallbacks, %lu frees; %lu synchronous copies waited "
+            "(SYNC_MEMOPS)\n", getpid(), stats.vmm, stats.small,
+            stats.fallback, stats.frees, stats.synced);
   }
 }
 
@@ -424,27 +627,37 @@ vmm_alloc_init(void)
   if (lib == NULL) {
     return;                      // No CUDA driver: nothing to do.
   }
-  // cuMemFree first: VMM allocations must never reach the real cuMemFree.
-  // The real functions are set before their slots point to the wrappers.
-  real_free = (free_fn)dlsym(lib, "cuMemFree_v2");      // until redirected
-  void *f = redirect(lib, "cuMemFree_v2", (void *)wrap_free);
-  void *a = NULL;
-  if (f != NULL) {
-    real_free = (free_fn)f;
-    real_alloc = (alloc_fn)dlsym(lib, "cuMemAlloc_v2");
-    real_pitch = (pitch_fn)dlsym(lib, "cuMemAllocPitch_v2");
-    a = redirect(lib, "cuMemAlloc_v2", (void *)wrap_alloc);
-    if (a != NULL) {
-      real_alloc = (alloc_fn)a;
-      void *p = redirect(lib, "cuMemAllocPitch_v2", (void *)wrap_pitch);
-      if (p != NULL) {
-        real_pitch = (pitch_fn)p;
-      }
-    }
-  }
-  if (a == NULL) {
+  ctx_sync = (CUresult (*)(void))dlsym(lib, "cuCtxSynchronize");
+  stream_sync = (CUresult (*)(CUstream))dlsym(lib, "cuStreamSynchronize");
+  // The real functions are the exported ones until their slots are
+  // redirected.  cuMemFree first: VMM allocations must never reach the real
+  // cuMemFree.
+  real_free = (free_fn)dlsym(lib, "cuMemFree_v2");
+  real_alloc = (alloc_fn)dlsym(lib, "cuMemAlloc_v2");
+  real_pitch = (pitch_fn)dlsym(lib, "cuMemAllocPitch_v2");
+  real_setattr = (setattr_fn)dlsym(lib, "cuPointerSetAttribute");
+  int on = ctx_sync != NULL && stream_sync != NULL &&
+           redirect(lib, "cuMemFree_v2", (void *)wrap_free,
+                    (void **)&real_free) &&
+           redirect(lib, "cuMemAlloc_v2", (void *)wrap_alloc,
+                    (void **)&real_alloc);
+  if (!on) {
     fprintf(stderr, "[mana-vmm] device allocations stay cudaMalloc memory: "
             "no checkpointable CUDA IPC\n");
+    return;
+  }
+  redirect(lib, "cuMemAllocPitch_v2", (void *)wrap_pitch, (void **)&real_pitch);
+  // SYNC_MEMOPS is emulated only if every synchronous copy and set waits.
+  int memops_on = 1;
+  for (size_t i = 0; i < sizeof memops / sizeof memops[0]; i++) {
+    *memops[i].real = dlsym(lib, memops[i].name);
+    memops_on = memops_on && *memops[i].real != NULL &&
+                redirect(lib, memops[i].name, memops[i].wrapper, memops[i].real);
+  }
+  if (!memops_on || !redirect(lib, "cuPointerSetAttribute",
+                              (void *)wrap_setattr, (void **)&real_setattr)) {
+    fprintf(stderr, "[mana-vmm] SYNC_MEMOPS is not emulated: synchronous "
+            "copies to device memory may return before they complete\n");
   }
   atexit(report);
 }
