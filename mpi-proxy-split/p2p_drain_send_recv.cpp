@@ -35,6 +35,7 @@
 #include "mpi_nextfunc.h"
 #include "seq_num.h"
 #include "virtual_id.h"
+#include "uh_wrappers.h"
 
 using namespace dmtcp;
 using dmtcp::kvdb::KVDBRequest;
@@ -261,6 +262,19 @@ recvMsgIntoInternalBuffer(MPI_Status status, MPI_Comm comm)
   return count;
 }
 
+// The drain runs on the checkpoint thread.  Before it completes a request of
+// the application on device memory (CUDA-aware MPI), give the thread that
+// memory's CUDA context: it may have another device's context, or none.
+static void
+useContextOfRequest(MPI_Request request)
+{
+  mpi_nonblocking_call_t call;
+  if (getPendingCall(request, &call)) {
+    mana_fwd_use_context_of(call.type == IRECV_REQUEST ? call.recvbuf
+                                                       : call.sendbuf);
+  }
+}
+
 // Go through each pending MPI_Irecv (and MPI_Isend) and try to complete
 // them before checkpointing.
 int
@@ -279,6 +293,7 @@ completePendingP2pRequests()
     // other MPIs.  A previous call to MPI_Irecv caused only the metadata to be
     // exchanged.  So, MPI_Iprobe succeeds and MPI_Irecv will later fail, unless
     // we force the sending of data via MPI_Test.
+    useContextOfRequest(request);
     MPI_Test_internal(&request, &flag, &status, false);
     if (flag) {
       if (call.type == IRECV_REQUEST) {
@@ -404,6 +419,7 @@ drainRemainingP2pMsgs()
           // own MPI_Wait/MPI_Test frees it.
           int done = 0;
           MPI_Status recv_status;
+          useContextOfRequest(matched_request);
           while (!done) {
             MPI_Test_internal(&matched_request, &done, &recv_status, false);
           }
@@ -440,6 +456,7 @@ completePendingIsends()
     }
     int flag = 0;
     MPI_Status status;
+    useContextOfRequest(request);
     while (!flag) {
       MPI_Test_internal(&request, &flag, &status, false);
     }

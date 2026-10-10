@@ -30,6 +30,7 @@ void mana_lower_half_mpi_init();
 void mana_fwd_before_ckpt();
 void mana_fwd_after_resume();
 void mana_fwd_after_resume_peers();
+void mana_fwd_use_context_of(const void *buf);
 extern void reset_wrappers();
 extern LowerHalfInfo_t *lh_info;
 

@@ -40,6 +40,7 @@
 #include "p2p_log_replay.h"
 #include "p2p_drain_send_recv.h"
 #include "virtual_id.h"
+#include "uh_wrappers.h"
 
 using namespace dmtcp;
 
@@ -292,6 +293,8 @@ replayMpiP2pOnRestart()
     switch (call->type) {
       case IRECV_REQUEST:
         JTRACE("Replaying Irecv call")(call->remote_node);
+        // This is the checkpoint thread: give it the buffer's CUDA context.
+        mana_fwd_use_context_of(call->recvbuf);
 #if 0
         MPI_Irecv(call->recvbuf, call->count,
                   realType, call->remote_node,

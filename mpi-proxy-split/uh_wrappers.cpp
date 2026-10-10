@@ -187,6 +187,56 @@ mana_fwd_note_thread(pid_t real_tid, unsigned long fs)
   }
 }
 
+// MANA_CUDA_FORWARD: makes the CUDA context that owns 'buf' current on this
+// thread, if 'buf' is device memory.  The checkpoint thread calls MPI (the
+// restart replay of pending receives) with no context or another device's,
+// and the MPI's CUDA calls on the buffer would fail (libfabric:
+// cuMemGetAddressRange -> CUDA_ERROR_NOT_FOUND).  Runs in the upper half,
+// with its FS.
+void
+mana_fwd_use_context_of(const void *buf)
+{
+  // From cuda.h, which MANA does not need to build.
+  const int CU_POINTER_ATTRIBUTE_CONTEXT = 1;
+  const int CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL = 9;
+  typedef int (*attr_fn)(void *, int, unsigned long long);
+  typedef int (*set_fn)(void *);
+  typedef int (*retain_fn)(void **, int);
+  static attr_fn attr = NULL;
+  static set_fn set = NULL;
+  static retain_fn retain = NULL;
+  static int looked = 0;
+  if (lh_info == NULL || lh_info->fwd_ctl == NULL || buf == NULL) {
+    return;
+  }
+  if (!looked) {
+    looked = 1;
+    // The application's driver, if it has one: never load it here.
+    void *cuda = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+    if (cuda != NULL) {
+      attr = (attr_fn)dlsym(cuda, "cuPointerGetAttribute");
+      set = (set_fn)dlsym(cuda, "cuCtxSetCurrent");
+      retain = (retain_fn)dlsym(cuda, "cuDevicePrimaryCtxRetain");
+    }
+  }
+  if (attr == NULL || set == NULL) {
+    return;
+  }
+  void *ctx = NULL;
+  int dev = -1;
+  if (attr(&ctx, CU_POINTER_ATTRIBUTE_CONTEXT, (uintptr_t)buf) == 0 &&
+      ctx != NULL) {
+    set(ctx);
+  } else if (retain != NULL &&
+             attr(&dev, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                  (uintptr_t)buf) == 0 &&
+             retain(&ctx, dev) == 0) {
+    // VMM memory (libmana_cuda_vmm.so) belongs to no context: use its
+    // device's primary context, the CUDA runtime's.
+    set(ctx);
+  }
+}
+
 // With MANA_CUDA_FORWARD, the lower half initializes MPI when the upper half
 // asks (lh_info->lh_mpi_init): at the application's MPI_Init(), and at
 // restart after the CUDA plugin restored the GPU (DMTCP_EVENT_RESTART runs in
