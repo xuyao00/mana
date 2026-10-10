@@ -270,6 +270,71 @@ pendingCallUsesDatatype(MPI_Datatype type)
   return found;
 }
 
+// CUDA-aware MPI (MANA_CUDA_FORWARD): a receive that stays posted across a
+// checkpoint and resume keeps the NIC's registration of its buffer, but the
+// CUDA plugin's checkpoint and restore of the GPU can move device memory to
+// other pages: the message would land in the old ones.  So after the drain,
+// which leaves no message in flight, the pending receives into device memory
+// are cancelled, and on resume, once the GPU is restored, posted again in
+// their order.  (At restart, replayMpiP2pOnRestart() posts them.)  The
+// application's threads stay out of the lower half meanwhile.  Receives into
+// host memory stay posted: that memory does not move.
+static std::vector<MPI_Request> cancelledRecvs;
+
+void
+cancelPendingRecvs()
+{
+  cancelledRecvs.clear();
+  for (MPI_Request request : pendingRequestsInPostingOrder()) {
+    mpi_nonblocking_call_t call;
+    if (!getPendingCall(request, &call) || call.type != IRECV_REQUEST ||
+        !mana_fwd_is_device_memory(call.recvbuf)) {
+      continue;
+    }
+    MPI_Request real = get_real_id((mana_mpi_handle){.request = request}).request;
+    MPI_Status status;
+    int cancelled = 0;
+    mana_fwd_use_context_of(call.recvbuf);
+    JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+    NEXT_FUNC(Cancel)(&real);
+    NEXT_FUNC(Wait)(&real, &status);
+    NEXT_FUNC(Test_cancelled)(&status, &cancelled);
+    RETURN_TO_UPPER_HALF();
+    if (cancelled) {
+      cancelledRecvs.push_back(request);
+    } else {
+      complete_virt_request(request, &status);  // It received a message.
+      clearPendingRequestFromLog(request);
+    }
+  }
+}
+
+void
+repostCancelledRecvs()
+{
+  for (MPI_Request request : cancelledRecvs) {
+    mpi_nonblocking_call_t call;
+    if (!getPendingCall(request, &call)) {
+      continue;
+    }
+    MPI_Comm realComm = get_real_id((mana_mpi_handle){.comm = call.comm}).comm;
+    MPI_Datatype realType =
+      get_real_id((mana_mpi_handle){.datatype = call.datatype}).datatype;
+    MPI_Request realRequest;
+    int retval;
+    mana_fwd_use_context_of(call.recvbuf);
+    JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+    retval = NEXT_FUNC(Irecv)(call.recvbuf, call.count, realType,
+                              call.remote_node, call.tag, realComm,
+                              &realRequest);
+    RETURN_TO_UPPER_HALF();
+    JASSERT(retval == MPI_SUCCESS).Text("Error while reposting recv");
+    update_virt_id((mana_mpi_handle){.request = request},
+                   (mana_mpi_handle){.request = realRequest});
+  }
+  cancelledRecvs.clear();
+}
+
 void
 replayMpiP2pOnRestart()
 {
@@ -280,6 +345,7 @@ replayMpiP2pOnRestart()
 
   // No other thread runs at restart; a lock saved in the image is stale.
   pendingLock = 0;
+  cancelledRecvs.clear();  // All pending receives are posted here.
   // Re-post the receives in the order they were posted.
   for (MPI_Request pending : pendingRequestsInPostingOrder()) {
     int retval = 0;

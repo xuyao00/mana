@@ -968,6 +968,9 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
         complete_pending_nonblocking_collectives();  // seq_num.cpp
         g_drain_stats.t_collective += drainStatsNow() - t_nbc;
       }
+      if (lh_info->fwd_ctl != NULL) {
+        cancelPendingRecvs();  // p2p_log_replay.cpp
+      }
       reportDrainStats();  // With MANA_DRAIN_STATS set
       // MPI is quiet now; next, the CUDA plugin checkpoints the GPU (its
       // PRESUSPEND runs after ours).  Leave out the lower half's CUDA state
@@ -1063,6 +1066,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
         mana_fwd_after_resume();
         dmtcp_global_barrier("MPI:cuda-ipc-exported");
         mana_fwd_after_resume_peers();
+        repostCancelledRecvs();  // p2p_log_replay.cpp
         allow_threads_to_enter_lower_half();
       }
       g_fwd_resume_pending = false;

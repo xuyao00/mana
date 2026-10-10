@@ -237,6 +237,33 @@ mana_fwd_use_context_of(const void *buf)
   }
 }
 
+// MANA_CUDA_FORWARD: whether 'buf' is device memory of the application's
+// CUDA.  Runs in the upper half, with its FS.
+int
+mana_fwd_is_device_memory(const void *buf)
+{
+  // From cuda.h, which MANA does not need to build.
+  const int CU_POINTER_ATTRIBUTE_MEMORY_TYPE = 2;
+  const unsigned CU_MEMORYTYPE_DEVICE = 2;
+  typedef int (*attr_fn)(void *, int, unsigned long long);
+  static attr_fn attr = NULL;
+  static int looked = 0;
+  if (lh_info == NULL || lh_info->fwd_ctl == NULL || buf == NULL) {
+    return 0;
+  }
+  if (!looked) {
+    looked = 1;
+    void *cuda = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+    if (cuda != NULL) {
+      attr = (attr_fn)dlsym(cuda, "cuPointerGetAttribute");
+    }
+  }
+  unsigned type = 0;
+  return attr != NULL &&
+         attr(&type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (uintptr_t)buf) == 0 &&
+         type == CU_MEMORYTYPE_DEVICE;
+}
+
 // With MANA_CUDA_FORWARD, the lower half initializes MPI when the upper half
 // asks (lh_info->lh_mpi_init): at the application's MPI_Init(), and at
 // restart after the CUDA plugin restored the GPU (DMTCP_EVENT_RESTART runs in
