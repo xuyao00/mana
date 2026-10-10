@@ -31,8 +31,13 @@ def setup_cuda_forwarding():
   os.environ["LD_LIBRARY_PATH"] = fwd_dir + (":" + old if old else "")
   # The CUDA checkpoint API identifies the process by its name.
   os.environ.setdefault("DMTCP_DISABLE_PRGNAME_PREFIX", "1")
+  # libfabric (e.g. Slingshot's CXI provider) must not pin device memory with
+  # GDRCopy: memory that the CUDA checkpoint API restored cannot be pinned
+  # (gdr_pin_buffer: EINVAL), and pins taken before a checkpoint go stale.
+  os.environ.setdefault("FI_HMEM_CUDA_USE_GDRCOPY", "0")
   if os.environ.get("MANA_CUDA_VMM_ALLOC", "1") == "0":
     os.environ.setdefault("UCX_TLS", "^cuda_ipc")
+    os.environ.setdefault("MPICH_GPU_IPC_ENABLED", "0")   # Cray MPICH
 
 dmtcp_flags = sys.argv[1:]
 
