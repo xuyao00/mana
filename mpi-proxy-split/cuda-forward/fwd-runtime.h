@@ -45,6 +45,10 @@ typedef struct {
   // As register_thread, with the thread's stack [lo, hi) (no gettid then).
   void (*register_thread_stack)(int tid, unsigned long uhfs,
                                 unsigned long lo, unsigned long hi);
+  // Whether the thread whose stack holds 'sp' is in a call that the lower
+  // half (the MPI library) made through the shims.  Uses no TLS and no libc:
+  // the upper half calls it with its own FS.
+  int (*forwarding)(unsigned long sp);
 } FwdCtl;
 
 #ifdef __cplusplus

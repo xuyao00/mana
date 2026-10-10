@@ -390,6 +390,14 @@ fwd_after_resume(void)
   }
 }
 
+// See FwdCtl::forwarding.
+static int
+fwd_forwarding(unsigned long sp)
+{
+  FwdThread *t = current_thread(sp, 0);
+  return t != NULL && t->depth > 0;
+}
+
 __attribute__((constructor)) static void
 fwd_runtime_init(void)
 {
@@ -400,6 +408,7 @@ fwd_runtime_init(void)
   mana_fwd_ctl.register_thread_stack = mana_fwd_register_thread_stack;
   mana_fwd_ctl.forget_threads = mana_fwd_forget_threads;
   mana_fwd_ctl.fsgsbase = &mana_fwd_fsgsbase;
+  mana_fwd_ctl.forwarding = fwd_forwarding;
 }
 
 /*

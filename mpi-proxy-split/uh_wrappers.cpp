@@ -35,6 +35,7 @@
 #include "mpi_plugin.h"
 #include "cuda-forward/fwd-runtime.h"
 #include "switch-context.h"
+#include "lower_half_ckpt.h"
 #include <dlfcn.h>
 #include <pthread.h>
 
@@ -235,6 +236,38 @@ mana_fwd_use_context_of(const void *buf)
     // device's primary context, the CUDA runtime's.
     set(ctx);
   }
+}
+
+// MANA_CUDA_FORWARD: whether this thread is in a CUDA call that the lower
+// half (the MPI library) made through the forwarding shims.  For
+// libmana_cuda_vmm.so.  Runs in the upper half, with its FS.
+extern "C" int
+mana_fwd_forwarding()
+{
+  FwdCtl *ctl = lh_info != NULL ? (FwdCtl *)lh_info->fwd_ctl : NULL;
+  if (ctl == NULL || ctl->forwarding == NULL) {
+    return 0;
+  }
+  return ctl->forwarding((unsigned long)__builtin_frame_address(0));
+}
+
+// Connects libmana_cuda_vmm.so (mana_launch --cuda), if it is loaded: the
+// application's synchronous copies and sets complete before an MPI call
+// enters the lower half (lower_half_disable_ckpt()), and those that the MPI
+// itself issues complete at once (see vmm-alloc.c).
+void
+mana_vmm_connect()
+{
+  void (*use_drain)(int (*)(void)) =
+    (void (*)(int (*)(void)))dlsym(RTLD_DEFAULT, "mana_vmm_use_drain");
+  int *pending = (int *)dlsym(RTLD_DEFAULT, "mana_vmm_pending");
+  void (*drain)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "mana_vmm_drain");
+  if (use_drain == NULL || pending == NULL || drain == NULL) {
+    return;
+  }
+  g_vmm_drain = drain;
+  __atomic_store_n(&g_vmm_pending, pending, __ATOMIC_RELEASE);
+  use_drain(mana_fwd_forwarding);
 }
 
 // MANA_CUDA_FORWARD: whether 'buf' is device memory of the application's

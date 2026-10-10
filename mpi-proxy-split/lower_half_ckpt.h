@@ -48,6 +48,14 @@ struct LowerHalfThread {
 extern __thread LowerHalfThread lh_thread ATTR_TLS_INITIAL_EXEC;
 extern bool lower_half_closed;
 
+// With libmana_cuda_vmm.so (mana_launch --cuda): nonzero while synchronous
+// copies or sets that the application issued may still be running.  The MPI
+// accesses device memory only after a call enters the lower half, so each
+// MPI call first waits for them (g_vmm_drain(); see vmm-alloc.c).  NULL
+// without that library.
+extern int *g_vmm_pending;
+extern void (*g_vmm_drain)(void);
+
 void init_lower_half_ckpt();
 void register_lower_half_thread();
 void unregister_lower_half_thread();
@@ -62,6 +70,11 @@ void allow_threads_to_enter_lower_half();
 static inline void
 lower_half_disable_ckpt()
 {
+  // Before entering: a long wait must not hold up a checkpoint.
+  if (__builtin_expect(g_vmm_pending != NULL &&
+                       __atomic_load_n(g_vmm_pending, __ATOMIC_ACQUIRE), 0)) {
+    g_vmm_drain();
+  }
   if (__builtin_expect(!lh_thread.registered, 0)) {
     register_lower_half_thread();
   }

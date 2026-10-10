@@ -837,6 +837,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       initialize_segv_handler();
       seq_num_init();
       init_lower_half_ckpt();
+      mana_vmm_connect();  // uh_wrappers.cpp
       mana_state = RUNNING;
 
       DmtcpMutexInit(&g_upper_half_fsbase_lock, DMTCP_MUTEX_LLL);

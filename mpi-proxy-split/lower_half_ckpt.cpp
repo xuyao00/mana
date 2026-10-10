@@ -29,6 +29,8 @@
 
 __thread LowerHalfThread lh_thread ATTR_TLS_INITIAL_EXEC;
 bool lower_half_closed = false;
+int *g_vmm_pending = NULL;
+void (*g_vmm_drain)(void) = NULL;
 
 // Every thread that has used LOWER_HALF_DISABLE_CKPT().
 static LowerHalfThread *threads = NULL;
