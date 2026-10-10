@@ -1,3 +1,8 @@
+# The plain C compiler, for what must not be linked with MPI (libmpistub.so,
+# libmpistub_audit.so, dlopen_mpi).  Make's default, cc, is the MPI compiler
+# wrapper on Cray systems; with craype-accel-nvidia80, it links even a
+# -nostdlib library with libcuda and the GTL.
+CC = @CC@
 CFLAGS = @CFLAGS@
 CXXFLAGS = @CXXFLAGS@
 FFLAGS = ${CXXFLAGS} @FFLAGS@
