@@ -68,6 +68,25 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int verbose;
 static struct { unsigned long vmm, small, fallback, frees; } stats;
 
+// Whether VMM memory of 'dev' can be made GPUDirect RDMA capable.  A NIC
+// (e.g. Slingshot's, through libfabric's CXI provider) can register VMM
+// memory only if it was created so; cudaMalloc memory always can be.
+static int
+rdma_capable(CUdevice dev)
+{
+  static int known[64];             // 0: not asked yet, 1: no, 2: yes
+  if (dev < 0 || dev >= 64) {
+    return 0;
+  }
+  if (known[dev] == 0) {
+    int v = 0;
+    CUresult rc = cuDeviceGetAttribute(
+      &v, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, dev);
+    known[dev] = rc == CUDA_SUCCESS && v ? 2 : 1;
+  }
+  return known[dev] == 2;
+}
+
 // A VMM allocation of 'size' (a multiple of the granularity) on the current
 // context's device, shareable as a POSIX fd.
 static CUresult
@@ -85,6 +104,7 @@ vmm_create(size_t size, CUdeviceptr *base, CUmemGenericAllocationHandle *h,
   prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
   prop.location.id = dev;
   prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  prop.allocFlags.gpuDirectRDMACapable = rdma_capable(dev);
   if ((rc = cuMemCreate(h, size, &prop, 0)) != CUDA_SUCCESS) {
     return rc;
   }

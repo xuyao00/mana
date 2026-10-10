@@ -22,6 +22,10 @@ static void *dev_alloc(size_t size) {
   prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
   prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE; prop.location.id = 0;
   prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  // A NIC (e.g. Slingshot) can register VMM memory only if made RDMA capable.
+  int rdma = 0;
+  cuDeviceGetAttribute(&rdma, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, 0);
+  prop.allocFlags.gpuDirectRDMACapable = rdma;
   size_t gran; cuMemGetAllocationGranularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED);
   size = (size + gran - 1) / gran * gran;
   CUmemGenericAllocationHandle h; cuMemCreate(&h, size, &prop, 0);
