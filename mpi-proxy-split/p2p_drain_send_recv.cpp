@@ -236,7 +236,7 @@ recvMsgIntoInternalBuffer(MPI_Status status, MPI_Comm comm)
   // avoided by going through NEXT_FUNC(Recv) directly.
   MPI_Comm realComm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-  int retval = NEXT_FUNC(Recv)(buf, count, MPI_BYTE,
+  int retval = NEXT_FUNC(Recv)(buf, count, lh_info->MANA_BYTE,
                                status.MPI_SOURCE, status.MPI_TAG,
                                realComm, MPI_STATUS_IGNORE);
   JASSERT(retval == MPI_SUCCESS);
@@ -300,8 +300,9 @@ completePendingP2pRequests()
         if (call.type == ISEND_REQUEST) {
           g_drain_stats.isends_completed++;
         }
-        update_virt_id((mana_mpi_handle){.request = request},
-                       (mana_mpi_handle){.request = MPI_REQUEST_NULL});
+        update_virt_id(
+          (mana_mpi_handle){.request = request},
+          (mana_mpi_handle){.request = lh_info->MANA_REQUEST_NULL});
       }
       clearPendingRequestFromLog(request);
     } else {
@@ -444,7 +445,7 @@ completePendingIsends()
       MPI_Test_internal(&request, &flag, &status, false);
     }
     update_virt_id((mana_mpi_handle){.request = request},
-                   (mana_mpi_handle){.request = MPI_REQUEST_NULL});
+                   (mana_mpi_handle){.request = lh_info->MANA_REQUEST_NULL});
     clearPendingRequestFromLog(request);
     g_drain_stats.isends_completed++;
   }
@@ -750,8 +751,9 @@ postDummy()
 {
   // The communicator's name, size, this rank's rank in it, and its members'
   // world ranks ('members' NULL: member i is world rank i).  A predefined
-  // communicator is named by its handle, which every rank shares, with
-  // instance -1.
+  // communicator has instance -1, and name 0 (MPI_COMM_WORLD) or 1
+  // (MPI_COMM_SELF), not its handle: with Open MPI, a handle is an address,
+  // which can differ between the programs of an MPMD job.
   MPI_Comm comm = g_pending_recv.comm;
   uint64_t comm_hash;
   int64_t comm_instance;
@@ -767,13 +769,13 @@ postDummy()
     my_rank = desc->rank;
     members = desc->global_ranks;
   } else if (comm == MPI_COMM_WORLD) {
-    comm_hash = (uint64_t)comm;
+    comm_hash = 0;
     comm_instance = -1;
     size = g_world_size;
     my_rank = g_world_rank;
   } else {
     JASSERT(comm == MPI_COMM_SELF)(comm).Text("MPI_Recv on an unknown comm");
-    comm_hash = (uint64_t)comm;
+    comm_hash = 1;
     comm_instance = -1;
     size = 1;
     my_rank = 0;
@@ -852,10 +854,12 @@ sendPostedDummies(bool nonblocking)
 
     // This rank's handle of the blocked rank's communicator: it is a
     // member, since the blocked rank chose it among the members.
-    MPI_Comm virtComm = comm_instance == -1
-                          ? (MPI_Comm)comm_hash
-                          : find_virt_comm(comm_hash,
-                                           (unsigned int)comm_instance);
+    MPI_Comm virtComm;
+    if (comm_instance == -1) {
+      virtComm = comm_hash == 0 ? MPI_COMM_WORLD : MPI_COMM_SELF;
+    } else {
+      virtComm = find_virt_comm(comm_hash, (unsigned int)comm_instance);
+    }
     JASSERT(virtComm != MPI_COMM_NULL)(comm_hash)(comm_instance)
       .Text("The dummy's sender doesn't know the blocked MPI_Recv's comm");
     MPI_Comm realComm =
@@ -865,7 +869,7 @@ sendPostedDummies(bool nonblocking)
     // local_sent_messages (the receiver doesn't count it either).
     void *dummy_buf = calloc(bytes > 0 ? bytes : 1, 1);
     int ret;
-    MPI_Request request = MPI_REQUEST_NULL;
+    MPI_Request request = lh_info->MANA_REQUEST_NULL;
     JUMP_TO_LOWER_HALF(lh_info->fsaddr);
     if (nonblocking) {
       ret = NEXT_FUNC(Isend)(dummy_buf, (int)bytes, lh_info->MANA_BYTE, dest,
@@ -991,7 +995,7 @@ localRankToGlobalRank(int localRank, MPI_Comm localComm)
   MPI_Group worldGroup, localGroup;
   MPI_Comm realComm = get_real_id((mana_mpi_handle){.comm = localComm}).comm;
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-  NEXT_FUNC(Comm_group)(MPI_COMM_WORLD, &worldGroup);
+  NEXT_FUNC(Comm_group)(lh_info->MANA_COMM_WORLD, &worldGroup);
   NEXT_FUNC(Comm_group)(realComm, &localGroup);
   NEXT_FUNC(Group_translate_ranks)(localGroup, 1, &localRank,
                                    worldGroup, &worldRank);
