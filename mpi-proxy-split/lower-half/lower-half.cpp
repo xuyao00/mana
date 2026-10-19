@@ -219,6 +219,14 @@ lazy_lh_mpi_init()
   static int done = 0;
   if (!done) {
     done = 1;
+    // MANA_UCX_MEM_EVENTS=1: the upper half reports CUDA allocations to UCX
+    // (FwdCtl.mem_event); UCX must not try to hook them itself.
+    FwdCtl *fwd_ctl = (FwdCtl *)lh_info->fwd_ctl;
+    void (*set_external)(int) = (void (*)(int))dlsym(RTLD_DEFAULT,
+                                                     "ucm_set_external_event");
+    if (fwd_ctl != NULL && fwd_ctl->ucx_mem_events && set_external != NULL) {
+      set_external((1 << 20) | (1 << 21));  // UCM_EVENT_MEM_TYPE_ALLOC, _FREE
+    }
     init_lh_mpi(NULL, NULL);
   }
 }

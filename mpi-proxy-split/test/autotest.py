@@ -90,6 +90,7 @@ TESTS = [
   Test("abort", 2, kind="run", fails=True, expect="abort: calling MPI_Abort"),
   Test("cuda_aware", 2, cuda=True),
   Test("cuda_ordering", 2, cuda=True),
+  Test("cuda_churn", 2, cuda=True),
   Test("dlopen_mpi", 2, args=[MPI_LIBRARY, "8"], kind="run", restart=True,
        native_args=[MPI_LIBRARY, "1"]),
   # The example that the documentation uses, as its users run it.

@@ -123,10 +123,31 @@ once.
 | `MANA_CUDA_VMM_ALLOC=0` | No VMM allocator, and no CUDA IPC (`UCX_TLS=^cuda_ipc`, `MPICH_GPU_IPC_ENABLED=0`). |
 | `MANA_FWD_VERBOSE=1` | Logs what the shims and the allocator do. |
 | `MANA_FWD_PROFILE=1` | At exit, prints the calls and TSC cycles of each forwarded function (fast trampolines then take the general path). |
+| `MANA_UCX_MEM_EVENTS=1` | Experimental: the VMM allocator reports device allocations to UCX (see below). |
 | `MANA_FWD_VIRTUAL_IPC=0` | Real legacy CUDA IPC: no checkpoint then. |
 
 `--cuda` also sets `FI_HMEM_CUDA_USE_GDRCOPY=0` (GDRCopy cannot pin memory
 that the CUDA checkpoint API restored) and `DMTCP_DISABLE_PRGNAME_PREFIX=1`.
+
+## UCX's memory caches (`MANA_UCX_MEM_EVENTS=1`)
+
+UCX keeps a memory-type cache and a registration cache, which it keeps
+correct with hooks on the CUDA driver's allocation functions (UCM). Under
+`--cuda`, the application allocates with the upper half's driver, which these
+hooks in the lower half cannot see, so UCX turns both caches off: it detects
+and registers each buffer on each message. On the lab GPU this costs 5 to
+7 us per device-buffer message (natively, `UCX_MEM_CUDA_HOOK_MODE=` costs the
+same) and doubles the time of 32 KB host-buffer messages.
+
+With `MANA_UCX_MEM_EVENTS=1`, the lower half declares UCX's CUDA memory
+events external before `MPI_Init` (`ucm_set_external_event`), and the VMM
+allocator reports each `cuMemAlloc`, `cuMemAllocPitch` and `cuMemFree`
+(`FwdCtl.mem_event`), and the allocations made before. A cache miss is
+taken for host memory, so this is safe only if every device buffer that the
+application passes to MPI comes from these functions: not
+`cudaMallocAsync`/memory pools, `cudaMallocManaged`, the application's own
+VMM mappings (`cuMemMap`), or device globals (`cudaGetSymbolAddress`), which
+UCX's own hooks also cover. Without the allocator it is off.
 
 ## Limitations
 

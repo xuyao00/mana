@@ -28,6 +28,7 @@
 
 #define _GNU_SOURCE
 #include <asm/prctl.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -650,6 +651,46 @@ fwd_after_resume_peers(void)
   }
 }
 
+// MANA_UCX_MEM_EVENTS=1 (experimental).  UCX's CUDA hooks cannot see the
+// application's allocations, which the upper half's driver makes: without
+// them, UCX has no memory-type cache and no registration cache, and detects
+// and registers each buffer on each message.  The lower half declares the
+// CUDA events external (lower-half.cpp), and the upper half's allocator
+// reports them here.  The event is UCM's ucm_event_t.mem_type.
+static unsigned long lh_main_fs;    // the lower half's main TLS
+
+static void
+fwd_mem_event(int alloc, void *addr, size_t size)
+{
+  static void (*dispatch)(int, void *);
+  static int looked;
+  unsigned long fs = fwd_getfs();
+  fwd_setfs(lh_main_fs);
+  if (!__atomic_load_n(&looked, __ATOMIC_ACQUIRE)) {
+    *(void **)&dispatch = dlsym(RTLD_DEFAULT, "ucm_event_dispatch");
+    __atomic_store_n(&looked, 1, __ATOMIC_RELEASE);
+  }
+  if (dispatch != NULL) {
+    union {
+      struct {
+        void *address;
+        size_t size;
+        int mem_type;               // ucs_memory_type_t
+        unsigned char sys_dev;      // ucs_sys_device_t
+        unsigned char mem_flags;
+      } m;
+      char pad[128];                // >= sizeof(ucm_event_t)
+    } ev;
+    memset(&ev, 0, sizeof ev);
+    ev.m.address = addr;
+    ev.m.size = size;
+    ev.m.mem_type = 1;              // UCS_MEMORY_TYPE_CUDA
+    ev.m.sys_dev = 0xff;            // UCS_SYS_DEVICE_ID_UNKNOWN: detect
+    dispatch(alloc ? 1 << 20 : 1 << 21, &ev);   // UCM_EVENT_MEM_TYPE_*
+  }
+  fwd_setfs(fs);
+}
+
 static int
 fwd_forwarding(unsigned long sp)
 {
@@ -667,6 +708,11 @@ fwd_runtime_init(void)
   mana_fwd_ctl.before_ckpt = fwd_before_ckpt;
   mana_fwd_ctl.after_resume = fwd_after_resume;
   mana_fwd_ctl.after_resume_peers = fwd_after_resume_peers;
+  const char *ev = getenv("MANA_UCX_MEM_EVENTS");
+  if (ev != NULL && strcmp(ev, "1") == 0) {
+    lh_main_fs = fwd_getfs();       // the lower half loads us on its main thread
+    mana_fwd_ctl.mem_event = fwd_mem_event;
+  }
 }
 
 /*

@@ -55,5 +55,8 @@ bool mana_cuda_is_device_memory(const void *buf);
 
 // Connects libmana_cuda_vmm.so, if it is loaded (see lower_half_ckpt.h).
 void mana_cuda_connect_vmm();
+// At restart, before the new lower half's MPI_Init: forget the old lower
+// half's FwdCtl.mem_event.
+void mana_cuda_restart_vmm();
 
 #endif  // ifndef _MANA_CUDA_H

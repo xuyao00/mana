@@ -1032,6 +1032,7 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
     }
 
     case DMTCP_EVENT_RESTART: {
+      mana_cuda_restart_vmm();  // mana_cuda.cpp
       reset_wrappers();
       initialize_wrappers();
       lh_info->uh_stack_start = uh_stack_start;

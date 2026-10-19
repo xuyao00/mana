@@ -299,6 +299,20 @@ vmm_alloc(CUdeviceptr *dptr, size_t bytesize)
   return CUDA_SUCCESS;
 }
 
+// MANA_UCX_MEM_EVENTS=1 (experimental; see FwdCtl.mem_event): every device
+// allocation and free is reported, outside the lock.  NULL until MANA sets it.
+static void (*mem_event)(int alloc, void *addr, size_t size);
+
+static void
+report_mem(int alloc, CUdeviceptr p, size_t size)
+{
+  void (*ev)(int, void *, size_t) = __atomic_load_n(&mem_event,
+                                                     __ATOMIC_ACQUIRE);
+  if (ev != NULL && size > 0) {
+    ev(alloc, (void *)p, size);
+  }
+}
+
 static CUresult
 wrap_alloc(CUdeviceptr *dptr, size_t bytesize)
 {
@@ -311,6 +325,9 @@ wrap_alloc(CUdeviceptr *dptr, size_t bytesize)
   if (rc != CUDA_SUCCESS) {
     stats.fallback++;
     rc = real_alloc(dptr, bytesize);   // e.g. no VMM support: as before
+  }
+  if (rc == CUDA_SUCCESS) {
+    report_mem(1, *dptr, bytesize);
   }
   return rc;
 }
@@ -355,6 +372,68 @@ is_ours(CUdeviceptr p)
   return 0;
 }
 
+// The size of our allocation or block that starts at 'p', or 0.  With the
+// lock.
+static size_t
+ours_size(CUdeviceptr p)
+{
+  for (int i = 0; i < n_allocs; i++) {
+    if (allocs[i].on && allocs[i].base == p) {
+      return allocs[i].size;
+    }
+  }
+  for (int c = 0; c < n_chunks; c++) {
+    Chunk *ch = &chunks[c];
+    if (!ch->on || p - ch->base >= ch->size) {
+      continue;
+    }
+    for (int b = 0; b < ch->n_blocks; b++) {
+      if (ch->blocks[b].used && ch->base + ch->blocks[b].off == p) {
+        return ch->blocks[b].size;
+      }
+    }
+  }
+  return 0;
+}
+
+// Whether every cuMemAlloc, cuMemAllocPitch and cuMemFree comes here, so
+// that mana_vmm_set_mem_event() reports them all.
+static int can_report;
+
+int
+mana_vmm_can_report(void)
+{
+  return can_report;
+}
+
+// Called by MANA (MANA_UCX_MEM_EVENTS=1) once the lower half's MPI (UCX) is
+// initialized: reports the allocations made so far, then each one.  NULL at
+// restart: 'fn' was in the old lower half.
+void
+mana_vmm_set_mem_event(void (*fn)(int alloc, void *addr, size_t size))
+{
+  if (fn == NULL) {
+    __atomic_store_n(&mem_event, NULL, __ATOMIC_RELEASE);
+    return;
+  }
+  pthread_mutex_lock(&lock);
+  for (int i = 0; i < n_allocs; i++) {
+    if (allocs[i].on) {
+      fn(1, (void *)allocs[i].base, allocs[i].size);
+    }
+  }
+  for (int c = 0; c < n_chunks; c++) {
+    for (int b = 0; chunks[c].on && b < chunks[c].n_blocks; b++) {
+      if (chunks[c].blocks[b].used) {
+        fn(1, (void *)(chunks[c].base + chunks[c].blocks[b].off),
+           chunks[c].blocks[b].size);
+      }
+    }
+  }
+  __atomic_store_n(&mem_event, fn, __ATOMIC_RELEASE);
+  pthread_mutex_unlock(&lock);
+}
+
 static CUresult
 wrap_free(CUdeviceptr dptr)
 {
@@ -365,6 +444,17 @@ wrap_free(CUdeviceptr dptr)
   // so that no kernel or copy still uses memory that a new allocation may
   // get.  Wait as well.
   ctx_sync();
+  if (__atomic_load_n(&mem_event, __ATOMIC_ACQUIRE) != NULL) {
+    CUdeviceptr base = 0;
+    size_t size = 0;
+    pthread_mutex_lock(&lock);
+    size = ours_size(dptr);
+    pthread_mutex_unlock(&lock);
+    if (size == 0 && cuMemGetAddressRange(&base, &size, dptr) != CUDA_SUCCESS) {
+      size = 0;
+    }
+    report_mem(0, dptr, size);
+  }
   pthread_mutex_lock(&lock);
   stats.frees++;
   for (int i = 0; i < n_allocs; i++) {
@@ -722,7 +812,8 @@ vmm_alloc_init(void)
             "no checkpointable CUDA IPC\n");
     return;
   }
-  redirect(lib, "cuMemAllocPitch_v2", (void *)wrap_pitch, (void **)&real_pitch);
+  can_report = redirect(lib, "cuMemAllocPitch_v2", (void *)wrap_pitch,
+                        (void **)&real_pitch);
   // The synchronous copies and sets are ordered only if all of them are
   // redirected.
   int memops_on = 1;

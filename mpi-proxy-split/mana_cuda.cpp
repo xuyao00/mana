@@ -22,6 +22,9 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "mana_cuda.h"
 #include "cuda-forward/fwd-runtime.h"
@@ -66,15 +69,51 @@ uh_dlsym(const char *soname, const char *symbol)
   return handle != NULL ? dlsym(handle, symbol) : NULL;
 }
 
+// MANA_UCX_MEM_EVENTS=1: the allocator's events go to the lower half's UCX
+// (FwdCtl.mem_event), or nowhere ('fn' NULL).
+static void
+set_vmm_mem_event(void (*fn)(int, void *, size_t))
+{
+  typedef void (*event_fn)(int, void *, size_t);
+  void (*set_event)(event_fn) =
+    (void (*)(event_fn))dlsym(RTLD_DEFAULT, "mana_vmm_set_mem_event");
+  if (set_event != NULL) {
+    set_event(fn);
+  }
+}
+
+void
+mana_cuda_restart_vmm()
+{
+  set_vmm_mem_event(NULL);
+}
+
 void
 mana_lower_half_mpi_init()
 {
   initialize_wrappers();
   if (lh_info->lh_mpi_init != NULL) {
+    // MANA_UCX_MEM_EVENTS=1: only if the allocator sees every allocation.
+    FwdCtl *ctl = fwd_ctl();
+    const char *ev = getenv("MANA_UCX_MEM_EVENTS");
+    if (ctl != NULL && ev != NULL && strcmp(ev, "1") == 0) {
+      int (*can_report)(void) =
+        (int (*)(void))dlsym(RTLD_DEFAULT, "mana_vmm_can_report");
+      ctl->ucx_mem_events = ctl->mem_event != NULL && can_report != NULL &&
+                            can_report();
+      if (!ctl->ucx_mem_events) {
+        fprintf(stderr, "MANA: MANA_UCX_MEM_EVENTS=1 needs the VMM allocator; "
+                "UCX keeps its CUDA hooks\n");
+      }
+    }
     mana_cuda_note_thread(dmtcp_get_real_tid(), getFS());
     JUMP_TO_LOWER_HALF(lh_info->fsaddr);
     ((void (*)(void))lh_info->lh_mpi_init)();
     RETURN_TO_UPPER_HALF();
+    // MANA_UCX_MEM_EVENTS=1: UCX now listens for CUDA allocations.
+    if (ctl != NULL && ctl->ucx_mem_events) {
+      set_vmm_mem_event(ctl->mem_event);
+    }
   }
 }
 

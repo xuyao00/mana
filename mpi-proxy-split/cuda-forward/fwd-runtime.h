@@ -57,6 +57,16 @@ typedef struct {
   void (*before_ckpt)(void);
   void (*after_resume)(void);
   void (*after_resume_peers)(void);
+  // Set by the lower half if MANA_UCX_MEM_EVENTS=1 (experimental): reports a
+  // device allocation (alloc 1) or free (alloc 0) of [addr, addr + size) to
+  // UCX's memory hooks (UCM), as UCX's own CUDA hooks would.  The upper half
+  // calls it with its own FS; it runs UCM with the lower half's.
+  void (*mem_event)(int alloc, void *addr, size_t size);
+  // Set by the upper half before the lower half's MPI_Init, if mem_event is
+  // set and every device allocation can be reported: the lower half then
+  // declares UCX's CUDA memory events external.  A device buffer that UCX
+  // was not told about would pass for host memory.
+  int ucx_mem_events;
 } FwdCtl;
 
 #ifdef __cplusplus
