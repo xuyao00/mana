@@ -36,7 +36,11 @@ thread's upper-half TLS and jumps to the same function of the upper half's
 library (`fwd-runtime.c`). So the MPI runs on the application's driver, in
 the application's contexts, as natively. MANA registers each upper-half
 thread with its stack, and a forwarded call finds its thread by its stack
-pointer, without a system call.
+pointer, without a system call. A function whose arguments and result are
+all in registers (the generator classifies them by their types in `cuda.h`)
+gets a fast trampoline, which calls the target with its own `call`
+instruction and saves no vector registers: 10 ns per forwarded call instead
+of 23 ns. UCX makes about 100 such calls per message besides its polling.
 
 Some functions are written by hand (`cuda-special.c`, `cudart-special.c`,
 `nvml-special.c`):
@@ -118,6 +122,7 @@ once.
 | `MANA_CUDA=1` | Same as `--cuda`. |
 | `MANA_CUDA_VMM_ALLOC=0` | No VMM allocator, and no CUDA IPC (`UCX_TLS=^cuda_ipc`, `MPICH_GPU_IPC_ENABLED=0`). |
 | `MANA_FWD_VERBOSE=1` | Logs what the shims and the allocator do. |
+| `MANA_FWD_PROFILE=1` | At exit, prints the calls and TSC cycles of each forwarded function (fast trampolines then take the general path). |
 | `MANA_FWD_VIRTUAL_IPC=0` | Real legacy CUDA IPC: no checkpoint then. |
 
 `--cuda` also sets `FI_HMEM_CUDA_USE_GDRCOPY=0` (GDRCopy cannot pin memory

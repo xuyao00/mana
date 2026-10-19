@@ -231,7 +231,13 @@ fwd_forget_thread(int tid)
   unlock_threads();
 }
 
-static inline FwdThread *
+// The fast trampolines (fwd-tramp.inc) use these offsets.
+_Static_assert(offsetof(FwdThread, uhfs) == 8, "FwdThread.uhfs");
+_Static_assert(offsetof(FwdThread, depth) == 32, "FwdThread.depth");
+
+// No vector registers: mana_fwd_fast_enter() uses it, and must keep the
+// caller's arguments in the vector registers.
+__attribute__((target("general-regs-only"))) static inline FwdThread *
 thread_by_stack(unsigned long sp)
 {
   int n = __atomic_load_n(&n_by_stack, __ATOMIC_ACQUIRE);
@@ -304,6 +310,95 @@ resolve(FwdLib *lib, int idx, unsigned long uhfs, unsigned long lhfs)
 // Forwarded calls, for MANA_FWD_VERBOSE (not exact: not atomic).
 static unsigned long n_calls;
 
+// MANA_FWD_PROFILE=1: calls and TSC cycles in each forwarded function (not
+// exact either), printed at exit, most called first.
+#define MAX_PROF_LIBS 8
+typedef struct {
+  int calls;                  // first: FwdRecord.prof points here
+  unsigned long cycles;
+} FwdProf;
+// -1: MANA_FWD_PROFILE not looked up yet.
+int mana_fwd_profiling = -1;
+static FwdLib *prof_libs[MAX_PROF_LIBS];
+static FwdProf *prof_tabs[MAX_PROF_LIBS];
+static FwdProf *prof_entry(FwdLib *lib, int idx);
+
+// The hand-written wrappers' upper-half calls (FWD_CALL_UPPER), by the name
+// of the wrapper: one more "library".
+#define MAX_PROF_SPECIAL 64
+static const char *special_names[MAX_PROF_SPECIAL];
+static FwdLib special_lib = { "(hand-written)", special_names, NULL,
+                              MAX_PROF_SPECIAL, NULL, 0 };
+
+void
+mana_fwd_prof_special(const char *func, unsigned long t0)
+{
+  int i;
+  for (i = 0; i < MAX_PROF_SPECIAL && special_names[i] != NULL &&
+              special_names[i] != func; i++) {
+  }
+  if (i == MAX_PROF_SPECIAL) {
+    return;
+  }
+  special_names[i] = func;
+  FwdProf *p = prof_entry(&special_lib, i);
+  if (p != NULL) {
+    p->calls++;
+    p->cycles += __builtin_ia32_rdtsc() - t0;
+  }
+}
+
+static FwdProf *
+prof_entry(FwdLib *lib, int idx)
+{
+  for (int i = 0; i < MAX_PROF_LIBS; i++) {
+    if (prof_libs[i] == lib) {
+      return &prof_tabs[i][idx];
+    }
+    if (prof_libs[i] == NULL) {
+      prof_tabs[i] = calloc(lib->n, sizeof(FwdProf));
+      if (prof_tabs[i] == NULL) {
+        return NULL;
+      }
+      prof_libs[i] = lib;
+      return &prof_tabs[i][idx];
+    }
+  }
+  return NULL;
+}
+
+static void
+prof_report(void)
+{
+  char buf[256];
+  for (;;) {
+    FwdProf *best = NULL;
+    const char *name = NULL;
+    for (int i = 0; i < MAX_PROF_LIBS && prof_libs[i] != NULL; i++) {
+      for (int j = 0; j < prof_libs[i]->n; j++) {
+        FwdProf *p = &prof_tabs[i][j];
+        if (prof_libs[i]->names[j] == NULL) {
+          continue;
+        }
+        if (p->calls > 0 && (best == NULL || p->calls > best->calls)) {
+          best = p;
+          name = prof_libs[i]->names[j];
+        }
+      }
+    }
+    if (best == NULL) {
+      return;
+    }
+    int n = snprintf(buf, sizeof buf, "[mana-fwd %d] profile %10d calls "
+                     "%14lu cycles %s\n", fwd_gettid(), best->calls,
+                     best->cycles, name);
+    if (write(2, buf, n) < 0) {
+      return;
+    }
+    best->calls = 0;
+  }
+}
+
 __attribute__((destructor)) static void
 fwd_report(void)
 {
@@ -314,6 +409,9 @@ fwd_report(void)
     if (write(2, buf, n) < 0) {
       return;
     }
+  }
+  if (mana_fwd_profiling > 0) {
+    prof_report();
   }
 }
 
@@ -333,6 +431,17 @@ mana_fwd_enter(FwdLib *lib, long idx, void **retslot)
   FwdRecord *r = &t->recs[t->depth++];
   r->ret = *retslot;
   r->lhfs = lhfs;
+  r->prof = NULL;
+  if (mana_fwd_profiling != 0) {
+    if (mana_fwd_profiling < 0) {
+      const char *v = getenv("MANA_FWD_PROFILE");
+      mana_fwd_profiling = v != NULL && v[0] != '\0' && v[0] != '0';
+    }
+    if (mana_fwd_profiling > 0) {
+      r->prof = &prof_entry(lib, (int)idx)->calls;
+      r->t0 = __builtin_ia32_rdtsc();
+    }
+  }
   void *target = resolve(lib, (int)idx, t->uhfs, lhfs);
   if (target == NULL || t->uhfs == 0) {
     if (t->uhfs == 0) {
@@ -348,11 +457,48 @@ mana_fwd_enter(FwdLib *lib, long idx, void **retslot)
   return r;
 }
 
+// Called by the fast trampolines (FWD_FAST_SLOT, lower-half FS) for slot
+// 'idx' of 'lib'.  The fast path is taken only in the common case: the target
+// is resolved, the thread is known by its stack and has an upper half, and
+// wrfsbase works.  Then this counts the call in the thread's depth (the
+// trampoline counts it out), and returns the target and the thread;
+// otherwise it returns no target, and the trampoline takes the general path.
+// It must not touch the vector registers, which may hold arguments.
+typedef struct {
+  void *target;
+  FwdThread *thread;
+} FwdFast;
+
+__attribute__((target("general-regs-only"))) FwdFast
+mana_fwd_fast_enter(FwdLib *lib, long idx, void **retslot)
+{
+  FwdFast f = { NULL, NULL };
+  // mana_fwd_profiling < 0: not looked up yet; the general path does that.
+  if (!mana_fwd_fsgsbase || mana_fwd_profiling != 0) {
+    return f;
+  }
+  void *target = lib->targets[idx];
+  FwdThread *t = thread_by_stack((unsigned long)retslot);
+  if (target == NULL || t == NULL || t->uhfs == 0 || t->depth >= MAX_DEPTH) {
+    return f;
+  }
+  t->depth++;
+  n_calls++;
+  f.target = target;
+  f.thread = t;
+  return f;
+}
+
 // Called by the trampolines when the forwarded call returned.
 void
 mana_fwd_exit(FwdRecord *r)
 {
   FwdThread *t = &threads[((char *)r - (char *)threads) / sizeof(FwdThread)];
+  if (r->prof != NULL) {
+    FwdProf *p = (FwdProf *)r->prof;
+    p->calls++;
+    p->cycles += __builtin_ia32_rdtsc() - r->t0;
+  }
   if (t->depth > 0 && &t->recs[t->depth - 1] == r) {
     t->depth--;
   }

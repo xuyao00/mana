@@ -14,6 +14,20 @@
  * FS back, pops the record (mana_fwd_exit), restores r12 and returns to the
  * caller with the target's rax/rdx/xmm0.
  * FwdRecord: target 0, uhfs 8, lhfs 16, ret 24, saved_r12 32.
+ *
+ *   FWD_FAST desc, pre, post   -- defines 'pre' and 'post' for library 'desc'
+ *   FWD_FAST_SLOT name, idx, pre, post, common
+ *                              -- a function 'name' whose arguments and result
+ *                                 are all in registers (gen-forward-shim.py)
+ *
+ * A fast slot calls its target itself, with its own call instruction, so the
+ * target's return and the slot's indirect call are predicted, and it keeps
+ * its state in callee-saved registers, which it saves on the stack: rbx = the
+ * lower half's FS, r12 = the FwdThread (uhfs 8, depth 32).  'pre' calls
+ * mana_fwd_fast_enter(desc, idx, &return_address), which saves no vector
+ * registers, switches FS with wrfsbase and returns the target in r11.  If
+ * that is 0 (not resolved yet, an unknown thread, no wrfsbase, profiling),
+ * the slot undoes its frame and takes the general path, 'common'.
  */
 
 .macro FWD_SETFS field
@@ -118,6 +132,76 @@
   .type \name, @function
   .p2align 4
 \name:
+  movl $\idx, %r11d
+  jmp \common
+  .size \name, .-\name
+.endm
+
+.macro FWD_FAST desc, pre, post
+  .text
+  .p2align 4
+  .type \pre, @function
+\pre:
+  /* rsp + 32 holds the caller's return address (see FWD_FAST_SLOT). */
+  pushq %rdi
+  pushq %rsi
+  pushq %rdx
+  pushq %rcx
+  pushq %r8
+  pushq %r9
+  pushq %rax
+  leaq \desc(%rip), %rdi
+  movl %r11d, %esi
+  leaq 88(%rsp), %rdx
+  call mana_fwd_fast_enter@PLT
+  movq %rax, %r11
+  movq %rdx, %r12
+  popq %rax
+  popq %r9
+  popq %r8
+  popq %rcx
+  popq %rdx
+  popq %rsi
+  popq %rdi
+  testq %r11, %r11
+  jz 1f
+  rdfsbase %rbx
+  movq 8(%r12), %r10
+  wrfsbase %r10
+1:
+  ret
+  .size \pre, .-\pre
+
+  .p2align 4
+  .type \post, @function
+\post:
+  wrfsbase %rbx
+  decl 32(%r12)
+  addq $8, %rsp
+  popq %r12
+  popq %rbx
+  ret
+  .size \post, .-\post
+.endm
+
+.macro FWD_FAST_SLOT name, idx, pre, post, common
+  .globl \name
+  .type \name, @function
+  .p2align 4
+\name:
+  pushq %rbx
+  pushq %r12
+  subq $8, %rsp
+  movl $\idx, %r11d
+  call \pre
+  testq %r11, %r11
+  jz 1f
+  call *%r11
+  jmp \post
+1:
+  addq $8, %rsp
+  popq %r12
+  popq %rbx
   movl $\idx, %r11d
   jmp \common
   .size \name, .-\name

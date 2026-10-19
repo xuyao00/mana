@@ -22,6 +22,7 @@ CUDART_SONAME := $(shell readelf -d $(REAL_LIBCUDART) 2>/dev/null | \
                    sed -n 's/.*(SONAME).*\[\(.*\)\]/\1/p')
 
 CC = gcc
+CXX = g++
 # The shims switch the FS register: no stack protector, as in all of MANA.
 CFLAGS = -g -O2 -fPIC -fno-stack-protector -Wall -I. -I$(CUDA_HOME)/include
 OUT = lh-shims
@@ -48,7 +49,8 @@ $(OUT)/libmana_fwd.so: fwd-runtime.c fwd-dyn.S fwd-tramp.inc fwd-runtime.h | $(O
 # gen-forward-shim.py writes PREFIX-tramp.S, PREFIX-desc.c and PREFIX.map;
 # the last arguments are the functions written by hand (*-special.c).
 gen/cuda.stamp: gen-forward-shim.py $(REAL_LIBCUDA) | gen
-	./gen-forward-shim.py $(REAL_LIBCUDA) libcuda.so.1 cuda gen \
+	./gen-forward-shim.py --header=cuda.h --cxx="$(CXX) -I$(CUDA_HOME)/include" \
+	  $(REAL_LIBCUDA) libcuda.so.1 cuda gen \
 	  cuGetProcAddress cuGetProcAddress_v2 cuGetExportTable \
 	  cuMemHostRegister cuMemHostRegister_v2 cuMemHostUnregister \
 	  cuMemRetainAllocationHandle cuIpcGetMemHandle cuIpcOpenMemHandle \
