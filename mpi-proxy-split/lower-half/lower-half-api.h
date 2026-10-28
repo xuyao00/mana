@@ -199,6 +199,21 @@ typedef struct _LowerHalfInfo
   // handle of the lower half (MANA_*_KIND), from MPI_Comm_c2f() and others.
   // With MPICH, those are macros, which the upper half cannot look up.
   void *handle_c2f;
+  // --cuda (MANA_CUDA=1): the application's CUDA runs in the lower half
+  // (cuda/DESIGN-lower-half-cuda.md).  Set up by init_lower_half_cuda(),
+  // after MPI_Init and before the upper half exists, at launch and restart.
+  int cuda_enabled;
+  // Every device address that the application sees is in this VMM range.
+  unsigned long long cuda_vmm_base;
+  unsigned long long cuda_vmm_size;
+  // void *(*)(const char *library, const char *symbol): dlopen() and dlsym()
+  // in the lower half; a NULL library means the global scope.
+  void *cuda_dlsym;
+  // void *(*)(void): the FS of a new parked lower-half thread, which lends
+  // its TLS to one upper-half thread.  Call it with FS set to
+  // cuda_tls_factory_fs, one caller at a time.
+  void *cuda_new_tls;
+  void *cuda_tls_factory_fs;
 } LowerHalfInfo_t;
 
 extern LowerHalfInfo_t *lh_info;

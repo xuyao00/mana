@@ -153,27 +153,116 @@ lh_thread_for_extra_tls(void *arg)
   return NULL;
 }
 
-static void
-create_lh_thread_for_extra_tls()
+// Returns the FS of a new parked thread (lh_thread_for_extra_tls()), or NULL.
+static void *
+create_parked_lh_thread(size_t stack_size)
 {
-  static unsigned long fs = 0;
+  unsigned long fs = 0;
   sigset_t all, old;
   pthread_t thread;
   pthread_attr_t attr;
   sigfillset(&all);
   pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 64 * 1024);
+  pthread_attr_setstacksize(&attr, stack_size);
   pthread_sigmask(SIG_SETMASK, &all, &old);
   int rc = pthread_create(&thread, &attr, lh_thread_for_extra_tls, &fs);
   pthread_sigmask(SIG_SETMASK, &old, NULL);
   pthread_attr_destroy(&attr);
   if (rc != 0) {
-    return;
+    return NULL;
   }
   while (__atomic_load_n(&fs, __ATOMIC_ACQUIRE) == 0) {
     sched_yield();
   }
-  lh_info->ckpt_fsaddr = (void *)fs;
+  return (void *)fs;
+}
+
+static void
+create_lh_thread_for_extra_tls()
+{
+  lh_info->ckpt_fsaddr = create_parked_lh_thread(64 * 1024);
+}
+
+// --cuda: a TLS for one more upper-half thread that calls CUDA (see
+// lh_info->cuda_new_tls).  The stack holds glibc's TLS of the lower half's
+// libraries, CUDA's among them.
+static void *
+lh_cuda_new_tls()
+{
+  return create_parked_lh_thread(256 * 1024);
+}
+
+static void *
+lh_cuda_dlsym(const char *library, const char *symbol)
+{
+  void *handle = RTLD_DEFAULT;
+  if (library != NULL) {
+    handle = dlopen(library, RTLD_NOW | RTLD_GLOBAL);
+    if (handle == NULL) {
+      return NULL;
+    }
+  }
+  return dlsym(handle, symbol);
+}
+
+#define MANA_CUDA_VMM_BASE 0x200000000000ULL
+#define MANA_CUDA_VMM_SIZE (1ULL << 40)
+
+static unsigned long long
+env_ull(const char *name, unsigned long long dflt)
+{
+  const char *value = getenv(name);
+  return (value != NULL && value[0] != '\0') ? strtoull(value, NULL, 0) : dflt;
+}
+
+// --cuda: reserves the VMM range that holds all of the application's device
+// memory, before the upper half exists, so that nothing else can be there.
+// This runs after MPI_Init, at launch and at restart alike: a CUDA-aware MPI
+// has initialized CUDA, and the driver's early mappings come back at the
+// same addresses.  No context is needed (cuda/experiments/lh-probes).
+static void
+init_lower_half_cuda()
+{
+  const char *cuda = getenv("MANA_CUDA");
+  if (cuda == NULL || cuda[0] == '\0' || strcmp(cuda, "0") == 0) {
+    return;
+  }
+  typedef int (*cuInit_t)(unsigned int);
+  typedef int (*cuMemAddressReserve_t)(unsigned long long *, size_t, size_t,
+                                       unsigned long long, unsigned long long);
+  cuInit_t cuInit_fn = (cuInit_t)lh_cuda_dlsym("libcuda.so.1", "cuInit");
+  cuMemAddressReserve_t reserve_fn = (cuMemAddressReserve_t)
+    lh_cuda_dlsym("libcuda.so.1", "cuMemAddressReserve");
+  if (cuInit_fn == NULL || reserve_fn == NULL) {
+    fprintf(stderr, "MANA: --cuda: cannot load libcuda.so.1: %s\n", dlerror());
+    exit(1);
+  }
+  int rc = cuInit_fn(0);
+  if (rc != 0) {
+    fprintf(stderr, "MANA: --cuda: cuInit failed (%d)\n", rc);
+    exit(1);
+  }
+  unsigned long long base = env_ull("MANA_CUDA_VMM_BASE", MANA_CUDA_VMM_BASE);
+  unsigned long long size = env_ull("MANA_CUDA_VMM_SIZE", MANA_CUDA_VMM_SIZE);
+  unsigned long long va = 0;
+  rc = reserve_fn(&va, size, 0, base, 0);
+  // The driver takes the address as a hint only (crac-old's vmm_assumptions).
+  if (rc != 0 || va != base) {
+    fprintf(stderr, "MANA: --cuda: cannot reserve the device range at %#llx "
+            "(%#llx bytes): result %d, address %#llx.  Set MANA_CUDA_VMM_BASE "
+            "to a free range.\n", base, size, rc, va);
+    exit(1);
+  }
+  lh_info->cuda_vmm_base = base;
+  lh_info->cuda_vmm_size = size;
+  lh_info->cuda_dlsym = (void *)&lh_cuda_dlsym;
+  lh_info->cuda_new_tls = (void *)&lh_cuda_new_tls;
+  lh_info->cuda_tls_factory_fs = create_parked_lh_thread(256 * 1024);
+  if (lh_info->cuda_tls_factory_fs == NULL) {
+    fprintf(stderr, "MANA: --cuda: cannot create a lower-half thread\n");
+    exit(1);
+  }
+  lh_info->cuda_enabled = 1;
 }
 
 int main(int argc, char *argv[], char *envp[]) {
@@ -216,6 +305,7 @@ int main(int argc, char *argv[], char *envp[]) {
   
   // Initialize MPI Functions and Constants mapping table in lower-half
   initialize_lh_info();
+  init_lower_half_cuda();
 
   // Check arguments and setup arguments for the loader program (cmd)
   // if has "--restore", pass all arguments to mtcp_restart
@@ -1256,6 +1346,23 @@ void update_library_path(const char *argv0)
     fprintf(stderr, "MANA: cannot read %s: %s\n", audit.c_str(),
             strerror(errno));
     exit(1);
+  }
+  // --cuda: the upper half loads MANA's CUDA front libraries in place of
+  // libcudart and libcuda (cuda-front/cuda_audit.c).
+  if (lh_info->cuda_enabled) {
+    string front = string(lib1) + "/cuda-front";
+    string cuda_audit = string(lib1) + "/libmana_cuda_audit.so";
+    if (access((front + "/libcuda.so.1").c_str(), R_OK) != 0 ||
+        access(cuda_audit.c_str(), R_OK) != 0) {
+      fprintf(stderr, "MANA: --cuda: no CUDA front in %s; was MANA built "
+              "with CUDA?\n", front.c_str());
+      exit(1);
+    }
+    if (prepend_to_library_path(front.c_str()) != 0) {
+      perror("MANA: prepending the CUDA front to LD_LIBRARY_PATH failed");
+      exit(1);
+    }
+    audit = audit + ":" + cuda_audit;
   }
   const char *old_audit = getenv("LD_AUDIT");
   if (old_audit != NULL && old_audit[0] != '\0') {
