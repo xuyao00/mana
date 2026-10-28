@@ -53,6 +53,7 @@ struct FrontLib {
   void **real;           // the lower half's, of generation bound_gen
   int n;
   unsigned bound_gen;
+  const char *file;      // what the lower half loads: soname, or a path
 };
 
 extern FrontLib front_cudart_lib FRONT_HIDDEN;
@@ -143,6 +144,7 @@ void front_open_slot() FRONT_HIDDEN;
 #define FRONT_LEAVE() LOWER_HALF_ENABLE_CKPT()
 
 [[noreturn]] void front_unsupported(const char *name) FRONT_HIDDEN;
+[[noreturn]] void front_missing(const FrontLib *lib, int index) FRONT_HIDDEN;
 [[noreturn]] void front_fatal(const char *fmt, ...) FRONT_HIDDEN
   __attribute__((format(printf, 1, 2)));
 void front_log(const char *fmt, ...) FRONT_HIDDEN
@@ -171,6 +173,9 @@ enum FrontKind {
   FRONT_ARRAY,           // a CUDA array, or a level of a mipmapped one
   FRONT_MIPMAP,          // a mipmapped array
   FRONT_TEXOBJ,          // a texture or surface object (not a handle)
+  FRONT_BLAS,            // a cuBLAS handle
+  FRONT_BLASLT,          // a cuBLASLt handle
+  FRONT_FFT,             // a cuFFT plan (not a handle: plans are ints)
   FRONT_N_KINDS
 };
 
@@ -254,10 +259,13 @@ void front_ipc_publish() FRONT_HIDDEN;
 void front_ipc_reimport() FRONT_HIDDEN;
 
 // cudart made its context of 'device' (front_objs.cpp): a restart makes it
-// again at the same point among the other creations.  The driver places
-// module data by what it allocated before, so this order gives the same
-// addresses.
+// again at the same point among the other creations, and loads the
+// application's modules there.  The driver places module data by what it
+// allocated before, so this order gives the same addresses.
 void front_note_cudart(int device) FRONT_HIDDEN;
+// A library (cuBLAS, cuFFT) is about to make a handle or plan on the current
+// device: cudart starts there first, with the application's modules.
+void front_before_library() FRONT_HIDDEN;
 
 // Records of objects (front_objs.cpp).
 void front_objs_stash() FRONT_HIDDEN;

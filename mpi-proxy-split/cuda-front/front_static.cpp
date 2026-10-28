@@ -45,7 +45,7 @@
 #include <map>
 #include <string>
 #include <vector>
-#include "front.h"
+#include "front_objs.h"
 
 extern "C" void *const front_cudart_dispatch[];
 
@@ -92,24 +92,7 @@ exe_path(std::string *path, ElfW(Addr) *base)
   memset(&exe, 0, sizeof exe);
   dl_iterate_phdr(find_exe, &exe);
   *base = exe.dlpi_addr;
-  uintptr_t at = (uintptr_t)exe.dlpi_phdr;
-  FILE *maps = fopen("/proc/self/maps", "r");
-  if (maps == NULL || at == 0) {
-    return false;
-  }
-  char line[4096];
-  bool found = false;
-  while (!found && fgets(line, sizeof line, maps) != NULL) {
-    unsigned long start, end;
-    char file[4096] = "";
-    if (sscanf(line, "%lx-%lx %*s %*s %*s %*s %4095s", &start, &end, file) >=
-          2 && at >= start && at < end && file[0] == '/') {
-      *path = file;
-      found = true;
-    }
-  }
-  fclose(maps);
-  return found;
+  return exe.dlpi_phdr != NULL && front_mapped_file(exe.dlpi_phdr, path);
 }
 
 bool

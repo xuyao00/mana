@@ -1,0 +1,6 @@
+# cuBLAS's synchronous copies to the device: the next MPI call waits for
+# them, as for cudaMemcpy (front_memops.cpp).  See gen-cuda-front.py.
+cublasSetVector
+cublasSetVector_64
+cublasSetMatrix
+cublasSetMatrix_64

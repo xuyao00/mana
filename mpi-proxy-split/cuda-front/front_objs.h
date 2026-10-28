@@ -75,6 +75,9 @@ extern std::mutex objs_lock FRONT_HIDDEN;
 extern FrontObj *obj_heads[FRONT_N_KINDS] FRONT_HIDDEN;
 extern std::map<void *, Pinned> pinned FRONT_HIDDEN;
 
+// The file mapped at 'addr' (/proc/self/maps).
+bool front_mapped_file(const void *addr, std::string *path) FRONT_HIDDEN;
+
 void obj_link(FrontObj *obj, FrontKind kind) FRONT_HIDDEN;
 void obj_unlink(FrontObj *obj) FRONT_HIDDEN;
 
@@ -136,6 +139,25 @@ void front_arrays_drop_shadows() FRONT_HIDDEN;
 void front_arrays_restore(FrontObj *obj) FRONT_HIDDEN;  // in the replay
 void front_arrays_fill() FRONT_HIDDEN;
 void front_arrays_forget(Ctx *ctx) FRONT_HIDDEN;  // with objs_lock held
+
+// The context of an object that the calling thread has just made, for its
+// record; the checkpoint waits for the device's work.
+Ctx *front_object_ctx() FRONT_HIDDEN;
+// Whether 'stream' is a live stream of the front, or a special one.
+bool front_stream_live(cudaStream_t stream) FRONT_HIDDEN;
+
+// A library's records (front_blas.cpp, front_fft.cpp), of one kind.  At
+// restart, 'restore' makes one again at its place in the replay; 'settle'
+// then sets what names other records (streams), once all exist.  'forget'
+// (with objs_lock held) is for a destroyed context's.
+struct FrontLibRecords {
+  void (*restore)(FrontObj *obj);
+  void (*settle)();
+  void (*forget)(Ctx *ctx);
+};
+void front_lib_records(FrontKind kind, const FrontLibRecords *records)
+  FRONT_HIDDEN;
+void front_libs_forget(Ctx *ctx) FRONT_HIDDEN;  // with objs_lock held
 
 // Event times (front_async.cpp).
 void front_events_quiesce() FRONT_HIDDEN;

@@ -1,0 +1,7 @@
+# cuBLAS functions that the header declares but the front refuses.  The
+# logger is global state of the lower half's library, and its callback would
+# run there.  (The legacy API of cublas.h, and cublasXt, are not declared in
+# cublas_v2.h: refused too.)
+cublasLoggerConfigure
+cublasSetLoggerCallback
+cublasGetLoggerCallback

@@ -4,6 +4,7 @@
   gen-cuda-front.py --real=LIB --prefix=P --out-dir=DIR [--header=H]
                     [--cxx=CXX --cflags=FLAGS] [--own=FILE]
                     [--pass=FILE] [--unsupported=FILE] [--memops=FILE]
+                    [--include=FILE]
 
 Under --cuda, the application's CUDA libraries run in the lower half
 (cuda/DESIGN-lower-half-cuda.md).  The upper half loads a front library in
@@ -11,7 +12,9 @@ their place, with the same exported functions and symbol versions.  Each
 exported function jumps through the dispatch table front_P_dispatch, which
 libmana_cuda.so holds, to one of:
 
-  own          written by hand (listed in --own), in libmana_cuda.so;
+  own          written by hand (listed in --own), in libmana_cuda.so; a name
+               there that ends in '?' is own if the library exports it
+               (newer functions; the front tests FRONT_IDX_P_name);
   auto         declared in header H (and, with --pass, listed there):
                FrontAuto<decltype(f)> (front_auto.h), which takes the
                checkpoint gate, translates virtual handles, and calls the
@@ -19,6 +22,9 @@ libmana_cuda.so holds, to one of:
                handles or callbacks aborts, by its types;
   unsupported  listed in --unsupported, or not declared in H, or not in
                --pass: aborts with the function's name.
+
+A library's own handle types are translated by --include FILE, a header of
+the front that the dispatch table includes after H (front_blas.h).
 
 A _ptds/_ptsz variant whose base function is auto uses the base's type.
 An auto function whose base is listed in --memops is a synchronous copy or
@@ -54,6 +60,8 @@ def read_list(path):
 
 
 own = read_list(opts.get("own"))
+optional = {name[:-1] for name in own if name.endswith("?")}
+own = {name for name in own if not name.endswith("?")} | optional
 unsupported = read_list(opts.get("unsupported"))
 passed = read_list(opts.get("pass")) if opts.get("pass") else None
 memops = read_list(opts.get("memops"))
@@ -79,9 +87,15 @@ for line in syms.splitlines():
   if name not in funcs:
     funcs.append(name)
 
+# The soname, by which the lower half loads it.
+dyn = subprocess.run(["readelf", "-d", real], stdout=subprocess.PIPE,
+                     universal_newlines=True, check=True).stdout
+soname = re.search(r"\(SONAME\).*\[(.*)\]", dyn)
+soname = soname.group(1) if soname else os.path.basename(real)
+
 # The functions that header H declares (after preprocessing, so that
 # cuda.h's '#define cuMemAlloc cuMemAlloc_v2' gives the _v2 name).
-declared = set()
+declared, overloaded = set(), set()
 if opts.get("header"):
   cxx = opts.get("cxx", "g++")
   src = "#include <%s>\n" % opts["header"]
@@ -90,13 +104,46 @@ if opts.get("header"):
                        input=src, stdout=subprocess.PIPE,
                        universal_newlines=True, check=True).stdout
   declared = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", pre))
+  # Names that C++ overloads with inline functions (cublasGemmEx, ...):
+  # decltype() cannot name the library's, so their types come from the
+  # header read as C.
+  bodies = set(re.findall(r"\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{", pre))
+  overloaded = bodies & set(funcs)
+  if overloaded:
+    c_pre = subprocess.run([opts.get("cc", "gcc"), "-E", "-P", "-x", "c", "-"] +
+                           opts.get("cflags", "").split(),
+                           input=src, stdout=subprocess.PIPE,
+                           universal_newlines=True, check=True).stdout
+    c_pre = re.sub(r"\s+", " ", c_pre)
+
+def strip_attributes(text):
+  while True:
+    m = re.search(r"__attribute__\s*\(", text)
+    if not m:
+      return text
+    depth, i = 0, m.end() - 1
+    while i < len(text):
+      depth += {"(": 1, ")": -1}.get(text[i], 0)
+      i += 1
+      if depth == 0:
+        break
+    text = text[:m.start()] + text[i:]
+
+# The C declaration of an overloaded function: (RET, PARAMS).
+def c_type(name):
+  m = re.search(r"([^;{}]*?)\b%s\s*\(([^;{}]*)\)\s*;" % name, c_pre)
+  if not m:
+    sys.exit("%s: no C declaration of %s" % (sys.argv[0], name))
+  ret = strip_attributes(m.group(1))
+  ret = re.sub(r"\bextern\b|\"C\"", "", ret).strip()
+  return ret, strip_attributes(m.group(2)).strip()
 
 def may_forward(name):
   return (name in declared and name not in unsupported and
           (passed is None or name in passed))
 
 
-missing = own - set(funcs)
+missing = own - optional - set(funcs)
 if missing:
   sys.exit("%s: --own names that %s does not export: %s"
            % (sys.argv[0], real, " ".join(sorted(missing))))
@@ -134,23 +181,34 @@ with open(os.path.join(out_dir, prefix + "-gen.cpp"), "w") as f:
   f.write('#include "front_auto.h"\n')
   if opts.get("header"):
     f.write("#include <%s>\n" % opts["header"])
+  if opts.get("include"):
+    f.write('#include "%s"\n' % opts["include"])
+  for name in sorted(overloaded):
+    ret, params = c_type(name)
+    f.write("typedef %s front_type_%s(%s);\n" % (ret, name, params))
   f.write("\nstatic const char *const names[] = {\n")
   for name, _, _ in entries:
     f.write('  "%s",\n' % name)
   f.write("};\n")
   f.write("static void *real[%d];\n" % max(len(entries), 1))
-  f.write('FrontLib front_%s_lib = { "%s", names, real, %d, 0 };\n'
-          % (prefix, os.path.basename(real), len(entries)))
+  f.write('FrontLib front_%s_lib = { "%s", names, real, %d, 0, NULL };\n'
+          % (prefix, soname, len(entries)))
   f.write("\nextern \"C\" void *const %s[] = {\n" % table)
   for i, (name, kind, base) in enumerate(entries):
+    # The type of 'base': decltype() but for overloaded names.
+    ftype = ("front_type_" + base if base in overloaded
+             else "decltype(::%s)" % base)
     if kind == "own":
-      f.write("  FRONT_OWN(%s),\n" % name)
+      if name in overloaded:
+        f.write("  FRONT_OWN_T(%s, %s),\n" % (name, ftype))
+      else:
+        f.write("  FRONT_OWN(%s),\n" % name)
     elif kind == "auto" and base in memops:
       f.write("  FRONT_AUTO_MEMOP(%s, %s, %d, %s),\n"
-              % (prefix, base, i,
+              % (prefix, ftype, i,
                  "true" if re.search(r"_(ptds|ptsz)$", name) else "false"))
     elif kind == "auto":
-      f.write("  FRONT_AUTO(%s, %s, %d),\n" % (prefix, base, i))
+      f.write("  FRONT_AUTO(%s, %s, %d),\n" % (prefix, ftype, i))
     else:
       f.write("  FRONT_UNSUPPORTED(%s, %d),\n" % (prefix, i))
   f.write("};\n")

@@ -1,0 +1,34 @@
+# cuFFT functions that the front defines by hand (front_fft.cpp): all that
+# take a plan, which is an int of the front's.  See gen-cuda-front.py.
+cufftCreate
+cufftDestroy
+cufftPlan1d
+cufftPlan2d
+cufftPlan3d
+cufftPlanMany
+cufftMakePlan1d
+cufftMakePlan2d
+cufftMakePlan3d
+cufftMakePlanMany
+cufftMakePlanMany64
+cufftXtMakePlanMany
+cufftSetAutoAllocation
+cufftSetPlanPropertyInt64
+cufftGetPlanPropertyInt64
+cufftResetPlanProperty
+cufftSetWorkArea
+cufftSetStream
+cufftExecC2C
+cufftExecR2C
+cufftExecC2R
+cufftExecZ2Z
+cufftExecD2Z
+cufftExecZ2D
+cufftXtExec
+cufftGetSize
+cufftGetSize1d
+cufftGetSize2d
+cufftGetSize3d
+cufftGetSizeMany
+cufftGetSizeMany64
+cufftXtGetSizeMany

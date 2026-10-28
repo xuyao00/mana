@@ -20,10 +20,10 @@
 
 // Under --cuda, the lower half adds this LD_AUDIT module for the upper half,
 // and puts lib/dmtcp/cuda-front first on LD_LIBRARY_PATH.  The upper half
-// then loads MANA's CUDA front libraries in place of libcudart and libcuda,
-// also for a program built with an RPATH, or one that dlopen()s them by
-// path: a real libcuda in the upper half would be a second CUDA driver in
-// the process (cuda/DESIGN-lower-half-cuda.md).
+// then loads MANA's CUDA front libraries in place of libcudart and libcuda
+// (and cuBLAS, cuBLASLt, cuFFT), also for a program built with an RPATH, or
+// one that dlopen()s them by path: a real libcuda in the upper half would be
+// a second CUDA driver in the process (cuda/DESIGN-lower-half-cuda.md).
 //
 // Built without libc, as mpi-wrappers/mpi_stub_audit.c is.
 
@@ -55,19 +55,27 @@ starts_with(const char *s, const char *prefix)
   return 1;
 }
 
-// libcudart.so, libcudart.so.<N>[...], libcuda.so, libcuda.so.1
+// libcudart.so, libcudart.so.<N>[...], libcuda.so, libcuda.so.1, and the
+// same for the libraries that run in the lower half too.
 static int
 is_front_library(const char *base)
 {
-  const char *rest;
-  if (starts_with(base, "libcudart.so")) {
-    rest = base + sizeof("libcudart.so") - 1;
-  } else if (starts_with(base, "libcuda.so")) {
-    rest = base + sizeof("libcuda.so") - 1;
-  } else {
-    return 0;
+  static const char *const libs[] = { "libcudart.so", "libcuda.so",
+                                      "libcublas.so", "libcublasLt.so",
+                                      "libcufft.so" };
+  for (unsigned i = 0; i < sizeof libs / sizeof libs[0]; i++) {
+    if (starts_with(base, libs[i])) {
+      const char *rest = base;
+      for (const char *p = libs[i]; *p != '\0'; p++) {
+        rest++;
+      }
+      if (*rest == '\0' || (rest[0] == '.' && rest[1] >= '0' &&
+                            rest[1] <= '9')) {
+        return 1;
+      }
+    }
   }
-  return *rest == '\0' || (rest[0] == '.' && rest[1] >= '0' && rest[1] <= '9');
+  return 0;
 }
 
 static int

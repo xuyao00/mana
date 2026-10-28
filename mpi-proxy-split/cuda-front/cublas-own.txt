@@ -1,0 +1,20 @@
+# cuBLAS functions that the front defines by hand (front_blas.cpp): handles,
+# their settings, status strings.  A name with '?' is own if the library
+# exports it.  See gen-cuda-front.py.
+cublasCreate_v2
+cublasDestroy_v2
+cublasSetStream_v2
+cublasGetStream_v2
+cublasSetWorkspace_v2
+cublasSetPointerMode_v2
+cublasSetAtomicsMode
+cublasSetMathMode
+cublasSetSmCountTarget
+cublasSetEmulationStrategy?
+cublasSetEmulationSpecialValuesSupport?
+cublasSetFixedPointEmulationMantissaControl?
+cublasSetFixedPointEmulationMaxMantissaBitCount?
+cublasSetFixedPointEmulationMantissaBitOffset?
+cublasSetFixedPointEmulationMantissaBitCountPointer?
+cublasGetStatusName
+cublasGetStatusString

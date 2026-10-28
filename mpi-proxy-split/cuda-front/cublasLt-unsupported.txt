@@ -1,0 +1,9 @@
+# cuBLASLt functions that the header declares but the front refuses: the
+# logger is global state of the lower half's library, and its callback and
+# FILE would be the lower half's.
+cublasLtLoggerSetCallback
+cublasLtLoggerSetFile
+cublasLtLoggerOpenFile
+cublasLtLoggerSetLevel
+cublasLtLoggerSetMask
+cublasLtLoggerForceDisable

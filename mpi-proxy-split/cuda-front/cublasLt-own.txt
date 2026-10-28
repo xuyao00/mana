@@ -1,0 +1,18 @@
+# cuBLASLt functions that the front defines by hand (front_blas.cpp):
+# handles, descriptors in upper-half memory, status strings.  A name with '?'
+# is own if the library exports it.  See gen-cuda-front.py.
+cublasLtCreate
+cublasLtDestroy
+cublasLtMatmulDescCreate
+cublasLtMatmulDescDestroy
+cublasLtMatrixLayoutCreate
+cublasLtMatrixLayoutDestroy
+cublasLtGroupedMatrixLayoutCreate?
+cublasLtMatmulPreferenceCreate
+cublasLtMatmulPreferenceDestroy
+cublasLtMatrixTransformDescCreate
+cublasLtMatrixTransformDescDestroy
+cublasLtEmulationDescCreate?
+cublasLtEmulationDescDestroy?
+cublasLtGetStatusName
+cublasLtGetStatusString

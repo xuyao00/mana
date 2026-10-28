@@ -174,11 +174,13 @@ error_string(cudaError_t error, bool name)
     }
   }
   const char *s;
+  FRONT_ENTER();
   if (name) {
     FRONT_LH(s = REAL(cudaGetErrorName)(error));
   } else {
     FRONT_LH(s = REAL(cudaGetErrorString)(error));
   }
+  FRONT_LEAVE();
   std::lock_guard<std::mutex> guard(objs_lock);
   return error_strings.emplace(key, s != NULL ? s : "").first->second.c_str();
 }
@@ -217,6 +219,89 @@ obj_unlink(FrontObj *obj)
   obj->magic = 0;
 }
 
+Ctx *
+front_object_ctx()
+{
+  Ctx *ctx = creating_ctx();
+  mark_device(ctx->device);
+  return ctx;
+}
+
+bool
+front_stream_live(cudaStream_t stream)
+{
+  if ((uintptr_t)stream <= 2) {
+    return true;
+  }
+  std::lock_guard<std::mutex> guard(objs_lock);
+  for (FrontObj *o = obj_heads[FRONT_STREAM]; o != NULL; o = o->next) {
+    if (o == (FrontObj *)stream) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static const FrontLibRecords *lib_records[FRONT_N_KINDS];
+
+void
+front_lib_records(FrontKind kind, const FrontLibRecords *records)
+{
+  lib_records[kind] = records;
+}
+
+void
+front_libs_forget(Ctx *ctx)
+{
+  for (const FrontLibRecords *records : lib_records) {
+    if (records != NULL) {
+      records->forget(ctx);
+    }
+  }
+}
+
+// Loads the modules of the fatbins registered before 'seq' into cudart's
+// context of the current device, by a variable or function of each.  CUDA
+// loads a module at its first use, and so does a library its kernels; the
+// driver places module data by what it allocated before.  So a library's
+// kernels would move the application's module data, by their timing, which
+// a restart does not repeat.  Instead, the application's modules are loaded
+// when cudart starts on a device, at launch and at that place in the replay
+// alike, and before a library makes a handle (front_before_library()).
+static void
+load_modules(uint64_t seq)
+{
+  std::lock_guard<std::mutex> guard(objs_lock);
+  cudaError_t pending;
+  FRONT_LH(pending = REAL(cudaPeekAtLastError)());
+  for (FrontObj *o = obj_heads[FRONT_FATBIN]; o != NULL && o->seq < seq;
+       o = o->next) {
+    Fatbin *f = (Fatbin *)o;
+    const Registration *use = NULL;
+    for (const Registration &r : f->regs) {
+      if (use == NULL || (r.is_var && !use->is_var)) {
+        use = &r;
+      }
+    }
+    if (!f->ended || use == NULL) {
+      continue;
+    }
+    // A module that cannot load fails as it would at its first use.
+    cudaError_t rc;
+    if (use->is_var) {
+      void *address;
+      FRONT_LH(rc = REAL(cudaGetSymbolAddress)(&address, use->host));
+    } else {
+      cudaFuncAttributes attr;
+      FRONT_LH(rc = REAL(cudaFuncGetAttributes)(&attr, use->host));
+    }
+    (void)rc;
+  }
+  if (pending == cudaSuccess) {
+    FRONT_LH((void)REAL(cudaGetLastError)());
+  }
+}
+
 void
 front_note_cudart(int device)
 {
@@ -225,13 +310,31 @@ front_note_cudart(int device)
     return;
   }
   mark_device(device);
-  std::lock_guard<std::mutex> guard(objs_lock);
-  if (!cudart_noted[device]) {
-    DeviceInit *d = new DeviceInit();
-    d->device = device;
-    obj_link(d, FRONT_DEVICE);
-    __atomic_store_n(&cudart_noted[device], true, __ATOMIC_RELEASE);
+  DeviceInit *d = NULL;
+  {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    if (!cudart_noted[device]) {
+      d = new DeviceInit();
+      d->device = device;
+      obj_link(d, FRONT_DEVICE);
+      __atomic_store_n(&cudart_noted[device], true, __ATOMIC_RELEASE);
+    }
   }
+  if (d != NULL) {
+    load_modules(d->seq);
+  }
+}
+
+void
+front_before_library()
+{
+  {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    if (obj_heads[FRONT_FATBIN] == NULL) {
+      return;
+    }
+  }
+  front_note_cudart(current_device());
 }
 
 // Makes 'device' current for the checkpoint thread, with cudart's context.
@@ -1027,6 +1130,7 @@ restore_obj(FrontObj *o)
   switch (o->kind) {
     case FRONT_DEVICE:
       front_use_device(((DeviceInit *)o)->device);
+      load_modules(o->seq);
       break;
     case FRONT_KERNEL: {
       Kernel *k = (Kernel *)o;
@@ -1058,6 +1162,11 @@ restore_obj(FrontObj *o)
     case FRONT_TEXOBJ:
       front_arrays_restore(o);
       break;
+    case FRONT_BLAS:
+    case FRONT_BLASLT:
+    case FRONT_FFT:
+      lib_records[o->kind]->restore(o);
+      break;
     default:
       front_drv_restore(o);
   }
@@ -1066,8 +1175,9 @@ restore_obj(FrontObj *o)
 // The fatbins' registrations first, as the application's constructors made
 // them.  Then every other record, in creation order over all kinds: so the
 // driver places module data where it was, and a record comes after the
-// context that it belongs to (texture objects: see front_arrays.cpp).  Then
-// the settings and contents.  (Device
+// context that it belongs to (texture objects: see front_arrays.cpp;
+// libraries' handles and plans: front_blas.cpp, front_fft.cpp).  Then the
+// settings and contents.  (Device
 // memory is already mapped, and is filled last: front_vmm.cpp.)  objs_lock
 // is not held: the checkpoint thread is the only one running.
 void
@@ -1098,7 +1208,8 @@ front_objs_restore()
   std::vector<FrontObj *> order;
   for (int kind : { FRONT_CTX, FRONT_DEVICE, FRONT_MODULE, FRONT_FUNCTION,
                     FRONT_KERNEL, FRONT_STREAM, FRONT_EVENT, FRONT_ARRAY,
-                    FRONT_MIPMAP, FRONT_TEXOBJ }) {
+                    FRONT_MIPMAP, FRONT_TEXOBJ, FRONT_BLAS, FRONT_BLASLT,
+                    FRONT_FFT }) {
     for (FrontObj *o = obj_heads[kind]; o != NULL; o = o->next) {
       order.push_back(o);
     }
@@ -1107,6 +1218,11 @@ front_objs_restore()
             [](FrontObj *a, FrontObj *b) { return a->seq < b->seq; });
   for (FrontObj *o : order) {
     restore_obj(o);
+  }
+  for (const FrontLibRecords *records : lib_records) {
+    if (records != NULL) {
+      records->settle();
+    }
   }
   front_arrays_fill();
   for (auto &entry : func_settings) {

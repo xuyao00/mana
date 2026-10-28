@@ -1,0 +1,10 @@
+# cuFFT functions without a plan, forwarded as they are; every other one
+# that is not own (cufft-own.txt) is refused: several GPUs (cufftXtSetGPUs,
+# the cudaLibXtDesc functions), callbacks, the device API.  See
+# gen-cuda-front.py.
+cufftEstimate1d
+cufftEstimate2d
+cufftEstimate3d
+cufftEstimateMany
+cufftGetVersion
+cufftGetProperty

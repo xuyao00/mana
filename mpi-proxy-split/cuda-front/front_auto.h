@@ -46,26 +46,36 @@ front_is_handle()
   return false;
 }
 
+// The handle types that forwarded calls translate, each by its
+// front_translate() below: streams, events, contexts, modules, functions and
+// arrays here; a library's handles in its own header (front_blas.h), which
+// its generated table includes after this one.
+template <typename T>
+struct front_translated : std::false_type {};
+#define FRONT_TRANSLATED(type) \
+  template <>                  \
+  struct front_translated<type> : std::true_type {}
+FRONT_TRANSLATED(cudaStream_t);
+FRONT_TRANSLATED(cudaEvent_t);
+FRONT_TRANSLATED(CUcontext);
+FRONT_TRANSLATED(CUmodule);
+FRONT_TRANSLATED(CUfunction);
+FRONT_TRANSLATED(cudaArray_t);
+FRONT_TRANSLATED(cudaArray_const_t);
+FRONT_TRANSLATED(CUarray);
+FRONT_TRANSLATED(cudaMipmappedArray_t);
+FRONT_TRANSLATED(cudaMipmappedArray_const_t);
+FRONT_TRANSLATED(CUmipmappedArray);
+
 // Whether the front can forward a parameter of type T as it is (after
-// translating streams, events, contexts, modules, functions and arrays).
-// Not: other
-// handles, pointers to handles (results), and callbacks, which run on the
-// lower half's threads.
+// translating the handles above).  Not: other handles, pointers to handles
+// (results), and callbacks, which run on the lower half's threads.
 template <typename T>
 constexpr bool
 front_arg_ok()
 {
   using U = std::remove_cv_t<T>;
-  if constexpr (std::is_same_v<U, cudaStream_t> ||
-                std::is_same_v<U, cudaEvent_t> ||
-                std::is_same_v<U, CUcontext> || std::is_same_v<U, CUmodule> ||
-                std::is_same_v<U, CUfunction> ||
-                std::is_same_v<U, cudaArray_t> ||
-                std::is_same_v<U, cudaArray_const_t> ||
-                std::is_same_v<U, CUarray> ||
-                std::is_same_v<U, cudaMipmappedArray_t> ||
-                std::is_same_v<U, cudaMipmappedArray_const_t> ||
-                std::is_same_v<U, CUmipmappedArray>) {
+  if constexpr (front_translated<U>::value) {
     return true;
   } else if constexpr (front_is_handle<U>()) {
     return false;
@@ -189,6 +199,9 @@ struct FrontAuto<R(A...), L, I> {
       front_check_bound(L);
       using Fn = R (*)(A...);
       Fn fn = (Fn)L->real[I];
+      if (__builtin_expect(fn == NULL, 0)) {
+        front_missing(L, I);
+      }
       if constexpr (std::is_void_v<R>) {
         front_call_lh(fn, front_translate(args)...);
         FRONT_LEAVE();
@@ -214,7 +227,11 @@ struct FrontAutoMemop<R(A...), L, I, PTDS> {
     FRONT_ENTER();
     front_check_bound(L);
     using Fn = R (*)(A...);
-    R ret = front_call_lh((Fn)L->real[I], front_translate(args)...);
+    Fn fn = (Fn)L->real[I];
+    if (__builtin_expect(fn == NULL, 0)) {
+      front_missing(L, I);
+    }
+    R ret = front_call_lh(fn, front_translate(args)...);
     if (ret == 0) {
       front_order_memop(PTDS);
     }
@@ -231,13 +248,15 @@ front_unsupported_at()
 }
 
 // An own function is defined in libmana_cuda.so under its own name; the
-// version script keeps it local there.
+// version script keeps it local there.  'type' is the function's type
+// (gen-cuda-front.py: decltype(), or for a name that C++ overloads, the C
+// declaration's).
 #define FRONT_OWN(name) (void *)&::name
-#define FRONT_AUTO(prefix, base, index) \
-  (void *)&FrontAuto<decltype(::base), &front_##prefix##_lib, index>::call
-#define FRONT_AUTO_MEMOP(prefix, base, index, ptds)                      \
-  (void *)&FrontAutoMemop<decltype(::base), &front_##prefix##_lib, index, \
-                          ptds>::call
+#define FRONT_OWN_T(name, type) (void *)static_cast<type *>(&::name)
+#define FRONT_AUTO(prefix, type, index) \
+  (void *)&FrontAuto<type, &front_##prefix##_lib, index>::call
+#define FRONT_AUTO_MEMOP(prefix, type, index, ptds)                       \
+  (void *)&FrontAutoMemop<type, &front_##prefix##_lib, index, ptds>::call
 #define FRONT_UNSUPPORTED(prefix, index) \
   (void *)&front_unsupported_at<&front_##prefix##_lib, index>
 

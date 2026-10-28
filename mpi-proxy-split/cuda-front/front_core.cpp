@@ -30,6 +30,7 @@
 #include <dlfcn.h>
 #include <mutex>
 #include <set>
+#include <string>
 #include "front_objs.h"
 
 void initialize_wrappers();  // libmana.so: sets lh_info
@@ -86,9 +87,41 @@ front_bad_handle(const void *handle, int kind)
   static const char *const kinds[] = { "", "stream", "event", "kernel",
                                        "fatbin", "context", "module",
                                        "function", "device", "CUDA array",
-                                       "mipmapped array", "texture object" };
+                                       "mipmapped array", "texture object",
+                                       "cuBLAS handle", "cuBLASLt handle",
+                                       "cuFFT plan" };
   front_fatal("%p is not a %s that the front made\n", handle,
               kind > 0 && kind < FRONT_N_KINDS ? kinds[kind] : "handle");
+}
+
+void
+front_missing(const FrontLib *lib, int index)
+{
+  front_fatal("%s is not in the lower half's %s\n", lib->names[index],
+              lib->file != NULL ? lib->file : lib->soname);
+}
+
+bool
+front_mapped_file(const void *addr, std::string *path)
+{
+  FILE *maps = fopen("/proc/self/maps", "r");
+  if (maps == NULL) {
+    return false;
+  }
+  uintptr_t at = (uintptr_t)addr;
+  char line[4096];
+  bool found = false;
+  while (!found && fgets(line, sizeof line, maps) != NULL) {
+    unsigned long start, end;
+    char file[4096] = "";
+    if (sscanf(line, "%lx-%lx %*s %*s %*s %*s %4095s", &start, &end, file) >=
+          2 && at >= start && at < end && file[0] == '/') {
+      *path = file;
+      found = true;
+    }
+  }
+  fclose(maps);
+  return found;
 }
 
 static void
@@ -193,9 +226,33 @@ front_lh_dlsym(const char *library, const char *name)
   return fn;
 }
 
+// A library that only the application uses (cuBLAS, cuFFT, ...) loads in
+// the lower half by its soname, through the lower half's search path; else
+// from the directory of the lower half's libcudart, where a toolkit keeps
+// it.  The MPI loaded libcudart and libcuda already.
+static const char *
+front_lib_file(FrontLib *lib)
+{
+  if (lib == &front_cudart_lib || lib == &front_cuda_lib || lib->n == 0 ||
+      front_lh_dlsym(lib->soname, lib->names[0]) != NULL) {
+    return lib->soname;
+  }
+  front_check_bound(&front_cudart_lib);
+  std::string cudart;
+  if (front_mapped_file((void *)REAL(cudaGetErrorString), &cudart)) {
+    std::string path = cudart.substr(0, cudart.rfind('/') + 1) + lib->soname;
+    if (front_lh_dlsym(path.c_str(), lib->names[0]) != NULL) {
+      return strdup(path.c_str());
+    }
+  }
+  front_fatal("the lower half cannot load %s: put its directory on "
+              "LD_LIBRARY_PATH\n", lib->soname);
+}
+
 // NULL for a function that this lower half lacks: the front libraries are
 // made from the lower half's libraries, so only for one of an older driver,
-// which the application would not have found there either.
+// which the application would not have found there either, or of another
+// version of a library (front_missing()).
 void
 front_bind(FrontLib *lib)
 {
@@ -205,8 +262,11 @@ front_bind(FrontLib *lib)
     return;
   }
   front_need_lower_half();
+  if (lib->file == NULL) {
+    lib->file = front_lib_file(lib);
+  }
   for (int i = 0; i < lib->n; i++) {
-    lib->real[i] = front_lh_dlsym(lib->soname, lib->names[i]);
+    lib->real[i] = front_lh_dlsym(lib->file, lib->names[i]);
   }
   __atomic_store_n(&lib->bound_gen, front_gen, __ATOMIC_RELEASE);
 }

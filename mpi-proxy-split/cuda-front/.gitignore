@@ -4,3 +4,6 @@ libcudart.so*
 libcuda.so*
 libmana_cuda_audit.so
 libmana_cuda.so
+libcublas.so*
+libcublasLt.so*
+libcufft.so*

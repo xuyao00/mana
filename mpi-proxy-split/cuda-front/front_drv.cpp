@@ -156,6 +156,7 @@ drop_objects_of(Ctx *ctx)
     it = it->second.ctx == ctx ? pinned.erase(it) : std::next(it);
   }
   front_arrays_forget(ctx);
+  front_libs_forget(ctx);
 }
 
 // The size of a module image: a cubin (ELF), a fatbin, or PTX text.

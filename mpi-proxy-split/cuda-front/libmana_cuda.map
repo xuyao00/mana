@@ -1,10 +1,14 @@
 # libmana_cuda.so exports only the dispatch tables, for the front libraries'
-# trampolines, and mana_cuda_event(), for libmana.so.  The front's own
+# trampolines (those of the libraries that the toolkit lacks are not
+# there), and mana_cuda_event(), for libmana.so.  The front's own
 # functions keep their CUDA names here, but stay local.
 {
   global:
     front_cudart_dispatch;
     front_cuda_dispatch;
+    front_cublas_dispatch;
+    front_cublasLt_dispatch;
+    front_cufft_dispatch;
     mana_cuda_event;
   local:
     *;

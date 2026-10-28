@@ -323,6 +323,11 @@ reserve_cuda_slot(unsigned long long above)
            -1, 0) != MAP_FAILED) {
     cuda_slot.push_back(std::make_pair(slot, (size_t)MANA_CUDA_SLOT_SIZE));
   }
+  const char *verbose = getenv("MANA_CUDA_VERBOSE");
+  if (verbose != NULL && verbose[0] != '\0' && verbose[0] != '0') {
+    fprintf(stderr, "MANA cuda[%d]: the slot for the first context is at %p, "
+            "under %zu mappings\n", getpid(), (void *)slot, areas.size());
+  }
 }
 
 static void
@@ -359,7 +364,10 @@ cuda_requested()
 // cache at restart allocates otherwise than at launch.  And malloc() maps
 // large blocks top-down, at the time a thread asks: with the largest
 // threshold, blocks under 32 MB come from the brk heap instead, outside the
-// area where the driver maps.
+// area where the driver maps.  A thread's first malloc may also map a new
+// arena (64 MB) there, by its timing against the others': one arena, before
+// MPI_Init starts threads (the slot moved by an arena in about 1 of 4 runs).
+// (The upper half's malloc is another glibc's.)
 static void
 prepare_lower_half_cuda()
 {
@@ -368,6 +376,7 @@ prepare_lower_half_cuda()
   }
   setenv("CUDA_CACHE_DISABLE", "1", 0);
   mallopt(M_MMAP_THRESHOLD, 32 * 1024 * 1024);
+  mallopt(M_ARENA_MAX, 1);
 }
 
 static void
@@ -402,10 +411,6 @@ init_lower_half_cuda()
             "to a free range.\n", base, size, rc, va);
     exit(1);
   }
-  // A thread's first malloc may map a new arena (64 MB), which would land in
-  // the slot by the history of the lower half's threads: keep one arena.
-  // (The upper half's malloc is another glibc's.)
-  mallopt(M_ARENA_MAX, 1);
   reserve_cuda_slot(base + size);
   lh_info->cuda_open_slot = (void *)&lh_cuda_open_slot;
   lh_info->cuda_vmm_base = base;
