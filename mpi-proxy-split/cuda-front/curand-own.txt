@@ -1,0 +1,28 @@
+# cuRAND functions that the front defines by hand (front_rand.cpp): all
+# that take a generator, whose position the front keeps, and those that
+# return memory of the library's.  See gen-cuda-front.py.
+curandCreateGenerator
+curandCreateGeneratorHost
+curandDestroyGenerator
+curandSetStream
+curandSetPseudoRandomGeneratorSeed
+curandSetGeneratorOffset
+curandSetGeneratorOrdering
+curandSetQuasiRandomGeneratorDimensions
+curandGenerate
+curandGenerateLongLong
+curandGenerateUniform
+curandGenerateNormal
+curandGenerateLogNormal
+curandGeneratePoisson
+curandGeneratePoissonMethod
+curandGenerateUniformDouble
+curandGenerateNormalDouble
+curandGenerateLogNormalDouble
+curandGenerateSeeds
+curandCreatePoissonDistribution
+curandDestroyDistribution
+curandGetDirectionVectors32
+curandGetScrambleConstants32
+curandGetDirectionVectors64
+curandGetScrambleConstants64

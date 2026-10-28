@@ -1165,6 +1165,7 @@ restore_obj(FrontObj *o)
     case FRONT_BLAS:
     case FRONT_BLASLT:
     case FRONT_FFT:
+    case FRONT_RAND:
       lib_records[o->kind]->restore(o);
       break;
     default:
@@ -1176,10 +1177,10 @@ restore_obj(FrontObj *o)
 // them.  Then every other record, in creation order over all kinds: so the
 // driver places module data where it was, and a record comes after the
 // context that it belongs to (texture objects: see front_arrays.cpp;
-// libraries' handles and plans: front_blas.cpp, front_fft.cpp).  Then the
-// settings and contents.  (Device
-// memory is already mapped, and is filled last: front_vmm.cpp.)  objs_lock
-// is not held: the checkpoint thread is the only one running.
+// libraries' handles, plans and generators: front_blas.cpp, front_fft.cpp,
+// front_rand.cpp).  Then the settings and contents.  (Device memory is
+// already mapped, and is filled last: front_vmm.cpp.)  objs_lock is not
+// held: the checkpoint thread is the only one running.
 void
 front_objs_restore()
 {
@@ -1209,7 +1210,7 @@ front_objs_restore()
   for (int kind : { FRONT_CTX, FRONT_DEVICE, FRONT_MODULE, FRONT_FUNCTION,
                     FRONT_KERNEL, FRONT_STREAM, FRONT_EVENT, FRONT_ARRAY,
                     FRONT_MIPMAP, FRONT_TEXOBJ, FRONT_BLAS, FRONT_BLASLT,
-                    FRONT_FFT }) {
+                    FRONT_FFT, FRONT_RAND }) {
     for (FrontObj *o = obj_heads[kind]; o != NULL; o = o->next) {
       order.push_back(o);
     }

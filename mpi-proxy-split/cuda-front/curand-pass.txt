@@ -1,0 +1,4 @@
+# cuRAND functions without a generator, forwarded as they are; every other
+# one is own (curand-own.txt).  See gen-cuda-front.py.
+curandGetVersion
+curandGetProperty

@@ -9,6 +9,7 @@
     front_cublas_dispatch;
     front_cublasLt_dispatch;
     front_cufft_dispatch;
+    front_curand_dispatch;
     mana_cuda_event;
   local:
     *;

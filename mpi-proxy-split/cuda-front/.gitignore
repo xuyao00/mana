@@ -7,3 +7,4 @@ libmana_cuda.so
 libcublas.so*
 libcublasLt.so*
 libcufft.so*
+libcurand.so*

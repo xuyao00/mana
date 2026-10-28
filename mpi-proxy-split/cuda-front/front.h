@@ -176,6 +176,7 @@ enum FrontKind {
   FRONT_BLAS,            // a cuBLAS handle
   FRONT_BLASLT,          // a cuBLASLt handle
   FRONT_FFT,             // a cuFFT plan (not a handle: plans are ints)
+  FRONT_RAND,            // a cuRAND generator
   FRONT_N_KINDS
 };
 

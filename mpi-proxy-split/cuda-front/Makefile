@@ -1,8 +1,8 @@
 # The CUDA front of the upper half under --cuda
 # (cuda/DESIGN-lower-half-cuda.md): MANA's libcudart.so.<N> and libcuda.so.1,
 # generated from the real libraries that bin/lower-half uses
-# (gen-cuda-front.py), the same for cuBLAS, cuBLASLt and cuFFT if the
-# toolkit has them, and libmana_cuda.so, which they all jump into.  All are
+# (gen-cuda-front.py), the same for cuBLAS, cuBLASLt, cuFFT and cuRAND if
+# the toolkit has them, and libmana_cuda.so, which they all jump into.  All are
 # installed in lib/dmtcp/cuda-front/.
 
 include ../Makefile_config
@@ -39,6 +39,7 @@ real_lib = $(firstword $(wildcard ${CUDA_MATH_LIBDIR}/$(1).so.[0-9]*))
 REAL_LIBCUBLAS ?= $(call real_lib,libcublas)
 REAL_LIBCUBLASLT ?= $(call real_lib,libcublasLt)
 REAL_LIBCUFFT ?= $(call real_lib,libcufft)
+REAL_LIBCURAND ?= $(call real_lib,libcurand)
 ifneq (${REAL_LIBCUBLAS},)
 ifneq (${REAL_LIBCUBLASLT},)
   CUBLAS_SONAME := $(call soname,${REAL_LIBCUBLAS})
@@ -47,6 +48,9 @@ endif
 endif
 ifneq (${REAL_LIBCUFFT},)
   CUFFT_SONAME := $(call soname,${REAL_LIBCUFFT})
+endif
+ifneq (${REAL_LIBCURAND},)
+  CURAND_SONAME := $(call soname,${REAL_LIBCURAND})
 endif
 
 INSTALL_DIR = ${MANA_ROOT}/lib/dmtcp/cuda-front
@@ -64,9 +68,10 @@ FRONT_OBJS = front_core.o front_vmm.o front_objs.o front_drv.o \
              gen/cudart-gen.o gen/cuda-gen.o \
              $(if ${CUBLAS_SONAME},front_blas.o gen/cublas-gen.o \
                gen/cublasLt-gen.o) \
-             $(if ${CUFFT_SONAME},front_fft.o gen/cufft-gen.o)
+             $(if ${CUFFT_SONAME},front_fft.o gen/cufft-gen.o) \
+             $(if ${CURAND_SONAME},front_rand.o gen/curand-gen.o)
 FRONT_LIBS = ${CUDART_SONAME} libcuda.so.1 ${CUBLAS_SONAME} \
-             ${CUBLASLT_SONAME} ${CUFFT_SONAME}
+             ${CUBLASLT_SONAME} ${CUFFT_SONAME} ${CURAND_SONAME}
 FRONT_HEADERS = front.h front_auto.h front_objs.h front_reg.h mana_cuda.h \
                 gen/cudart-index.h gen/cuda-index.h \
                 ../lower-half/lower-half-api.h
@@ -94,8 +99,9 @@ gen/cuda-gen.cpp gen/cuda-tramp.S gen/cuda.map gen/cuda-index.h: \
 	  --out-dir=gen --header=cuda.h --cxx=g++ --cflags="${GEN_CFLAGS}" \
 	  --own=cuda-own.txt --pass=cuda-pass.txt --memops=cuda-memops.txt
 
-# cuBLAS and cuBLASLt (front_blas.h translates their handles), and cuFFT,
-# whose plans are all own: it forwards only cufft-pass.txt.
+# cuBLAS and cuBLASLt (front_blas.h translates their handles); cuFFT and
+# cuRAND, whose plans and generators are all own: they forward only their
+# -pass.txt.
 gen/cublas-gen.cpp gen/cublas-tramp.S gen/cublas.map gen/cublas-index.h: \
     gen-cuda-front.py cublas-own.txt cublas-unsupported.txt \
     cublas-memops.txt ${REAL_LIBCUBLAS}
@@ -120,9 +126,16 @@ gen/cufft-gen.cpp gen/cufft-tramp.S gen/cufft.map gen/cufft-index.h: \
 	  --out-dir=gen --header=cufftXt.h --cxx=g++ --cflags="${GEN_CFLAGS}" \
 	  --own=cufft-own.txt --pass=cufft-pass.txt
 
+gen/curand-gen.cpp gen/curand-tramp.S gen/curand.map gen/curand-index.h: \
+    gen-cuda-front.py curand-own.txt curand-pass.txt ${REAL_LIBCURAND}
+	python3 gen-cuda-front.py --real=${REAL_LIBCURAND} --prefix=curand \
+	  --out-dir=gen --header=curand.h --cxx=g++ --cflags="${GEN_CFLAGS}" \
+	  --own=curand-own.txt --pass=curand-pass.txt
+
 front_blas.o gen/cublas-gen.o gen/cublasLt-gen.o: front_blas.h \
     gen/cublas-index.h gen/cublasLt-index.h
 front_fft.o: gen/cufft-index.h
+front_rand.o: gen/curand-index.h
 
 %.o: %.cpp ${FRONT_HEADERS}
 	${MPICXX} ${FRONT_CXXFLAGS} -c -o $@ $<
@@ -163,6 +176,11 @@ ${CUFFT_SONAME}: gen/cufft-tramp.o gen/cufft.map libmana_cuda.so
 	  -Wl,-soname,${CUFFT_SONAME} -Wl,--version-script=gen/cufft.map \
 	  -Wl,-rpath,'$$ORIGIN' -Wl,-z,now
 
+${CURAND_SONAME}: gen/curand-tramp.o gen/curand.map libmana_cuda.so
+	${MPICXX} -shared -o $@ gen/curand-tramp.o libmana_cuda.so \
+	  -Wl,-soname,${CURAND_SONAME} -Wl,--version-script=gen/curand.map \
+	  -Wl,-rpath,'$$ORIGIN' -Wl,-z,now
+
 # An LD_AUDIT module for the upper half; it must not need libc.
 libmana_cuda_audit.so: cuda_audit.c
 	${CC} -O2 -fPIC -shared -nostdlib -fno-stack-protector \
@@ -177,10 +195,13 @@ install: default
 	$(if ${CUBLASLT_SONAME},ln -sf ${CUBLASLT_SONAME} \
 	  ${INSTALL_DIR}/libcublasLt.so)
 	$(if ${CUFFT_SONAME},ln -sf ${CUFFT_SONAME} ${INSTALL_DIR}/libcufft.so)
+	$(if ${CURAND_SONAME},ln -sf ${CURAND_SONAME} \
+	  ${INSTALL_DIR}/libcurand.so)
 	cp -f libmana_cuda_audit.so ${MANA_ROOT}/lib/dmtcp/
 
 clean:
 	rm -rf gen *.o libmana_cuda.so libcudart.so.* libcuda.so.1 \
-	  libcublas.so.* libcublasLt.so.* libcufft.so.* libmana_cuda_audit.so
+	  libcublas.so.* libcublasLt.so.* libcufft.so.* libcurand.so.* \
+	  libmana_cuda_audit.so
 
 .PHONY: default check-real install clean
