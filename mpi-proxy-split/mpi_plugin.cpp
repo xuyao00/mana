@@ -19,6 +19,7 @@
  *  <http://www.gnu.org/licenses/>.                                         *
  ****************************************************************************/
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -49,6 +50,7 @@
 #include "virtual_id.h"
 #include "uh_wrappers.h"
 #include "logging.h"
+#include "cuda-front/mana_cuda.h"
 
 #include "config.h"
 #include "dmtcp.h"
@@ -759,6 +761,30 @@ close_lower_half_except_blocked()
   g_drain_stats.t_wait_lower_half += drainStatsNow() - t;
 }
 
+// --cuda (MANA_CUDA=1): the application's CUDA runs in the lower half, and
+// the CUDA front (cuda-front/) saves and rebuilds it.  The front is loaded
+// only if the application uses the CUDA runtime.
+static bool
+mana_cuda_enabled()
+{
+  const char *cuda = getenv("MANA_CUDA");
+  return cuda != NULL && cuda[0] != '\0' && strcmp(cuda, "0") != 0;
+}
+
+static void
+mana_cuda(int event)
+{
+  static mana_cuda_event_t fn = NULL;
+  static bool looked = false;
+  if (!looked) {
+    fn = (mana_cuda_event_t)dlsym(RTLD_DEFAULT, "mana_cuda_event");
+    looked = true;
+  }
+  if (fn != NULL) {
+    fn(event);
+  }
+}
+
 static void
 mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 {
@@ -900,6 +926,15 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
         complete_pending_nonblocking_collectives();  // seq_num.cpp
         g_drain_stats.t_collective += drainStatsNow() - t_nbc;
       }
+      if (mana_cuda_enabled()) {
+        // The lower half is closed, so no thread starts GPU work any more:
+        // wait for the GPUs, then copy device memory into the upper half.
+        // Until every rank has synchronized, another rank's kernel may
+        // still write this rank's memory through CUDA IPC.
+        mana_cuda(MANA_CUDA_QUIESCE);
+        dmtcp_global_barrier("MPI:cuda-quiesced");
+        mana_cuda(MANA_CUDA_STASH);
+      }
       reportDrainStats();  // With MANA_DRAIN_STATS set
       printEventToStderr("EVENT_PRESUSPEND (done)");
       break;
@@ -932,6 +967,9 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 
     case DMTCP_EVENT_RESUME: {
       printEventToStderr("EVENT_RESUME");
+      if (mana_cuda_enabled()) {
+        mana_cuda(MANA_CUDA_RESUME);
+      }
       processingOpenCkpFileFds = false;
       dmtcp_local_barrier("MPI:Reset-Drain-Send-Recv-Counters");
       resetDrainCounters(); // p2p_drain_send_recv.cpp
@@ -969,6 +1007,11 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       MPI_MANA_Internal(str); // This does nothing.  Modify in lower-half
                              // for easy debugging of lower half during restart.
                              // See definition in mpi-wrappers/mpi_wrappers.cpp
+      if (mana_cuda_enabled()) {
+        // Device memory comes back before the replay reposts receives
+        // into it.
+        mana_cuda(MANA_CUDA_RESTART);
+      }
       mana_state = RESTART_REPLAY;
       dmtcp_global_barrier("MPI:replayMpiP2pOnRestart");
       replayMpiP2pOnRestart(); // p2p_log_replay.cpp

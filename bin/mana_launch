@@ -4,7 +4,7 @@ import os
 import shutil
 
 help_msg = '''
-  USAGE: [srun] mana_launch [--verbose] [--timing] [DMTCP_OPTIONS ...]
+  USAGE: [srun] mana_launch [--verbose] [--timing] [--cuda] [DMTCP_OPTIONS ...]
                             [--ckptdir DIR] MPI_EXECUTABLE [...]
           For DMTCP options, do: dmtcp_launch --help
 '''
@@ -56,6 +56,11 @@ if "--verbose" in dmtcp_flags:
 if "--timing" in dmtcp_flags:
   os.environ["MANA_TIMING"] = "1"
   dmtcp_flags.remove("--timing")
+# --cuda: the application's CUDA runs in the lower half, next to the MPI
+# (cuda/DESIGN-lower-half-cuda.md).  Same as MANA_CUDA=1.
+if "--cuda" in dmtcp_flags:
+  os.environ["MANA_CUDA"] = "1"
+  dmtcp_flags.remove("--cuda")
 if "srun" in target_app or "sbatch" in target_app:
   print(help_msg)
   sys.exit(1)

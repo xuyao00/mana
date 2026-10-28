@@ -1,0 +1,33 @@
+# cudart functions that the front defines by hand (front_objs.cpp).  The
+# generator makes nothing for them.  See gen-cuda-front.py.
+cudaSetDevice
+cudaSetDeviceFlags
+cudaMalloc
+cudaMallocPitch
+cudaFree
+cudaHostAlloc
+cudaMallocHost
+cudaFreeHost
+cudaHostRegister
+cudaHostUnregister
+cudaStreamCreate
+cudaStreamCreateWithFlags
+cudaStreamCreateWithPriority
+cudaStreamDestroy
+cudaEventCreate
+cudaEventCreateWithFlags
+cudaEventDestroy
+cudaFuncSetAttribute
+cudaFuncSetCacheConfig
+__cudaRegisterFatBinary
+__cudaRegisterFatBinaryEnd
+__cudaUnregisterFatBinary
+__cudaRegisterFunction
+__cudaRegisterVar
+__cudaRegisterManagedVar
+__cudaInitModule
+__cudaPushCallConfiguration
+__cudaPopCallConfiguration
+__cudaGetKernel
+__cudaLaunchKernel
+__cudaLaunchKernel_ptsz

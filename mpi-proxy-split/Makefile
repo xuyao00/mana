@@ -125,6 +125,9 @@ install: ${MANA_COORD_OBJS}
 	+ make ${MANA_ROOT}/lib/dmtcp/libmpistub.so
 	+ make ${MANA_ROOT}/lib/dmtcp/libmpistub_audit.so
 	+ make -C ${LH_SRCDIR} install
+	@# --cuda: the CUDA front, if the lower half's MPI uses CUDA.
+	+ if ldd ${LH_SRCDIR}/lower-half 2>/dev/null | grep -q libcudart; then \
+	    make -C cuda-front install; fi
 
 tidy:
 	rm -f *~ .*.swp dmtcp_restart_script*.sh ckpt_*.dmtcp
@@ -132,6 +135,7 @@ tidy:
 	rm -rf dmtcp_coordinator_db-*.json
 
 clean: tidy
+	+ make -C cuda-front clean
 	rm -f ${LIBOBJS} ${MANA_COORD_OBJS}
 	rm -f libmana.so
 	rm -f ${MANA_ROOT}/lib/dmtcp/libmana.so
