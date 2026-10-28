@@ -18,67 +18,33 @@
  *  <http://www.gnu.org/licenses/>.                                         *
  ****************************************************************************/
 
-// The front's hand-written functions ("own" in cudart-own.txt), and the
-// records from which a restart rebuilds what was alive at the checkpoint:
-// one record per live object, never a history.  The kernel registrations
-// that the application's constructors make are the one fixed set of calls
-// that a restart makes again.
+// The runtime's own functions ("own" in cudart-own.txt), and the records
+// from which a restart rebuilds what was alive at the checkpoint: one record
+// per live object, never a history.  The kernel registrations that the
+// application's constructors make are the one fixed set of calls that a
+// restart makes again.
 
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <map>
-#include <mutex>
-#include <vector>
-#include "front.h"
+#include <algorithm>
+#include "front_objs.h"
+#include "front_reg.h"
 
-// cudart's registration interface (crt/host_runtime.h, crt/device_functions.h).
-extern "C" {
-void **__cudaRegisterFatBinary(void *fatCubin);
-void __cudaRegisterFatBinaryEnd(void **fatCubinHandle);
-void __cudaUnregisterFatBinary(void **fatCubinHandle);
-void __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
-                            char *deviceFun, const char *deviceName,
-                            int thread_limit, uint3 *tid, uint3 *bid,
-                            dim3 *bDim, dim3 *gDim, int *wSize);
-void __cudaRegisterVar(void **fatCubinHandle, char *hostVar,
-                       char *deviceAddress, const char *deviceName, int ext,
-                       size_t size, int constant, int global);
-void __cudaRegisterManagedVar(void **fatCubinHandle, void **hostVarPtrAddress,
-                              char *deviceAddress, const char *deviceName,
-                              int ext, size_t size, int constant, int global);
-char __cudaInitModule(void **fatCubinHandle);
-unsigned __cudaPushCallConfiguration(dim3 gridDim, dim3 blockDim,
-                                     size_t sharedMem,
-                                     struct CUstream_st *stream);
-cudaError_t __cudaPopCallConfiguration(dim3 *gridDim, dim3 *blockDim,
-                                       size_t *sharedMem, void *stream);
-cudaError_t __cudaGetKernel(cudaKernel_t *kernel, const void *hostFun);
-cudaError_t __cudaLaunchKernel(cudaKernel_t kernel, dim3 gridDim,
-                               dim3 blockDim, void **args, size_t sharedMem,
-                               cudaStream_t stream);
-cudaError_t __cudaLaunchKernel_ptsz(cudaKernel_t kernel, dim3 gridDim,
-                                    dim3 blockDim, void **args,
-                                    size_t sharedMem, cudaStream_t stream);
-}
-
-uint64_t front_devices_used = 1;
+uint64_t front_devices_used;
+std::mutex objs_lock;
+FrontObj *obj_heads[FRONT_N_KINDS];
+std::map<void *, Pinned> pinned;
 
 namespace {
 
-struct Stream : FrontObj {
-  unsigned flags;
-  int priority;
-  int device;
-};
-
-struct Event : FrontObj {
-  unsigned flags;
-  int device;
-};
-
 struct Kernel : FrontObj {
   const void *host_fun;
+  Ctx *ctx;
+};
+
+struct DeviceInit : FrontObj {
+  int device;
 };
 
 struct Registration {
@@ -106,51 +72,18 @@ struct FuncSetting {
   int value;
 };
 
-struct Pinned {
-  size_t size;
-  unsigned flags;        // cudaHostRegister flags
-  bool ours;             // cudaHostAlloc: we mapped it
-};
-
-std::mutex objs_lock;
-FrontObj *heads[FRONT_FATBIN + 1];
-FrontObj *tails[FRONT_FATBIN + 1];
+FrontObj *tails[FRONT_N_KINDS];
+uint64_t next_seq;
+bool cudart_noted[64];
 std::map<const void *, Kernel *> kernels;      // by host stub
 // (function, attribute) -> setting; cudaFuncSetCacheConfig uses -1.
 std::map<std::pair<const void *, int>, FuncSetting> func_settings;
-std::map<void *, Pinned> pinned;
 std::map<int, unsigned> device_flags;
-
-void
-link(FrontObj *obj, FrontKind kind)
-{
-  obj->magic = FRONT_MAGIC;
-  obj->kind = kind;
-  obj->prev = tails[kind];
-  obj->next = NULL;
-  if (tails[kind] != NULL) {
-    tails[kind]->next = obj;
-  } else {
-    heads[kind] = obj;
-  }
-  tails[kind] = obj;
-}
-
-void
-unlink(FrontObj *obj)
-{
-  if (obj->prev != NULL) {
-    obj->prev->next = obj->next;
-  } else {
-    heads[obj->kind] = obj->next;
-  }
-  if (obj->next != NULL) {
-    obj->next->prev = obj->prev;
-  } else {
-    tails[obj->kind] = obj->prev;
-  }
-  obj->magic = 0;
-}
+std::map<int, std::string> error_strings;      // (name? 1 : 0) + 2 * error
+// (device, peer) with peer access, as cudaDeviceEnablePeerAccess made it.
+std::map<std::pair<int, int>, unsigned> peer_access;
+// cudaGetSymbolAddress: what the application has, by (device, symbol).
+std::map<std::pair<int, const void *>, void *> symbol_addresses;
 
 int
 current_device()
@@ -169,70 +102,15 @@ mark_device(int device)
   }
 }
 
-// Makes 'device' current for the checkpoint thread, with cudart's context.
-void
-use_device(int device)
+// The calling thread's context, for a record of an object made in it.
+Ctx *
+creating_ctx()
 {
-  cudaError_t rc;
-  FRONT_LH(rc = REAL(cudaSetDevice)(device));
-  if (rc == cudaSuccess) {
-    FRONT_LH(rc = REAL(cudaFree)(NULL));
+  Ctx *ctx = front_ctx_current();
+  if (ctx == NULL) {
+    ctx = front_ctx_primary(current_device());
   }
-  if (rc != cudaSuccess) {
-    front_fatal("using device %d: error %d\n", device, rc);
-  }
-}
-
-cudaError_t
-create_stream(cudaStream_t *stream, unsigned flags, int priority)
-{
-  if (stream == NULL) {
-    return cudaErrorInvalidValue;
-  }
-  FRONT_ENTER();
-  Stream *s = new Stream();
-  s->flags = flags;
-  s->priority = priority;
-  s->device = current_device();
-  cudaError_t rc;
-  FRONT_LH(rc = REAL(cudaStreamCreateWithPriority)(
-             (cudaStream_t *)&s->real, flags, priority));
-  if (rc == cudaSuccess) {
-    std::lock_guard<std::mutex> guard(objs_lock);
-    link(s, FRONT_STREAM);
-    *stream = (cudaStream_t)s;
-  } else {
-    delete s;
-  }
-  FRONT_LEAVE();
-  return rc;
-}
-
-cudaError_t
-create_event(cudaEvent_t *event, unsigned flags)
-{
-  if (event == NULL) {
-    return cudaErrorInvalidValue;
-  }
-  if (flags & cudaEventInterprocess) {
-    front_unsupported("cudaEventCreateWithFlags(cudaEventInterprocess)");
-  }
-  FRONT_ENTER();
-  Event *e = new Event();
-  e->flags = flags;
-  e->device = current_device();
-  cudaError_t rc;
-  FRONT_LH(rc = REAL(cudaEventCreateWithFlags)((cudaEvent_t *)&e->real,
-                                               flags));
-  if (rc == cudaSuccess) {
-    std::lock_guard<std::mutex> guard(objs_lock);
-    link(e, FRONT_EVENT);
-    *event = (cudaEvent_t)e;
-  } else {
-    delete e;
-  }
-  FRONT_LEAVE();
-  return rc;
+  return ctx;
 }
 
 Fatbin *
@@ -282,7 +160,299 @@ set_func(const void *func, int attr, const FuncSetting &setting)
   }
 }
 
+// A string of the lower half's libcudart, copied into upper-half memory: the
+// application may keep it across a restart.
+const char *
+error_string(cudaError_t error, bool name)
+{
+  int key = 2 * (int)error + (name ? 1 : 0);
+  {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    auto it = error_strings.find(key);
+    if (it != error_strings.end()) {
+      return it->second.c_str();
+    }
+  }
+  const char *s;
+  if (name) {
+    FRONT_LH(s = REAL(cudaGetErrorName)(error));
+  } else {
+    FRONT_LH(s = REAL(cudaGetErrorString)(error));
+  }
+  std::lock_guard<std::mutex> guard(objs_lock);
+  return error_strings.emplace(key, s != NULL ? s : "").first->second.c_str();
+}
+
 }  // namespace
+
+void
+obj_link(FrontObj *obj, FrontKind kind)
+{
+  obj->magic = FRONT_MAGIC;
+  obj->kind = kind;
+  obj->seq = ++next_seq;
+  obj->prev = tails[kind];
+  obj->next = NULL;
+  if (tails[kind] != NULL) {
+    tails[kind]->next = obj;
+  } else {
+    obj_heads[kind] = obj;
+  }
+  tails[kind] = obj;
+}
+
+void
+obj_unlink(FrontObj *obj)
+{
+  if (obj->prev != NULL) {
+    obj->prev->next = obj->next;
+  } else {
+    obj_heads[obj->kind] = obj->next;
+  }
+  if (obj->next != NULL) {
+    obj->next->prev = obj->prev;
+  } else {
+    tails[obj->kind] = obj->prev;
+  }
+  obj->magic = 0;
+}
+
+void
+front_note_cudart(int device)
+{
+  if (device < 0 || device >= 64 ||
+      __atomic_load_n(&cudart_noted[device], __ATOMIC_ACQUIRE)) {
+    return;
+  }
+  mark_device(device);
+  std::lock_guard<std::mutex> guard(objs_lock);
+  if (!cudart_noted[device]) {
+    DeviceInit *d = new DeviceInit();
+    d->device = device;
+    obj_link(d, FRONT_DEVICE);
+    __atomic_store_n(&cudart_noted[device], true, __ATOMIC_RELEASE);
+  }
+}
+
+// Makes 'device' current for the checkpoint thread, with cudart's context.
+void
+front_use_device(int device)
+{
+  cudaError_t rc;
+  FRONT_LH(rc = REAL(cudaSetDevice)(device));
+  if (rc == cudaSuccess) {
+    FRONT_LH(rc = REAL(cudaFree)(NULL));
+  }
+  if (rc != cudaSuccess) {
+    front_fatal("using device %d: error %d\n", device, rc);
+  }
+  front_note_cudart(device);
+}
+
+// ---- Shared by the runtime and the driver --------------------------------
+
+int
+front_create_stream(cudaStream_t *stream, unsigned flags, int priority,
+                    bool drv)
+{
+  if (stream == NULL) {
+    return cudaErrorInvalidValue;  // CUDA_ERROR_INVALID_VALUE too
+  }
+  FRONT_ENTER();
+  Stream *s = new Stream();
+  s->flags = flags;
+  s->priority = priority;
+  int rc;
+  if (drv) {
+    FRONT_LH(rc = DRV(cuStreamCreateWithPriority)((CUstream *)&s->real,
+                                                  flags, priority));
+  } else {
+    FRONT_LH(rc = REAL(cudaStreamCreateWithPriority)(
+               (cudaStream_t *)&s->real, flags, priority));
+  }
+  if (rc == 0) {
+    s->ctx = creating_ctx();
+    if (!drv) {
+      front_note_cudart(s->ctx->device);
+    }
+    std::lock_guard<std::mutex> guard(objs_lock);
+    obj_link(s, FRONT_STREAM);
+    *stream = (cudaStream_t)s;
+  } else {
+    delete s;
+  }
+  FRONT_LEAVE();
+  return rc;
+}
+
+int
+front_destroy_stream(cudaStream_t stream, bool drv)
+{
+  FRONT_ENTER();
+  int rc;
+  if (drv) {
+    FRONT_LH(rc = DRV(cuStreamDestroy_v2)(front_real_stream(stream)));
+  } else {
+    FRONT_LH(rc = REAL(cudaStreamDestroy)(front_real_stream(stream)));
+  }
+  if (rc == 0 && (uintptr_t)stream > 2) {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    obj_unlink((FrontObj *)stream);
+    delete (Stream *)stream;
+  }
+  FRONT_LEAVE();
+  return rc;
+}
+
+int
+front_create_event(cudaEvent_t *event, unsigned flags, bool drv)
+{
+  if (event == NULL) {
+    return cudaErrorInvalidValue;
+  }
+  if (flags & cudaEventInterprocess) {  // CU_EVENT_INTERPROCESS too
+    front_unsupported("interprocess events");
+  }
+  FRONT_ENTER();
+  Event *e = new Event();
+  e->flags = flags;
+  int rc;
+  if (drv) {
+    FRONT_LH(rc = DRV(cuEventCreate)((CUevent *)&e->real, flags));
+  } else {
+    FRONT_LH(rc = REAL(cudaEventCreateWithFlags)((cudaEvent_t *)&e->real,
+                                                 flags));
+  }
+  if (rc == 0) {
+    e->ctx = creating_ctx();
+    if (!drv) {
+      front_note_cudart(e->ctx->device);
+    }
+    std::lock_guard<std::mutex> guard(objs_lock);
+    obj_link(e, FRONT_EVENT);
+    *event = (cudaEvent_t)e;
+  } else {
+    delete e;
+  }
+  FRONT_LEAVE();
+  return rc;
+}
+
+int
+front_destroy_event(cudaEvent_t event, bool drv)
+{
+  FRONT_ENTER();
+  int rc;
+  if (drv) {
+    FRONT_LH(rc = DRV(cuEventDestroy_v2)(front_real_event(event)));
+  } else {
+    FRONT_LH(rc = REAL(cudaEventDestroy)(front_real_event(event)));
+  }
+  if (rc == 0 && event != NULL) {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    obj_unlink((FrontObj *)event);
+    delete (Event *)event;
+  }
+  FRONT_LEAVE();
+  return rc;
+}
+
+// Pinned host memory is upper-half memory, registered again at restart.  The
+// register flags are the same in both APIs.
+int
+front_host_alloc(void **ptr, size_t size, unsigned register_flags, bool drv)
+{
+  if (ptr == NULL) {
+    return cudaErrorInvalidValue;
+  }
+  if (size == 0) {
+    *ptr = NULL;
+    return 0;
+  }
+  void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (p == MAP_FAILED) {
+    return cudaErrorMemoryAllocation;  // CUDA_ERROR_OUT_OF_MEMORY too
+  }
+  int rc = front_host_register(p, size, register_flags, drv);
+  if (rc != 0) {
+    munmap(p, size);
+    return rc;
+  }
+  {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    pinned[p].ours = true;
+  }
+  *ptr = p;
+  return 0;
+}
+
+int
+front_host_free(void *ptr, bool drv)
+{
+  size_t size = 0;
+  {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    auto it = pinned.find(ptr);
+    if (it != pinned.end() && it->second.ours) {
+      size = it->second.size;
+    }
+  }
+  if (size == 0) {
+    // Not the front's (or NULL): the lower half's error, or success.
+    FRONT_ENTER();
+    int rc;
+    if (drv) {
+      FRONT_LH(rc = DRV(cuMemFreeHost)(ptr));
+    } else {
+      FRONT_LH(rc = REAL(cudaFreeHost)(ptr));
+    }
+    FRONT_LEAVE();
+    return rc;
+  }
+  int rc = front_host_unregister(ptr, drv);
+  if (rc == 0) {
+    munmap(ptr, size);
+  }
+  return rc;
+}
+
+int
+front_host_register(void *ptr, size_t size, unsigned flags, bool drv)
+{
+  FRONT_ENTER();
+  int rc;
+  if (drv) {
+    FRONT_LH(rc = DRV(cuMemHostRegister_v2)(ptr, size, flags));
+  } else {
+    FRONT_LH(rc = REAL(cudaHostRegister)(ptr, size, flags));
+  }
+  if (rc == 0) {
+    Ctx *ctx = creating_ctx();
+    std::lock_guard<std::mutex> guard(objs_lock);
+    pinned[ptr] = { size, flags, false, ctx };
+  }
+  FRONT_LEAVE();
+  return rc;
+}
+
+int
+front_host_unregister(void *ptr, bool drv)
+{
+  FRONT_ENTER();
+  int rc;
+  if (drv) {
+    FRONT_LH(rc = DRV(cuMemHostUnregister)(ptr));
+  } else {
+    FRONT_LH(rc = REAL(cudaHostUnregister)(ptr));
+  }
+  if (rc == 0) {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    pinned.erase(ptr);
+  }
+  FRONT_LEAVE();
+  return rc;
+}
 
 // ---- Devices -------------------------------------------------------------
 
@@ -295,6 +465,9 @@ cudaSetDevice(int device)
   if (rc == cudaSuccess) {
     front_thread.device = device;
     mark_device(device);
+    // cudart makes the device's primary context, and makes it current.
+    front_stack_set_top(front_ctx_primary(device));
+    front_note_cudart(device);
   }
   FRONT_LEAVE();
   return rc;
@@ -315,6 +488,125 @@ cudaSetDeviceFlags(unsigned int flags)
   return rc;
 }
 
+// cuDevicePrimaryCtxSetFlags (front_drv.cpp) sets the same flags.
+void
+front_set_device_flags(int device, unsigned flags)
+{
+  std::lock_guard<std::mutex> guard(objs_lock);
+  device_flags[device] = flags;
+}
+
+// The limits and the cache configuration belong to the current context;
+// cudaLimit and CUlimit, cudaFuncCache and CUfunc_cache have the same values.
+extern "C" cudaError_t
+cudaDeviceSetLimit(enum cudaLimit limit, size_t value)
+{
+  FRONT_ENTER();
+  cudaError_t rc;
+  FRONT_LH(rc = REAL(cudaDeviceSetLimit)(limit, value));
+  if (rc == cudaSuccess) {
+    Ctx *ctx = creating_ctx();
+    std::lock_guard<std::mutex> guard(objs_lock);
+    ctx->limits[(int)limit] = value;
+  }
+  FRONT_LEAVE();
+  return rc;
+}
+
+extern "C" cudaError_t
+cudaDeviceSetCacheConfig(enum cudaFuncCache cacheConfig)
+{
+  FRONT_ENTER();
+  cudaError_t rc;
+  FRONT_LH(rc = REAL(cudaDeviceSetCacheConfig)(cacheConfig));
+  if (rc == cudaSuccess) {
+    Ctx *ctx = creating_ctx();
+    std::lock_guard<std::mutex> guard(objs_lock);
+    ctx->cache_config = (int)cacheConfig;
+  }
+  FRONT_LEAVE();
+  return rc;
+}
+
+// Peer access, from the current device; it stays on across restarts.
+static cudaError_t
+peer_access_on(int peer, unsigned flags, bool on)
+{
+  FRONT_ENTER();
+  cudaError_t rc;
+  int device = current_device();
+  if (on) {
+    FRONT_LH(rc = REAL(cudaDeviceEnablePeerAccess)(peer, flags));
+  } else {
+    FRONT_LH(rc = REAL(cudaDeviceDisablePeerAccess)(peer));
+  }
+  if (rc == cudaSuccess) {
+    front_vmm_peer_access(device, peer, on);
+    std::lock_guard<std::mutex> guard(objs_lock);
+    if (on) {
+      peer_access[{ device, peer }] = flags;
+    } else {
+      peer_access.erase({ device, peer });
+    }
+  }
+  FRONT_LEAVE();
+  return rc;
+}
+
+extern "C" cudaError_t
+cudaDeviceEnablePeerAccess(int peerDevice, unsigned int flags)
+{
+  return peer_access_on(peerDevice, flags, true);
+}
+
+extern "C" cudaError_t
+cudaDeviceDisablePeerAccess(int peerDevice)
+{
+  return peer_access_on(peerDevice, 0, false);
+}
+
+// The context API's form (front_drv.cpp).
+void
+front_peer_access(int device, int peer, unsigned flags, bool on)
+{
+  front_vmm_peer_access(device, peer, on);
+  std::lock_guard<std::mutex> guard(objs_lock);
+  if (on) {
+    peer_access[{ device, peer }] = flags;
+  } else {
+    peer_access.erase({ device, peer });
+  }
+}
+
+// A __device__ address that the application has must not move at restart:
+// it may be stored in device memory, out of the front's sight.
+extern "C" cudaError_t
+cudaGetSymbolAddress(void **devPtr, const void *symbol)
+{
+  FRONT_ENTER();
+  cudaError_t rc;
+  FRONT_LH(rc = REAL(cudaGetSymbolAddress)(devPtr, symbol));
+  if (rc == cudaSuccess && devPtr != NULL) {
+    int device = current_device();
+    std::lock_guard<std::mutex> guard(objs_lock);
+    symbol_addresses[{ device, symbol }] = *devPtr;
+  }
+  FRONT_LEAVE();
+  return rc;
+}
+
+extern "C" const char *
+cudaGetErrorString(cudaError_t error)
+{
+  return error_string(error, false);
+}
+
+extern "C" const char *
+cudaGetErrorName(cudaError_t error)
+{
+  return error_string(error, true);
+}
+
 // ---- Device memory -------------------------------------------------------
 
 extern "C" cudaError_t
@@ -333,16 +625,7 @@ cudaMallocPitch(void **devPtr, size_t *pitch, size_t width, size_t height)
     return cudaErrorInvalidValue;
   }
   FRONT_ENTER();
-  static size_t alignment = 0;
-  if (alignment == 0) {
-    int value = 0;
-    cudaError_t rc;
-    FRONT_LH(rc = REAL(cudaDeviceGetAttribute)(
-               &value, cudaDevAttrTexturePitchAlignment, current_device()));
-    alignment = (rc == cudaSuccess && value > 0) ? value : 512;
-  }
-  *pitch = (width + alignment - 1) / alignment * alignment;
-  cudaError_t rc = front_vmm_alloc(devPtr, *pitch * height);
+  cudaError_t rc = front_vmm_alloc_pitch(devPtr, pitch, width, height);
   FRONT_LEAVE();
   return rc;
 }
@@ -360,18 +643,11 @@ cudaFree(void *devPtr)
   return rc;
 }
 
-// ---- Pinned host memory: upper-half memory, registered again at restart --
+// ---- Pinned host memory --------------------------------------------------
 
 extern "C" cudaError_t
 cudaHostAlloc(void **pHost, size_t size, unsigned int flags)
 {
-  if (pHost == NULL) {
-    return cudaErrorInvalidValue;
-  }
-  if (size == 0) {
-    *pHost = NULL;
-    return cudaSuccess;
-  }
   // cudaHostAllocWriteCombined cannot be reproduced on registered memory.
   unsigned reg = 0;
   if (flags & cudaHostAllocPortable) {
@@ -380,25 +656,7 @@ cudaHostAlloc(void **pHost, size_t size, unsigned int flags)
   if (flags & cudaHostAllocMapped) {
     reg |= cudaHostRegisterMapped;
   }
-  void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (p == MAP_FAILED) {
-    return cudaErrorMemoryAllocation;
-  }
-  FRONT_ENTER();
-  cudaError_t rc;
-  FRONT_LH(rc = REAL(cudaHostRegister)(p, size, reg));
-  if (rc == cudaSuccess) {
-    std::lock_guard<std::mutex> guard(objs_lock);
-    pinned[p] = { size, reg, true };
-  }
-  FRONT_LEAVE();
-  if (rc != cudaSuccess) {
-    munmap(p, size);
-    return rc;
-  }
-  *pHost = p;
-  return cudaSuccess;
+  return (cudaError_t)front_host_alloc(pHost, size, reg, false);
 }
 
 extern "C" cudaError_t
@@ -410,55 +668,19 @@ cudaMallocHost(void **ptr, size_t size)
 extern "C" cudaError_t
 cudaFreeHost(void *ptr)
 {
-  FRONT_ENTER();
-  Pinned p = { 0, 0, false };
-  {
-    std::lock_guard<std::mutex> guard(objs_lock);
-    auto it = pinned.find(ptr);
-    if (it != pinned.end() && it->second.ours) {
-      p = it->second;
-      pinned.erase(it);
-    }
-  }
-  cudaError_t rc;
-  if (p.ours) {
-    FRONT_LH(rc = REAL(cudaHostUnregister)(ptr));
-  } else {
-    FRONT_LH(rc = REAL(cudaFreeHost)(ptr));
-  }
-  FRONT_LEAVE();
-  if (p.ours) {
-    munmap(ptr, p.size);
-  }
-  return rc;
+  return (cudaError_t)front_host_free(ptr, false);
 }
 
 extern "C" cudaError_t
 cudaHostRegister(void *ptr, size_t size, unsigned int flags)
 {
-  FRONT_ENTER();
-  cudaError_t rc;
-  FRONT_LH(rc = REAL(cudaHostRegister)(ptr, size, flags));
-  if (rc == cudaSuccess) {
-    std::lock_guard<std::mutex> guard(objs_lock);
-    pinned[ptr] = { size, flags, false };
-  }
-  FRONT_LEAVE();
-  return rc;
+  return (cudaError_t)front_host_register(ptr, size, flags, false);
 }
 
 extern "C" cudaError_t
 cudaHostUnregister(void *ptr)
 {
-  FRONT_ENTER();
-  cudaError_t rc;
-  FRONT_LH(rc = REAL(cudaHostUnregister)(ptr));
-  if (rc == cudaSuccess) {
-    std::lock_guard<std::mutex> guard(objs_lock);
-    pinned.erase(ptr);
-  }
-  FRONT_LEAVE();
-  return rc;
+  return (cudaError_t)front_host_unregister(ptr, false);
 }
 
 // ---- Streams and events --------------------------------------------------
@@ -466,62 +688,45 @@ cudaHostUnregister(void *ptr)
 extern "C" cudaError_t
 cudaStreamCreate(cudaStream_t *pStream)
 {
-  return create_stream(pStream, cudaStreamDefault, 0);
+  return (cudaError_t)front_create_stream(pStream, cudaStreamDefault, 0,
+                                          false);
 }
 
 extern "C" cudaError_t
 cudaStreamCreateWithFlags(cudaStream_t *pStream, unsigned int flags)
 {
-  return create_stream(pStream, flags, 0);
+  return (cudaError_t)front_create_stream(pStream, flags, 0, false);
 }
 
 extern "C" cudaError_t
 cudaStreamCreateWithPriority(cudaStream_t *pStream, unsigned int flags,
                              int priority)
 {
-  return create_stream(pStream, flags, priority);
+  return (cudaError_t)front_create_stream(pStream, flags, priority, false);
 }
 
 extern "C" cudaError_t
 cudaStreamDestroy(cudaStream_t stream)
 {
-  FRONT_ENTER();
-  cudaError_t rc;
-  FRONT_LH(rc = REAL(cudaStreamDestroy)(front_real_stream(stream)));
-  if (rc == cudaSuccess && (uintptr_t)stream > 2) {
-    std::lock_guard<std::mutex> guard(objs_lock);
-    unlink((FrontObj *)stream);
-    delete (Stream *)stream;
-  }
-  FRONT_LEAVE();
-  return rc;
+  return (cudaError_t)front_destroy_stream(stream, false);
 }
 
 extern "C" cudaError_t
 cudaEventCreate(cudaEvent_t *event)
 {
-  return create_event(event, cudaEventDefault);
+  return (cudaError_t)front_create_event(event, cudaEventDefault, false);
 }
 
 extern "C" cudaError_t
 cudaEventCreateWithFlags(cudaEvent_t *event, unsigned int flags)
 {
-  return create_event(event, flags);
+  return (cudaError_t)front_create_event(event, flags, false);
 }
 
 extern "C" cudaError_t
 cudaEventDestroy(cudaEvent_t event)
 {
-  FRONT_ENTER();
-  cudaError_t rc;
-  FRONT_LH(rc = REAL(cudaEventDestroy)(front_real_event(event)));
-  if (rc == cudaSuccess && event != NULL) {
-    std::lock_guard<std::mutex> guard(objs_lock);
-    unlink((FrontObj *)event);
-    delete (Event *)event;
-  }
-  FRONT_LEAVE();
-  return rc;
+  return (cudaError_t)front_destroy_event(event, false);
 }
 
 // ---- Kernels -------------------------------------------------------------
@@ -529,14 +734,14 @@ cudaEventDestroy(cudaEvent_t event)
 extern "C" void **
 __cudaRegisterFatBinary(void *fatCubin)
 {
-  FRONT_ENTER();
+  FRONT_ENTER_REGISTER();
   Fatbin *f = new Fatbin();
   f->fat_cubin = fatCubin;
   f->ended = false;
   FRONT_LH(f->real = REAL(__cudaRegisterFatBinary)(fatCubin));
   {
     std::lock_guard<std::mutex> guard(objs_lock);
-    link(f, FRONT_FATBIN);
+    obj_link(f, FRONT_FATBIN);
   }
   FRONT_LEAVE();
   return (void **)f;
@@ -545,7 +750,7 @@ __cudaRegisterFatBinary(void *fatCubin)
 extern "C" void
 __cudaRegisterFatBinaryEnd(void **fatCubinHandle)
 {
-  FRONT_ENTER();
+  FRONT_ENTER_REGISTER();
   Fatbin *f = fatbin_of(fatCubinHandle);
   FRONT_LH(REAL(__cudaRegisterFatBinaryEnd)((void **)f->real));
   f->ended = true;
@@ -555,12 +760,12 @@ __cudaRegisterFatBinaryEnd(void **fatCubinHandle)
 extern "C" void
 __cudaUnregisterFatBinary(void **fatCubinHandle)
 {
-  FRONT_ENTER();
+  FRONT_ENTER_REGISTER();
   Fatbin *f = fatbin_of(fatCubinHandle);
   FRONT_LH(REAL(__cudaUnregisterFatBinary)((void **)f->real));
   {
     std::lock_guard<std::mutex> guard(objs_lock);
-    unlink(f);
+    obj_unlink(f);
   }
   delete f;
   FRONT_LEAVE();
@@ -577,7 +782,7 @@ __cudaRegisterFunction(void **fatCubinHandle, const char *hostFun,
       wSize != NULL) {
     front_unsupported("__cudaRegisterFunction with launch bounds pointers");
   }
-  FRONT_ENTER();
+  FRONT_ENTER_REGISTER();
   Fatbin *f = fatbin_of(fatCubinHandle);
   Registration r = { false, hostFun, deviceFun, deviceName, thread_limit,
                      0, 0, 0, 0, {} };
@@ -593,7 +798,7 @@ __cudaRegisterVar(void **fatCubinHandle, char *hostVar, char *deviceAddress,
                   const char *deviceName, int ext, size_t size, int constant,
                   int global)
 {
-  FRONT_ENTER();
+  FRONT_ENTER_REGISTER();
   Fatbin *f = fatbin_of(fatCubinHandle);
   Registration r = { true, hostVar, deviceAddress, deviceName, 0, ext, size,
                      constant, global, {} };
@@ -613,7 +818,7 @@ __cudaRegisterManagedVar(void **, void **, char *, const char *, int, size_t,
 extern "C" char
 __cudaInitModule(void **fatCubinHandle)
 {
-  FRONT_ENTER();
+  FRONT_ENTER_REGISTER();
   Fatbin *f = fatbin_of(fatCubinHandle);
   char rc;
   FRONT_LH(rc = REAL(__cudaInitModule)((void **)f->real));
@@ -673,6 +878,8 @@ __cudaGetKernel(cudaKernel_t *kernel, const void *hostFun)
     cudaKernel_t real = NULL;
     FRONT_LH(rc = REAL(__cudaGetKernel)(&real, hostFun));
     if (rc == cudaSuccess) {
+      Ctx *ctx = creating_ctx();
+      front_note_cudart(ctx->device);
       std::lock_guard<std::mutex> guard(objs_lock);
       auto it = kernels.find(hostFun);
       if (it != kernels.end()) {
@@ -681,7 +888,8 @@ __cudaGetKernel(cudaKernel_t *kernel, const void *hostFun)
         k = new Kernel();
         k->real = real;
         k->host_fun = hostFun;
-        link(k, FRONT_KERNEL);
+        k->ctx = ctx;
+        obj_link(k, FRONT_KERNEL);
         kernels[hostFun] = k;
       }
     }
@@ -717,8 +925,9 @@ cudaFuncSetAttribute(const void *func, enum cudaFuncAttribute attr,
   cudaError_t rc;
   FRONT_LH(rc = REAL(cudaFuncSetAttribute)(func, attr, value));
   if (rc == cudaSuccess) {
+    int device = current_device();
     std::lock_guard<std::mutex> guard(objs_lock);
-    func_settings[{ func, (int)attr }] = { current_device(), false, value };
+    func_settings[{ func, (int)attr }] = { device, false, value };
   }
   FRONT_LEAVE();
   return rc;
@@ -731,9 +940,9 @@ cudaFuncSetCacheConfig(const void *func, enum cudaFuncCache cacheConfig)
   cudaError_t rc;
   FRONT_LH(rc = REAL(cudaFuncSetCacheConfig)(func, cacheConfig));
   if (rc == cudaSuccess) {
+    int device = current_device();
     std::lock_guard<std::mutex> guard(objs_lock);
-    func_settings[{ func, -1 }] = { current_device(), true,
-                                    (int)cacheConfig };
+    func_settings[{ func, -1 }] = { device, true, (int)cacheConfig };
   }
   FRONT_LEAVE();
   return rc;
@@ -742,75 +951,123 @@ cudaFuncSetCacheConfig(const void *func, enum cudaFuncCache cacheConfig)
 // ---- Checkpoint and restart ----------------------------------------------
 
 // __device__ and __constant__ contents, on each device used (each context
-// has its own copy).  Their addresses move at restart.
+// has its own copy), and the driver's module globals.  Their addresses move
+// at restart.
 void
 front_objs_stash()
 {
-  std::lock_guard<std::mutex> guard(objs_lock);
-  for (int device = 0; device < 64; device++) {
-    if (!(front_devices_used & (1ULL << device))) {
-      continue;
-    }
-    use_device(device);
-    for (FrontObj *o = heads[FRONT_FATBIN]; o != NULL; o = o->next) {
-      for (Registration &r : ((Fatbin *)o)->regs) {
-        if (!r.is_var || r.size == 0) {
-          continue;
+  {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    for (int device = 0; device < 64; device++) {
+      if (!(front_devices_used & (1ULL << device))) {
+        continue;
+      }
+      front_use_device(device);
+      for (FrontObj *o = obj_heads[FRONT_FATBIN]; o != NULL; o = o->next) {
+        for (Registration &r : ((Fatbin *)o)->regs) {
+          if (!r.is_var || r.size == 0) {
+            continue;
+          }
+          void *shadow = malloc(r.size);
+          cudaError_t rc;
+          FRONT_LH(rc = REAL(cudaMemcpyFromSymbol)(shadow, r.host, r.size, 0,
+                                                   cudaMemcpyDeviceToHost));
+          if (rc != cudaSuccess) {
+            front_fatal("saving %s on device %d: error %d\n", r.name, device,
+                        rc);
+          }
+          r.shadows[device] = shadow;
         }
-        void *shadow = malloc(r.size);
-        cudaError_t rc;
-        FRONT_LH(rc = REAL(cudaMemcpyFromSymbol)(shadow, r.host, r.size, 0,
-                                                 cudaMemcpyDeviceToHost));
-        if (rc != cudaSuccess) {
-          front_fatal("saving %s on device %d: error %d\n", r.name, device,
-                      rc);
-        }
-        r.shadows[device] = shadow;
       }
     }
   }
+  front_modules_stash();
 }
 
 void
 front_objs_drop_shadows()
 {
-  std::lock_guard<std::mutex> guard(objs_lock);
-  for (FrontObj *o = heads[FRONT_FATBIN]; o != NULL; o = o->next) {
-    for (Registration &r : ((Fatbin *)o)->regs) {
-      for (auto &entry : r.shadows) {
-        free(entry.second);
+  {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    for (FrontObj *o = obj_heads[FRONT_FATBIN]; o != NULL; o = o->next) {
+      for (Registration &r : ((Fatbin *)o)->regs) {
+        for (auto &entry : r.shadows) {
+          free(entry.second);
+        }
+        r.shadows.clear();
       }
-      r.shadows.clear();
     }
   }
+  front_modules_drop_shadows();
 }
 
-// Before any context exists in the new lower half.
+// Before any context exists in the new lower half.  The driver's call makes
+// no context, so the contexts come at their place in the creation order.
 void
 front_objs_restore_devices()
 {
   std::lock_guard<std::mutex> guard(objs_lock);
   for (auto &entry : device_flags) {
-    cudaError_t rc;
-    FRONT_LH(rc = REAL(cudaSetDevice)(entry.first));
-    if (rc == cudaSuccess) {
-      FRONT_LH(rc = REAL(cudaSetDeviceFlags)(entry.second));
-    }
-    if (rc != cudaSuccess) {
+    CUresult rc;
+    FRONT_LH(rc = DRV(cuDevicePrimaryCtxSetFlags_v2)(entry.first,
+                                                     entry.second));
+    if (rc != CUDA_SUCCESS) {
       front_fatal("restoring the flags of device %d: error %d\n",
                   entry.first, rc);
     }
   }
 }
 
-// In the dependency order: kernels, their attributes and globals, streams,
-// events, pinned memory.  (Device memory is already back: front_vmm.cpp.)
+static void
+restore_obj(FrontObj *o)
+{
+  CUresult rc = CUDA_SUCCESS;
+  switch (o->kind) {
+    case FRONT_DEVICE:
+      front_use_device(((DeviceInit *)o)->device);
+      break;
+    case FRONT_KERNEL: {
+      Kernel *k = (Kernel *)o;
+      front_ctx_use(k->ctx);
+      cudaError_t rrc;
+      FRONT_LH(rrc = REAL(__cudaGetKernel)((cudaKernel_t *)&k->real,
+                                           k->host_fun));
+      if (rrc != cudaSuccess) {
+        front_fatal("finding kernel %p again: error %d\n", k->host_fun, rrc);
+      }
+      break;
+    }
+    case FRONT_STREAM: {
+      Stream *s = (Stream *)o;
+      front_ctx_use(s->ctx);
+      FRONT_LH(rc = DRV(cuStreamCreateWithPriority)((CUstream *)&s->real,
+                                                    s->flags, s->priority));
+      if (rc != CUDA_SUCCESS) {
+        front_fatal("creating a stream again: error %d\n", rc);
+      }
+      break;
+    }
+    case FRONT_EVENT:
+      front_ctx_use(((Event *)o)->ctx);
+      front_event_restore((Event *)o);
+      break;
+    default:
+      front_drv_restore(o);
+  }
+}
+
+// The fatbins' registrations first, as the application's constructors made
+// them.  Then every other record, in creation order over all kinds: so the
+// driver places module data where it was, and a record comes after the
+// context that it belongs to.  Then the settings and contents.  (Device
+// memory is already mapped, and is filled last: front_vmm.cpp.)  objs_lock
+// is not held: the checkpoint thread is the only one running.
 void
 front_objs_restore()
 {
-  std::lock_guard<std::mutex> guard(objs_lock);
   cudaError_t rc;
-  for (FrontObj *o = heads[FRONT_FATBIN]; o != NULL; o = o->next) {
+  front_ctx_forget();
+  for (FrontObj *o = obj_heads[FRONT_FATBIN]; o != NULL; o = o->next) {
     Fatbin *f = (Fatbin *)o;
     FRONT_LH(f->real = REAL(__cudaRegisterFatBinary)(f->fat_cubin));
     for (Registration &r : f->regs) {
@@ -829,24 +1086,29 @@ front_objs_restore()
       FRONT_LH(REAL(__cudaRegisterFatBinaryEnd)((void **)f->real));
     }
   }
-  for (FrontObj *o = heads[FRONT_KERNEL]; o != NULL; o = o->next) {
-    Kernel *k = (Kernel *)o;
-    FRONT_LH(rc = REAL(__cudaGetKernel)((cudaKernel_t *)&k->real,
-                                        k->host_fun));
-    if (rc != cudaSuccess) {
-      front_fatal("finding kernel %p again: error %d\n", k->host_fun, rc);
+  front_open_slot();
+  std::vector<FrontObj *> order;
+  for (int kind : { FRONT_CTX, FRONT_DEVICE, FRONT_MODULE, FRONT_FUNCTION,
+                    FRONT_KERNEL, FRONT_STREAM, FRONT_EVENT }) {
+    for (FrontObj *o = obj_heads[kind]; o != NULL; o = o->next) {
+      order.push_back(o);
     }
   }
+  std::sort(order.begin(), order.end(),
+            [](FrontObj *a, FrontObj *b) { return a->seq < b->seq; });
+  for (FrontObj *o : order) {
+    restore_obj(o);
+  }
   for (auto &entry : func_settings) {
-    use_device(entry.second.device);
+    front_use_device(entry.second.device);
     set_func(entry.first.first, entry.first.second, entry.second);
   }
   for (int device = 0; device < 64; device++) {
     if (!(front_devices_used & (1ULL << device))) {
       continue;
     }
-    use_device(device);
-    for (FrontObj *o = heads[FRONT_FATBIN]; o != NULL; o = o->next) {
+    front_use_device(device);
+    for (FrontObj *o = obj_heads[FRONT_FATBIN]; o != NULL; o = o->next) {
       for (Registration &r : ((Fatbin *)o)->regs) {
         auto it = r.shadows.find(device);
         if (!r.is_var || it == r.shadows.end()) {
@@ -861,36 +1123,34 @@ front_objs_restore()
       }
     }
   }
-  for (FrontObj *o = heads[FRONT_STREAM]; o != NULL; o = o->next) {
-    Stream *s = (Stream *)o;
-    use_device(s->device);
-    FRONT_LH(rc = REAL(cudaStreamCreateWithPriority)(
-               (cudaStream_t *)&s->real, s->flags, s->priority));
-    if (rc != cudaSuccess) {
-      front_fatal("creating a stream again: error %d\n", rc);
+  for (auto &entry : symbol_addresses) {
+    front_use_device(entry.first.first);
+    void *now = NULL;
+    FRONT_LH(rc = REAL(cudaGetSymbolAddress)(&now, entry.first.second));
+    if (rc != cudaSuccess || now != entry.second) {
+      front_fatal("the __device__ variable at host address %p moved from %p "
+                  "to %p on device %d, and the application has its "
+                  "address\n", entry.first.second, entry.second, now,
+                  entry.first.first);
     }
   }
-  // An event that was never recorded completes at once, as a recorded one
-  // does after the checkpoint's synchronization.  So record each event
-  // once: waits and queries then behave as before the checkpoint.
-  for (FrontObj *o = heads[FRONT_EVENT]; o != NULL; o = o->next) {
-    Event *e = (Event *)o;
-    use_device(e->device);
-    FRONT_LH(rc = REAL(cudaEventCreateWithFlags)((cudaEvent_t *)&e->real,
-                                                 e->flags));
-    if (rc == cudaSuccess) {
-      FRONT_LH(rc = REAL(cudaEventRecord)((cudaEvent_t)e->real, NULL));
-    }
-    if (rc != cudaSuccess) {
-      front_fatal("creating an event again: error %d\n", rc);
+  for (auto &entry : peer_access) {
+    front_use_device(entry.first.first);
+    FRONT_LH(rc = REAL(cudaDeviceEnablePeerAccess)(entry.first.second,
+                                                   entry.second));
+    if (rc != cudaSuccess && rc != cudaErrorPeerAccessAlreadyEnabled) {
+      front_fatal("enabling peer access from device %d to %d again: error "
+                  "%d\n", entry.first.first, entry.first.second, rc);
     }
   }
+  CUresult drc;
   for (auto &entry : pinned) {
-    FRONT_LH(rc = REAL(cudaHostRegister)(entry.first, entry.second.size,
-                                         entry.second.flags));
-    if (rc != cudaSuccess) {
+    front_ctx_use(entry.second.ctx);
+    FRONT_LH(drc = DRV(cuMemHostRegister_v2)(entry.first, entry.second.size,
+                                             entry.second.flags));
+    if (drc != CUDA_SUCCESS) {
       front_fatal("registering host memory %p again: error %d\n",
-                  entry.first, rc);
+                  entry.first, drc);
     }
   }
   front_log("restored the CUDA objects\n");

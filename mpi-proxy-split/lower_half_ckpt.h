@@ -56,7 +56,20 @@ void wait_for_threads_to_leave_lower_half();
 void wait_for_unblocked_threads_to_leave_lower_half();
 void allow_threads_to_enter_lower_half();
 
-#define LOWER_HALF_DISABLE_CKPT() lower_half_disable_ckpt()
+// Under --cuda, nonzero while the application's synchronous CUDA copies and
+// sets may still run: an MPI call waits for them first (mpi_plugin.cpp,
+// cuda-front/front_memops.cpp).
+extern int mana_cuda_memops_pending;
+void mana_cuda_drain_memops();
+
+#define LOWER_HALF_DISABLE_CKPT()                                          \
+  do {                                                                     \
+    lower_half_disable_ckpt();                                             \
+    if (__builtin_expect(                                                  \
+          __atomic_load_n(&mana_cuda_memops_pending, __ATOMIC_RELAXED), 0)) { \
+      mana_cuda_drain_memops();                                            \
+    }                                                                      \
+  } while (0)
 #define LOWER_HALF_ENABLE_CKPT() lower_half_enable_ckpt()
 
 static inline void

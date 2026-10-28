@@ -1,0 +1,10 @@
+# The synchronous copies and sets of cudart (with their _ptds variants) that
+# may return before they are done: the next MPI call waits for them
+# (front_memops.cpp).  See gen-cuda-front.py.
+cudaMemcpy
+cudaMemcpy2D
+cudaMemcpy3D
+cudaMemcpyPeer
+cudaMemset
+cudaMemset2D
+cudaMemset3D

@@ -19,7 +19,6 @@
  *  <http://www.gnu.org/licenses/>.                                         *
  ****************************************************************************/
 
-#include <dlfcn.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -763,7 +762,15 @@ close_lower_half_except_blocked()
 
 // --cuda (MANA_CUDA=1): the application's CUDA runs in the lower half, and
 // the CUDA front (cuda-front/) saves and rebuilds it.  The front is loaded
-// only if the application uses the CUDA runtime.
+// only if the application uses CUDA; it then registers its event function.
+static mana_cuda_event_t mana_cuda_fn = NULL;
+
+extern "C" void
+mana_cuda_register(mana_cuda_event_t fn)
+{
+  __atomic_store_n(&mana_cuda_fn, fn, __ATOMIC_RELEASE);
+}
+
 static bool
 mana_cuda_enabled()
 {
@@ -774,15 +781,36 @@ mana_cuda_enabled()
 static void
 mana_cuda(int event)
 {
-  static mana_cuda_event_t fn = NULL;
-  static bool looked = false;
-  if (!looked) {
-    fn = (mana_cuda_event_t)dlsym(RTLD_DEFAULT, "mana_cuda_event");
-    looked = true;
-  }
+  mana_cuda_event_t fn = __atomic_load_n(&mana_cuda_fn, __ATOMIC_ACQUIRE);
   if (fn != NULL) {
     fn(event);
   }
+}
+
+// LOWER_HALF_DISABLE_CKPT() (lower_half_ckpt.h), in an MPI call.
+void
+mana_cuda_drain_memops()
+{
+  mana_cuda(MANA_CUDA_DRAIN_MEMOPS);
+}
+
+// DMTCP's key-value store, for the front's CUDA IPC.  From the application's
+// threads, one caller at a time: they share one socket to the coordinator.
+extern "C" int
+mana_kv_set(const char *db, const char *key, const char *val)
+{
+  return dmtcp::kvdb::set(db, key, val) == KVDBResponse::SUCCESS ? 0 : -1;
+}
+
+extern "C" int
+mana_kv_get(const char *db, const char *key, char *val, size_t size)
+{
+  dmtcp::string found;
+  if (dmtcp::kvdb::get(db, key, &found) != KVDBResponse::SUCCESS) {
+    return -1;
+  }
+  snprintf(val, size, "%s", found.c_str());
+  return 0;
 }
 
 static void
@@ -867,6 +895,10 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 
     case DMTCP_EVENT_PTHREAD_RETURN:
     case DMTCP_EVENT_PTHREAD_EXIT: {
+      if (mana_cuda_enabled()) {
+        // Under DMTCP's wrapper lock: no checkpoint can come meanwhile.
+        mana_cuda(MANA_CUDA_THREAD_EXIT);
+      }
       unregister_lower_half_thread();
       // Do we need a mutex here?
       DmtcpMutexLock(&g_upper_half_fsbase_lock);
@@ -1009,8 +1041,11 @@ mpi_plugin_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
                              // See definition in mpi-wrappers/mpi_wrappers.cpp
       if (mana_cuda_enabled()) {
         // Device memory comes back before the replay reposts receives
-        // into it.
+        // into it.  The application's CUDA IPC: every rank exports again
+        // before any maps a peer's memory.
         mana_cuda(MANA_CUDA_RESTART);
+        dmtcp_global_barrier("MPI:cuda-ipc-exported");
+        mana_cuda(MANA_CUDA_RESTART_IPC);
       }
       mana_state = RESTART_REPLAY;
       dmtcp_global_barrier("MPI:replayMpiP2pOnRestart");

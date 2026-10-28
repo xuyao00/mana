@@ -1,0 +1,106 @@
+# libcuda functions that the front forwards (with their _ptds/_ptsz
+# variants), translating streams, events, contexts, modules and functions.
+# Every other function is unsupported: many driver handles are integers
+# (memory handles, texture and surface objects), which no type shows, so a
+# new function is unsupported until it is listed.  See gen-cuda-front.py.
+
+# Initialization, devices.
+cuInit
+cuDriverGetVersion
+cuDeviceGet
+cuDeviceGetCount
+cuDeviceGetName
+cuDeviceGetUuid_v2
+cuDeviceGetLuid
+cuDeviceTotalMem_v2
+cuDeviceGetAttribute
+cuDeviceGetProperties
+cuDeviceComputeCapability
+cuDeviceGetByPCIBusId
+cuDeviceGetPCIBusId
+cuDeviceCanAccessPeer
+cuDeviceGetP2PAttribute
+cuDeviceGetTexture1DLinearMaxWidth
+cuDeviceGetExecAffinitySupport
+cuDevicePrimaryCtxGetState
+
+# The current context.
+cuCtxGetDevice
+cuCtxGetDevice_v2
+cuCtxGetFlags
+cuCtxGetApiVersion
+cuCtxSynchronize
+cuCtxSynchronize_v2
+cuCtxGetCacheConfig
+cuCtxGetSharedMemConfig
+cuCtxGetLimit
+cuCtxGetStreamPriorityRange
+cuCtxResetPersistingL2Cache
+
+# Copies and sets.
+cuMemcpy
+cuMemcpyAsync
+cuMemcpyPeer
+cuMemcpyPeerAsync
+cuMemcpyHtoD_v2
+cuMemcpyDtoH_v2
+cuMemcpyDtoD_v2
+cuMemcpyHtoDAsync_v2
+cuMemcpyDtoHAsync_v2
+cuMemcpyDtoDAsync_v2
+cuMemcpy2D_v2
+cuMemcpy2DUnaligned_v2
+cuMemcpy2DAsync_v2
+cuMemcpy3D_v2
+cuMemcpy3DAsync_v2
+cuMemsetD8_v2
+cuMemsetD16_v2
+cuMemsetD32_v2
+cuMemsetD2D8_v2
+cuMemsetD2D16_v2
+cuMemsetD2D32_v2
+cuMemsetD8Async
+cuMemsetD16Async
+cuMemsetD32Async
+cuMemsetD2D8Async
+cuMemsetD2D16Async
+cuMemsetD2D32Async
+
+# Memory queries.
+cuMemGetInfo_v2
+cuMemGetAddressRange_v2
+cuMemHostGetDevicePointer_v2
+cuMemHostGetFlags
+cuMemGetAllocationGranularity
+
+# Streams and events.
+cuStreamQuery
+cuStreamSynchronize
+cuStreamWaitEvent
+cuStreamGetFlags
+cuStreamGetPriority
+cuStreamGetDevice
+cuStreamIsCapturing
+cuStreamWriteValue32_v2
+cuStreamWriteValue64_v2
+cuStreamWaitValue32_v2
+cuStreamWaitValue64_v2
+cuStreamBatchMemOp_v2
+cuEventQuery
+cuEventSynchronize
+
+# Functions and launches.
+cuFuncGetAttribute
+cuFuncSetSharedMemConfig
+cuFuncGetParamInfo
+cuFuncIsLoaded
+cuFuncLoad
+cuLaunchKernel
+cuLaunchCooperativeKernel
+cuModuleGetLoadingMode
+
+# Others.
+cuFlushGPUDirectRDMAWrites
+cuThreadExchangeStreamCaptureMode
+cuProfilerStart
+cuProfilerStop

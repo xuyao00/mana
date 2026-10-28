@@ -1,0 +1,11 @@
+# libmana_cuda.so exports only the dispatch tables, for the front libraries'
+# trampolines, and mana_cuda_event(), for libmana.so.  The front's own
+# functions keep their CUDA names here, but stay local.
+{
+  global:
+    front_cudart_dispatch;
+    front_cuda_dispatch;
+    mana_cuda_event;
+  local:
+    *;
+};

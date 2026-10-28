@@ -28,7 +28,7 @@
 // 512 bytes) in chunks of the granularity (2 MB), as in cuda-aware-pr's
 // vmm-alloc.c: a chunk is an allocation of its own, which stays mapped.  So
 // CU_POINTER_ATTRIBUTE_RANGE_START/SIZE, and a CUDA IPC export, cover the
-// chunk.  Not yet: peer access.
+// chunk.
 
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +45,8 @@ struct Alloc {
   CUmemGenericAllocationHandle handle;  // of generation 'gen'
   void *shadow;                         // device contents during a checkpoint
   bool live;                            // false: freed, kept mapped for reuse
+  int export_fd;                        // CUDA IPC: of generation export_gen
+  unsigned export_gen;                  // 0: never exported
 };
 
 #define SMALL_MIN 512
@@ -60,7 +62,15 @@ struct Chunk {
   std::vector<size_t> requested; // per block, for the checkpoint
 };
 
+// cudaFreeAsync: a block is free once its stream has passed this event (of
+// the lower half; none is left at a checkpoint).
+struct PendingFree {
+  CUdeviceptr ptr;
+  CUevent event;
+};
+
 std::mutex vmm_lock;
+std::vector<PendingFree> pending_frees;
 CUdeviceptr va_base;
 size_t va_size;
 size_t va_top;                                 // bump offset into the range
@@ -126,6 +136,28 @@ device_granularity(int device)
   return granularity[device];
 }
 
+// Bit d of peers[x]: device d has peer access to device x's memory
+// (cudaDeviceEnablePeerAccess), so the allocator grants it to d too.
+uint64_t peers[64];
+
+// The owner and its peers may read and write [va, va + size).
+void
+set_access(CUdeviceptr va, size_t size, int device)
+{
+  CUmemAccessDesc access[64];
+  int n = 0;
+  for (int d = 0; d < 64; d++) {
+    if (d == device || (peers[device] & (1ULL << d))) {
+      memset(&access[n], 0, sizeof access[n]);
+      access[n].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+      access[n].location.id = d;
+      access[n].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+      n++;
+    }
+  }
+  DRV_CHECK(DRV(cuMemSetAccess)(va, size, access, n));
+}
+
 // Creates physical memory on 'device' and maps it at 'va'.
 CUresult
 map_physical(CUdeviceptr va, size_t size, int device,
@@ -138,11 +170,7 @@ map_physical(CUdeviceptr va, size_t size, int device,
     return rc;
   }
   DRV_CHECK(DRV(cuMemMap)(va, size, 0, *handle, 0));
-  CUmemAccessDesc access;
-  memset(&access, 0, sizeof access);
-  access.location = prop.location;
-  access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-  DRV_CHECK(DRV(cuMemSetAccess)(va, size, &access, 1));
+  set_access(va, size, device);
   return CUDA_SUCCESS;
 }
 
@@ -199,6 +227,7 @@ ready_device(int device)
       front_fatal("initializing device %d: error %d\n", device, rc);
     }
     device_ready_gen[device] = front_gen;
+    front_note_cudart(device);
   }
 }
 
@@ -206,6 +235,7 @@ ready_device(int device)
 
 static cudaError_t big_alloc_locked(void **ptr, size_t size, int device);
 static cudaError_t small_alloc_locked(void **ptr, size_t size, int device);
+static void reap_locked(bool all);
 
 cudaError_t
 front_vmm_alloc(void **ptr, size_t size)
@@ -229,10 +259,32 @@ front_vmm_alloc(void **ptr, size_t size)
   std::lock_guard<std::mutex> guard(vmm_lock);
   init_range();
   ready_device(device);
+  if (!pending_frees.empty()) {
+    reap_locked(false);
+  }
   if (size < SMALL_MAX) {
     return small_alloc_locked(ptr, size, device);
   }
   return big_alloc_locked(ptr, size, device);
+}
+
+// cudaMallocPitch, cuMemAllocPitch.
+cudaError_t
+front_vmm_alloc_pitch(void **ptr, size_t *pitch, size_t width, size_t height)
+{
+  static size_t alignment = 0;
+  if (alignment == 0) {
+    int device = 0, value = 0;
+    cudaError_t rc;
+    FRONT_LH(rc = REAL(cudaGetDevice)(&device));
+    if (rc == cudaSuccess) {
+      FRONT_LH(rc = REAL(cudaDeviceGetAttribute)(
+                 &value, cudaDevAttrTexturePitchAlignment, device));
+    }
+    alignment = (rc == cudaSuccess && value > 0) ? value : 512;
+  }
+  *pitch = (width + alignment - 1) / alignment * alignment;
+  return front_vmm_alloc(ptr, *pitch * height);
 }
 
 cudaError_t
@@ -255,7 +307,7 @@ big_alloc_locked(void **ptr, size_t size, int device)
   if (va == 0) {
     return cudaErrorMemoryAllocation;
   }
-  Alloc a = { rounded, size, device, 0, NULL, true };
+  Alloc a = { rounded, size, device, 0, NULL, true, -1, 0 };
   if (map_physical(va, rounded, device, &a.handle) != CUDA_SUCCESS) {
     give_back_va(va, rounded);
     return cudaErrorMemoryAllocation;
@@ -291,7 +343,7 @@ small_alloc_locked(void **ptr, size_t size, int device)
     if (base == 0) {
       return cudaErrorMemoryAllocation;
     }
-    Alloc a = { chunk_size, chunk_size, device, 0, NULL, true };
+    Alloc a = { chunk_size, chunk_size, device, 0, NULL, true, -1, 0 };
     if (map_physical(base, chunk_size, device, &a.handle) != CUDA_SUCCESS) {
       give_back_va(base, chunk_size);
       return cudaErrorMemoryAllocation;
@@ -320,42 +372,115 @@ small_alloc_locked(void **ptr, size_t size, int device)
   front_fatal("chunk %#llx has no free block\n", (unsigned long long)base);
 }
 
-bool
-front_vmm_free(void *ptr, cudaError_t *result)
+// Whether 'p' is a live allocation of the allocator, not being freed.
+static bool
+is_live_locked(CUdeviceptr p)
 {
-  std::unique_lock<std::mutex> guard(vmm_lock);
-  CUdeviceptr p = (CUdeviceptr)ptr;
   auto it = allocs.upper_bound(p);
   if (it == allocs.begin()) {
     return false;
   }
   --it;
+  bool live;
   auto chunk = chunks.find(it->first);
-  uint32_t index = 0;
   if (chunk != chunks.end()) {
     Chunk &c = chunk->second;
     if (p >= it->first + it->second.size || (p - it->first) % c.block != 0) {
       return false;
     }
-    index = (p - it->first) / c.block;
-    if (!(c.used[index / 64] & (1ULL << (index % 64)))) {
-      return false;  // freed already: the driver's error, as for cudaMalloc
-    }
-  } else if (it->first != p || !it->second.live) {
-    return false;
+    uint32_t index = (p - it->first) / c.block;
+    live = c.used[index / 64] & (1ULL << (index % 64));
+  } else {
+    live = it->first == p && it->second.live;
   }
-  guard.unlock();
-  // cudaFree() waits for the device's work.
-  FRONT_LH(*result = REAL(cudaDeviceSynchronize)());
-  guard.lock();
+  for (const PendingFree &f : pending_frees) {
+    live = live && f.ptr != p;
+  }
+  return live;
+}
+
+static void
+release_locked(CUdeviceptr p)
+{
+  auto it = --allocs.upper_bound(p);
+  auto chunk = chunks.find(it->first);
   if (chunk != chunks.end()) {
     Chunk &c = chunk->second;
+    uint32_t index = (p - it->first) / c.block;
     c.used[index / 64] &= ~(1ULL << (index % 64));
     c.requested[index] = 0;
     c.n_free++;
   } else {
     it->second.live = false;
   }
+}
+
+// The blocks of cudaFreeAsync that their streams have passed (all, after the
+// checkpoint's synchronization).
+static void
+reap_locked(bool all)
+{
+  for (auto it = pending_frees.begin(); it != pending_frees.end();) {
+    CUresult rc = CUDA_SUCCESS;
+    if (!all) {
+      FRONT_LH(rc = DRV(cuEventQuery)(it->event));
+    }
+    if (rc == CUDA_ERROR_NOT_READY) {
+      ++it;
+      continue;
+    }
+    FRONT_LH(DRV(cuEventDestroy_v2)(it->event));
+    release_locked(it->ptr);
+    it = pending_frees.erase(it);
+  }
+}
+
+bool
+front_vmm_free(void *ptr, cudaError_t *result)
+{
+  CUdeviceptr p = (CUdeviceptr)ptr;
+  {
+    std::lock_guard<std::mutex> guard(vmm_lock);
+    if (!is_live_locked(p)) {
+      return false;  // not ours, or freed already: the driver's error
+    }
+  }
+  // cudaFree() waits for the device's work.
+  FRONT_LH(*result = REAL(cudaDeviceSynchronize)());
+  std::lock_guard<std::mutex> guard(vmm_lock);
+  if (is_live_locked(p)) {
+    release_locked(p);
+  }
+  return true;
+}
+
+bool
+front_vmm_free_async(void *ptr, cudaStream_t real_stream, int *result)
+{
+  CUdeviceptr p = (CUdeviceptr)ptr;
+  std::unique_lock<std::mutex> guard(vmm_lock);
+  if (!is_live_locked(p)) {
+    return false;
+  }
+  CUevent event = NULL;
+  CUresult rc;
+  FRONT_LH(rc = DRV(cuEventCreate)(&event, CU_EVENT_DISABLE_TIMING));
+  if (rc == CUDA_SUCCESS) {
+    FRONT_LH(rc = DRV(cuEventRecord)(event, real_stream));
+  }
+  if (rc != CUDA_SUCCESS) {
+    // No event: wait now.
+    if (event != NULL) {
+      FRONT_LH(DRV(cuEventDestroy_v2)(event));
+    }
+    guard.unlock();
+    cudaError_t sync_rc;
+    bool ours = front_vmm_free(ptr, &sync_rc);
+    *result = sync_rc;
+    return ours;
+  }
+  pending_frees.push_back({ p, event });
+  *result = 0;
   return true;
 }
 
@@ -363,6 +488,7 @@ void
 front_vmm_stash()
 {
   std::lock_guard<std::mutex> guard(vmm_lock);
+  reap_locked(true);
   size_t bytes = 0;
   for (auto &entry : allocs) {
     Alloc &a = entry.second;
@@ -410,11 +536,11 @@ front_vmm_drop_shadows()
   }
 }
 
-// At restart, in the new lower half: the same range, then new physical
-// memory at each live allocation, filled from its shadow.  Freed chunks are
-// not kept.
+// At restart, in the new lower half, before any context exists: the same
+// range, and new physical memory at each live allocation (VMM calls need no
+// context).  Freed chunks are not kept.
 void
-front_vmm_restore()
+front_vmm_map()
 {
   std::lock_guard<std::mutex> guard(vmm_lock);
   for (int i = 0; i < 64; i++) {
@@ -436,27 +562,134 @@ front_vmm_restore()
       continue;
     }
     Alloc &a = it->second;
-    cudaError_t rc;
-    FRONT_LH(rc = REAL(cudaSetDevice)(a.device));
-    if (rc != cudaSuccess) {
-      front_fatal("restoring device memory on device %d: error %d\n",
-                  a.device, rc);
-    }
-    ready_device(a.device);
     if (map_physical(it->first, a.size, a.device, &a.handle) !=
         CUDA_SUCCESS) {
       front_fatal("no device memory for %zu bytes at %#llx on device %d\n",
                   a.size, (unsigned long long)it->first, a.device);
     }
-    if (a.shadow != NULL) {
-      FRONT_LH(rc = REAL(cudaMemcpy)((void *)it->first, a.shadow,
+    ++it;
+  }
+}
+
+static bool
+export_locked(CUdeviceptr base, Alloc &a)
+{
+  if (a.export_gen == front_gen) {
+    return true;
+  }
+  int fd = -1;
+  CUresult rc;
+  FRONT_LH(rc = DRV(cuMemExportToShareableHandle)(
+             &fd, a.handle, CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0));
+  if (rc != CUDA_SUCCESS) {
+    front_log("exporting %#llx: error %d\n", (unsigned long long)base, rc);
+    return false;
+  }
+  a.export_fd = fd;
+  a.export_gen = front_gen;
+  return true;
+}
+
+// A live allocation, or the base of a chunk of small ones: as natively, a
+// handle stands for the allocation that holds the pointer, which
+// cuMemGetAddressRange gives.
+bool
+front_vmm_export(void *ptr, FrontExport *out)
+{
+  std::lock_guard<std::mutex> guard(vmm_lock);
+  CUdeviceptr p = (CUdeviceptr)ptr;
+  auto it = allocs.find(p);
+  bool chunk_base = it != allocs.end() && chunks.count(p) != 0;
+  if (!chunk_base && !is_live_locked(p)) {
+    return false;
+  }
+  it = --allocs.upper_bound(p);
+  if (!export_locked(it->first, it->second)) {
+    return false;
+  }
+  *out = { it->first, it->second.size, it->second.export_fd };
+  return true;
+}
+
+void
+front_vmm_reexport(void (*publish)(const FrontExport &))
+{
+  std::lock_guard<std::mutex> guard(vmm_lock);
+  for (auto &entry : allocs) {
+    Alloc &a = entry.second;
+    if (a.export_gen != 0 && export_locked(entry.first, a)) {
+      publish({ entry.first, a.size, a.export_fd });
+    }
+  }
+}
+
+CUdeviceptr
+front_vmm_take_va(size_t size)
+{
+  std::lock_guard<std::mutex> guard(vmm_lock);
+  init_range();
+  return take_va(size);
+}
+
+void
+front_vmm_give_back_va(CUdeviceptr va, size_t size)
+{
+  std::lock_guard<std::mutex> guard(vmm_lock);
+  give_back_va(va, size);
+}
+
+// Peer access from 'device' to 'peer''s memory, on or off: also for the
+// memory that is mapped already.
+void
+front_vmm_peer_access(int device, int peer, bool on)
+{
+  if (device < 0 || device >= 64 || peer < 0 || peer >= 64) {
+    return;
+  }
+  std::lock_guard<std::mutex> guard(vmm_lock);
+  if (on) {
+    peers[peer] |= 1ULL << device;
+  } else {
+    peers[peer] &= ~(1ULL << device);
+  }
+  for (auto &entry : allocs) {
+    if (entry.second.device != peer) {
+      continue;
+    }
+    set_access(entry.first, entry.second.size, peer);
+    if (!on) {
+      CUmemAccessDesc none;
+      memset(&none, 0, sizeof none);
+      none.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+      none.location.id = device;
+      none.flags = CU_MEM_ACCESS_FLAGS_PROT_NONE;
+      DRV_CHECK(DRV(cuMemSetAccess)(entry.first, entry.second.size, &none,
+                                    1));
+    }
+  }
+}
+
+// Last at restart: the contents, once cudart's contexts are back.
+void
+front_vmm_fill()
+{
+  std::lock_guard<std::mutex> guard(vmm_lock);
+  for (auto &entry : allocs) {
+    Alloc &a = entry.second;
+    if (a.shadow == NULL) {
+      continue;
+    }
+    cudaError_t rc;
+    FRONT_LH(rc = REAL(cudaSetDevice)(a.device));
+    if (rc == cudaSuccess) {
+      ready_device(a.device);
+      FRONT_LH(rc = REAL(cudaMemcpy)((void *)entry.first, a.shadow,
                                      a.requested, cudaMemcpyHostToDevice));
     }
     if (rc != cudaSuccess) {
       front_fatal("restoring device memory at %#llx: error %d\n",
-                  (unsigned long long)it->first, rc);
+                  (unsigned long long)entry.first, rc);
     }
-    ++it;
   }
   front_log("restored %zu allocations\n", allocs.size());
 }

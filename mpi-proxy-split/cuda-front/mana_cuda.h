@@ -19,8 +19,9 @@
  ****************************************************************************/
 
 // What libmana.so (mpi_plugin.cpp) asks of the CUDA front under --cuda:
-// mana_cuda_event(event), on the checkpoint thread.  The front is loaded
-// only if the application uses the CUDA runtime.
+// mana_cuda_event(event), on the checkpoint thread, except for
+// MANA_CUDA_THREAD_EXIT and MANA_CUDA_DRAIN_MEMOPS.  The front is loaded only
+// if the application uses CUDA.
 
 #ifndef _MANA_CUDA_H
 #define _MANA_CUDA_H
@@ -30,6 +31,9 @@ enum ManaCudaEvent {
   MANA_CUDA_STASH,         // then, after a global barrier: save device data
   MANA_CUDA_RESUME,        // RESUME: free the saved device data
   MANA_CUDA_RESTART,       // RESTART, before the P2P replay: rebuild
+  MANA_CUDA_THREAD_EXIT,   // PTHREAD_RETURN or _EXIT, on the exiting thread
+  MANA_CUDA_DRAIN_MEMOPS,  // an MPI call: wait for pending copies and sets
+  MANA_CUDA_RESTART_IPC,   // after MANA_CUDA_RESTART and a global barrier
 };
 
 typedef void (*mana_cuda_event_t)(int event);

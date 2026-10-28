@@ -1,0 +1,86 @@
+# libcuda functions that the front defines by hand (front_drv.cpp).  See
+# gen-cuda-front.py.
+
+# Contexts: records, and a copy of each thread's context stack.
+cuCtxCreate_v2
+cuCtxCreate_v4
+cuCtxDestroy_v2
+cuCtxPushCurrent_v2
+cuCtxPopCurrent_v2
+cuCtxSetCurrent
+cuCtxGetCurrent
+cuCtxSetLimit
+cuCtxSetCacheConfig
+cuDevicePrimaryCtxRetain
+cuDevicePrimaryCtxRelease_v2
+cuDevicePrimaryCtxSetFlags_v2
+cuStreamGetCtx
+cuStreamGetCtx_ptsz
+
+# Memory: the VMM allocator, and pinned upper-half memory.
+cuMemAlloc_v2
+cuMemAllocPitch_v2
+cuMemFree_v2
+cuMemAllocHost_v2
+cuMemHostAlloc
+cuMemFreeHost
+cuMemHostRegister_v2
+cuMemHostUnregister
+cuPointerGetAttribute
+cuPointerGetAttributes
+
+# Modules and functions: records, with a copy of the image.
+cuModuleLoad
+cuModuleLoadData
+cuModuleLoadDataEx
+cuModuleLoadFatBinary
+cuModuleUnload
+cuModuleGetFunction
+cuModuleGetGlobal_v2
+cuFuncSetAttribute
+cuFuncSetCacheConfig
+cuFuncGetModule
+
+# Streams and events: the same records as the runtime's.
+cuStreamCreate
+cuStreamCreateWithPriority
+cuStreamDestroy_v2
+cuEventCreate
+cuEventDestroy_v2
+
+# Strings copied into the upper half; the front's functions for entry points.
+cuGetErrorString
+cuGetErrorName
+cuGetProcAddress_v2
+
+# Host functions, stream-ordered allocation, the default pools, event times
+# (front_async.cpp).
+cuLaunchHostFunc
+cuLaunchHostFunc_ptsz
+cuStreamAddCallback
+cuStreamAddCallback_ptsz
+cuMemAllocAsync
+cuMemAllocAsync_ptsz
+cuMemAllocFromPoolAsync
+cuMemAllocFromPoolAsync_ptsz
+cuMemFreeAsync
+cuMemFreeAsync_ptsz
+cuDeviceGetDefaultMemPool
+cuDeviceGetMemPool
+cuMemPoolSetAttribute
+cuMemPoolGetAttribute
+cuMemPoolTrimTo
+cuEventRecord
+cuEventRecord_ptsz
+cuEventRecordWithFlags
+cuEventRecordWithFlags_ptsz
+cuEventElapsedTime_v2
+
+# The application's CUDA IPC (front_ipc.cpp).
+cuIpcGetMemHandle
+cuIpcOpenMemHandle_v2
+cuIpcCloseMemHandle
+
+# Peer access, kept across restarts.
+cuCtxEnablePeerAccess
+cuCtxDisablePeerAccess

@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #endif
 #include <linux/futex.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -23,6 +24,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <algorithm>
+#include <map>
 #include <vector>
 
 #include "mtcp_header.h"
@@ -183,13 +185,72 @@ create_lh_thread_for_extra_tls()
   lh_info->ckpt_fsaddr = create_parked_lh_thread(64 * 1024);
 }
 
-// --cuda: a TLS for one more upper-half thread that calls CUDA (see
-// lh_info->cuda_new_tls).  The stack holds glibc's TLS of the lower half's
-// libraries, CUDA's among them.
+// --cuda: a donor lends its TLS to one upper-half thread that calls CUDA
+// (lh_info->cuda_new_tls).  When that thread exits (lh_info->cuda_free_tls),
+// the donor exits too, and CUDA's per-thread state goes with its TLS, as it
+// does for a native thread.  Signals stay blocked: DMTCP does not know the
+// donors, and they are not saved.
+struct CudaDonor {
+  unsigned long fs;
+  int done;
+};
+
+static std::map<unsigned long, CudaDonor *> cuda_donors;  // by FS
+
+static void *
+lh_cuda_donor(void *arg)
+{
+  CudaDonor *donor = (CudaDonor *)arg;
+  unsigned long fs = 0;
+  syscall(SYS_arch_prctl, ARCH_GET_FS, &fs);
+  __atomic_store_n(&donor->fs, fs, __ATOMIC_RELEASE);
+  while (!__atomic_load_n(&donor->done, __ATOMIC_ACQUIRE)) {
+    syscall(SYS_futex, &donor->done, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
+  }
+  delete donor;
+  return NULL;
+}
+
+// The stack holds glibc's TLS of the lower half's libraries, CUDA's among
+// them.
 static void *
 lh_cuda_new_tls()
 {
-  return create_parked_lh_thread(256 * 1024);
+  CudaDonor *donor = new CudaDonor();
+  sigset_t all, old;
+  pthread_t thread;
+  pthread_attr_t attr;
+  sigfillset(&all);
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 256 * 1024);
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  pthread_sigmask(SIG_SETMASK, &all, &old);
+  int rc = pthread_create(&thread, &attr, lh_cuda_donor, donor);
+  pthread_sigmask(SIG_SETMASK, &old, NULL);
+  pthread_attr_destroy(&attr);
+  if (rc != 0) {
+    delete donor;
+    return NULL;
+  }
+  unsigned long fs;
+  while ((fs = __atomic_load_n(&donor->fs, __ATOMIC_ACQUIRE)) == 0) {
+    sched_yield();
+  }
+  cuda_donors[fs] = donor;
+  return (void *)fs;
+}
+
+static void
+lh_cuda_free_tls(void *fs)
+{
+  auto it = cuda_donors.find((unsigned long)fs);
+  if (it == cuda_donors.end()) {
+    return;
+  }
+  CudaDonor *donor = it->second;
+  cuda_donors.erase(it);
+  __atomic_store_n(&donor->done, 1, __ATOMIC_RELEASE);
+  syscall(SYS_futex, &donor->done, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
 }
 
 static void *
@@ -208,6 +269,71 @@ lh_cuda_dlsym(const char *library, const char *symbol)
 #define MANA_CUDA_VMM_BASE 0x200000000000ULL
 #define MANA_CUDA_VMM_SIZE (1ULL << 40)
 
+// --cuda: the driver places its device heap, from which module data come,
+// when the process makes its first context: below the lowest mapping then
+// (cuda/experiments/lh-probes).  The application may hold the addresses of
+// module data, so the first context must see the same address space at
+// launch and at restart.  So, at the same point of both (after MPI_Init),
+// the gaps of the top-down mapping area are plugged and a slot is reserved
+// below them: later mappings of the lower half go below the slot.  The
+// front releases it all right before the first context
+// (lh_info->cuda_open_slot).
+#define MANA_CUDA_SLOT_SIZE (4ULL << 30)
+
+static std::vector<std::pair<char *, size_t> > cuda_slot;  // and the plugs
+
+static void
+reserve_cuda_slot(unsigned long long above)
+{
+  FILE *maps = fopen("/proc/self/maps", "r");
+  if (maps == NULL) {
+    return;
+  }
+  // The top-down area: from the lowest mapping above 'above' to the highest
+  // one below the stack.  The gap under the stack is the stack's.
+  std::vector<std::pair<unsigned long, unsigned long> > areas;
+  char line[4096];
+  while (fgets(line, sizeof line, maps) != NULL) {
+    unsigned long start, end;
+    if (sscanf(line, "%lx-%lx", &start, &end) == 2 && start >= above &&
+        strstr(line, "[stack]") == NULL && strstr(line, "[vvar") == NULL &&
+        strstr(line, "[vdso]") == NULL && strstr(line, "[vsyscall]") == NULL) {
+      areas.push_back(std::make_pair(start, end));
+    }
+  }
+  fclose(maps);
+  if (areas.empty()) {
+    return;
+  }
+  for (size_t i = 0; i + 1 < areas.size(); i++) {
+    size_t gap = areas[i + 1].first - areas[i].second;
+    if (gap == 0) {
+      continue;
+    }
+    void *plug = mmap((void *)areas[i].second, gap, PROT_NONE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE |
+                      MAP_FIXED_NOREPLACE, -1, 0);
+    if (plug != MAP_FAILED) {
+      cuda_slot.push_back(std::make_pair((char *)plug, gap));
+    }
+  }
+  char *slot = (char *)areas[0].first - MANA_CUDA_SLOT_SIZE;
+  if (mmap(slot, MANA_CUDA_SLOT_SIZE, PROT_NONE,
+           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE,
+           -1, 0) != MAP_FAILED) {
+    cuda_slot.push_back(std::make_pair(slot, (size_t)MANA_CUDA_SLOT_SIZE));
+  }
+}
+
+static void
+lh_cuda_open_slot()
+{
+  for (auto &area : cuda_slot) {
+    munmap(area.first, area.second);
+  }
+  cuda_slot.clear();
+}
+
 static unsigned long long
 env_ull(const char *name, unsigned long long dflt)
 {
@@ -220,11 +346,34 @@ env_ull(const char *name, unsigned long long dflt)
 // This runs after MPI_Init, at launch and at restart alike: a CUDA-aware MPI
 // has initialized CUDA, and the driver's early mappings come back at the
 // same addresses.  No context is needed (cuda/experiments/lh-probes).
+static bool
+cuda_requested()
+{
+  const char *cuda = getenv("MANA_CUDA");
+  return cuda != NULL && cuda[0] != '\0' && strcmp(cuda, "0") != 0;
+}
+
+// --cuda, before MPI_Init, which may start CUDA: what the driver maps from
+// the first context on must not depend on the process's history or on the
+// timing of its threads (see reserve_cuda_slot()).  A PTX JIT that hits its
+// cache at restart allocates otherwise than at launch.  And malloc() maps
+// large blocks top-down, at the time a thread asks: with the largest
+// threshold, blocks under 32 MB come from the brk heap instead, outside the
+// area where the driver maps.
+static void
+prepare_lower_half_cuda()
+{
+  if (!cuda_requested()) {
+    return;
+  }
+  setenv("CUDA_CACHE_DISABLE", "1", 0);
+  mallopt(M_MMAP_THRESHOLD, 32 * 1024 * 1024);
+}
+
 static void
 init_lower_half_cuda()
 {
-  const char *cuda = getenv("MANA_CUDA");
-  if (cuda == NULL || cuda[0] == '\0' || strcmp(cuda, "0") == 0) {
+  if (!cuda_requested()) {
     return;
   }
   typedef int (*cuInit_t)(unsigned int);
@@ -253,10 +402,17 @@ init_lower_half_cuda()
             "to a free range.\n", base, size, rc, va);
     exit(1);
   }
+  // A thread's first malloc may map a new arena (64 MB), which would land in
+  // the slot by the history of the lower half's threads: keep one arena.
+  // (The upper half's malloc is another glibc's.)
+  mallopt(M_ARENA_MAX, 1);
+  reserve_cuda_slot(base + size);
+  lh_info->cuda_open_slot = (void *)&lh_cuda_open_slot;
   lh_info->cuda_vmm_base = base;
   lh_info->cuda_vmm_size = size;
   lh_info->cuda_dlsym = (void *)&lh_cuda_dlsym;
   lh_info->cuda_new_tls = (void *)&lh_cuda_new_tls;
+  lh_info->cuda_free_tls = (void *)&lh_cuda_free_tls;
   lh_info->cuda_tls_factory_fs = create_parked_lh_thread(256 * 1024);
   if (lh_info->cuda_tls_factory_fs == NULL) {
     fprintf(stderr, "MANA: --cuda: cannot create a lower-half thread\n");
@@ -295,6 +451,7 @@ int main(int argc, char *argv[], char *envp[]) {
                    ? MPI_THREAD_MULTIPLE : MPI_THREAD_SINGLE;
   int provided = MPI_THREAD_SINGLE;
   reserve_restart_fds();
+  prepare_lower_half_cuda();
   MPI_Init_thread(&argc, &argv, required, &provided);
   if (required == MPI_THREAD_MULTIPLE && provided == MPI_THREAD_MULTIPLE) {
     create_lh_thread_for_extra_tls();

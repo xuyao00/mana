@@ -6,22 +6,11 @@
 # They reset or tear down the device, or share it with other processes.
 cudaDeviceReset
 cudaThreadExit
-cudaIpcGetMemHandle
-cudaIpcOpenMemHandle
-cudaIpcCloseMemHandle
 cudaIpcGetEventHandle
 cudaIpcOpenEventHandle
-cudaDeviceEnablePeerAccess
-cudaDeviceDisablePeerAccess
 
 # Memory that the VMM allocator does not make yet.
 cudaMallocManaged
-cudaMallocAsync
-cudaMallocAsync_ptsz
-cudaFreeAsync
-cudaFreeAsync_ptsz
-cudaMallocFromPoolAsync
-cudaMallocFromPoolAsync_ptsz
 cudaMalloc3D
 
 # Their structures hold handles, or they hand out lower-half pointers.
@@ -29,8 +18,6 @@ cudaLaunchKernelExC
 cudaLaunchKernelExC_ptsz
 cudaLaunchCooperativeKernelMultiDevice
 cudaGetExportTable
-cudaGetDriverEntryPoint
-cudaGetDriverEntryPointByVersion
 
 # Texture and surface values must come back exactly (fillers, Phase 2).
 cudaCreateTextureObject

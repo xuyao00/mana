@@ -29,6 +29,7 @@
 
 __thread LowerHalfThread lh_thread ATTR_TLS_INITIAL_EXEC;
 bool lower_half_closed = false;
+int mana_cuda_memops_pending = 0;
 
 // Every thread that has used LOWER_HALF_DISABLE_CKPT().
 static LowerHalfThread *threads = NULL;

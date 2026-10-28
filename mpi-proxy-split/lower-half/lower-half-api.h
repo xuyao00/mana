@@ -210,10 +210,16 @@ typedef struct _LowerHalfInfo
   // in the lower half; a NULL library means the global scope.
   void *cuda_dlsym;
   // void *(*)(void): the FS of a new parked lower-half thread, which lends
-  // its TLS to one upper-half thread.  Call it with FS set to
+  // its TLS to one upper-half thread.  void (*)(void *fs): the upper-half
+  // thread exits; so does the lower-half one.  Call them with FS set to
   // cuda_tls_factory_fs, one caller at a time.
   void *cuda_new_tls;
+  void *cuda_free_tls;
   void *cuda_tls_factory_fs;
+  // void (*)(void): releases the address space that the first context of
+  // the process gets (reserve_cuda_slot()); call it right before that, with
+  // any lower-half FS.
+  void *cuda_open_slot;
 } LowerHalfInfo_t;
 
 extern LowerHalfInfo_t *lh_info;

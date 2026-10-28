@@ -1,7 +1,13 @@
-# cudart functions that the front defines by hand (front_objs.cpp).  The
-# generator makes nothing for them.  See gen-cuda-front.py.
+# cudart functions that the front defines by hand (front_objs.cpp,
+# front_drv.cpp).  See gen-cuda-front.py.
 cudaSetDevice
 cudaSetDeviceFlags
+cudaDeviceSetLimit
+cudaDeviceSetCacheConfig
+cudaGetErrorString
+cudaGetErrorName
+cudaGetDriverEntryPoint
+cudaGetDriverEntryPointByVersion
 cudaMalloc
 cudaMallocPitch
 cudaFree
@@ -31,3 +37,36 @@ __cudaPopCallConfiguration
 __cudaGetKernel
 __cudaLaunchKernel
 __cudaLaunchKernel_ptsz
+
+# Host functions, stream-ordered allocation, the default pools, event times
+# (front_async.cpp).
+cudaLaunchHostFunc
+cudaLaunchHostFunc_ptsz
+cudaStreamAddCallback
+cudaStreamAddCallback_ptsz
+cudaMallocAsync
+cudaMallocAsync_ptsz
+cudaMallocFromPoolAsync
+cudaMallocFromPoolAsync_ptsz
+cudaFreeAsync
+cudaFreeAsync_ptsz
+cudaDeviceGetDefaultMemPool
+cudaDeviceGetMemPool
+cudaMemPoolSetAttribute
+cudaMemPoolGetAttribute
+cudaMemPoolTrimTo
+cudaEventRecord
+cudaEventRecord_ptsz
+cudaEventRecordWithFlags
+cudaEventRecordWithFlags_ptsz
+cudaEventElapsedTime
+
+# The application's CUDA IPC (front_ipc.cpp).
+cudaIpcGetMemHandle
+cudaIpcOpenMemHandle
+cudaIpcCloseMemHandle
+
+# Peer access, kept across restarts; __device__ addresses, checked there.
+cudaDeviceEnablePeerAccess
+cudaDeviceDisablePeerAccess
+cudaGetSymbolAddress

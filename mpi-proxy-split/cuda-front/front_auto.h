@@ -18,8 +18,8 @@
  *  <http://www.gnu.org/licenses/>.                                         *
  ****************************************************************************/
 
-// The generated functions of a front library (gen-cuda-front.py): each
-// exported function jumps through the library's dispatch table to
+// The dispatch tables of the front libraries (gen-cuda-front.py): each
+// exported function jumps through its library's table to an own function, to
 // FrontAuto<decltype(f)>::call, or to front_unsupported_at().
 
 #ifndef _MANA_CUDA_FRONT_AUTO_H
@@ -47,15 +47,18 @@ front_is_handle()
 }
 
 // Whether the front can forward a parameter of type T as it is (after
-// translating streams and events).  Not: other handles, pointers to handles
-// (results), and callbacks, which run on the lower half's threads.
+// translating streams, events, contexts, modules and functions).  Not: other
+// handles, pointers to handles (results), and callbacks, which run on the
+// lower half's threads.
 template <typename T>
 constexpr bool
 front_arg_ok()
 {
   using U = std::remove_cv_t<T>;
   if constexpr (std::is_same_v<U, cudaStream_t> ||
-                std::is_same_v<U, cudaEvent_t>) {
+                std::is_same_v<U, cudaEvent_t> ||
+                std::is_same_v<U, CUcontext> || std::is_same_v<U, CUmodule> ||
+                std::is_same_v<U, CUfunction>) {
     return true;
   } else if constexpr (front_is_handle<U>()) {
     return false;
@@ -83,6 +86,24 @@ static inline cudaEvent_t
 front_translate(cudaEvent_t event)
 {
   return front_real_event(event);
+}
+
+static inline CUcontext
+front_translate(CUcontext ctx)
+{
+  return (CUcontext)front_real_obj(ctx, FRONT_CTX);
+}
+
+static inline CUmodule
+front_translate(CUmodule module)
+{
+  return (CUmodule)front_real_obj(module, FRONT_MODULE);
+}
+
+static inline CUfunction
+front_translate(CUfunction function)
+{
+  return (CUfunction)front_real_obj(function, FRONT_FUNCTION);
 }
 
 template <typename T>
@@ -135,6 +156,28 @@ struct FrontAuto<R(A...), L, I> {
   }
 };
 
+// A synchronous copy or set (--memops): see front_memops.cpp.
+template <typename F, FrontLib *L, int I, bool PTDS>
+struct FrontAutoMemop;
+
+template <typename R, typename... A, FrontLib *L, int I, bool PTDS>
+struct FrontAutoMemop<R(A...), L, I, PTDS> {
+  static_assert((front_arg_ok<A>() && ...), "a memop the front can forward");
+
+  static R call(A... args)
+  {
+    FRONT_ENTER();
+    front_check_bound(L);
+    using Fn = R (*)(A...);
+    R ret = front_call_lh((Fn)L->real[I], front_translate(args)...);
+    if (ret == 0) {
+      front_order_memop(PTDS);
+    }
+    FRONT_LEAVE();
+    return ret;
+  }
+};
+
 template <FrontLib *L, int I>
 [[noreturn]] static void
 front_unsupported_at()
@@ -142,13 +185,15 @@ front_unsupported_at()
   front_unsupported(L->names[I]);
 }
 
+// An own function is defined in libmana_cuda.so under its own name; the
+// version script keeps it local there.
+#define FRONT_OWN(name) (void *)&::name
 #define FRONT_AUTO(prefix, base, index) \
   (void *)&FrontAuto<decltype(::base), &front_##prefix##_lib, index>::call
+#define FRONT_AUTO_MEMOP(prefix, base, index, ptds)                      \
+  (void *)&FrontAutoMemop<decltype(::base), &front_##prefix##_lib, index, \
+                          ptds>::call
 #define FRONT_UNSUPPORTED(prefix, index) \
   (void *)&front_unsupported_at<&front_##prefix##_lib, index>
-
-// Defined in the generated file; declared before the table uses them.
-extern FrontLib front_cudart_lib FRONT_HIDDEN;
-extern FrontLib front_cuda_lib FRONT_HIDDEN;
 
 #endif  // ifndef _MANA_CUDA_FRONT_AUTO_H
