@@ -1,12 +1,10 @@
 # The synchronous copies and sets of libcuda (with their _ptds variants) that
 # may return before they are done: the next MPI call waits for them
-# (front_memops.cpp).  See gen-cuda-front.py.
+# (front_memops.cpp).  See gen-cuda-front.py.  cuMemcpy2D and cuMemcpy3D, own
+# functions, do it themselves (front_arrays.cpp).
 cuMemcpy
 cuMemcpyHtoD_v2
 cuMemcpyDtoD_v2
-cuMemcpy2D_v2
-cuMemcpy2DUnaligned_v2
-cuMemcpy3D_v2
 cuMemcpyPeer
 cuMemsetD8_v2
 cuMemsetD16_v2

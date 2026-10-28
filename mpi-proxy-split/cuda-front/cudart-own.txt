@@ -70,3 +70,26 @@ cudaIpcCloseMemHandle
 cudaDeviceEnablePeerAccess
 cudaDeviceDisablePeerAccess
 cudaGetSymbolAddress
+
+# CUDA arrays, the copies whose structures hold them, texture and surface
+# objects (front_arrays.cpp).
+cudaMallocArray
+cudaMalloc3DArray
+cudaFreeArray
+cudaMallocMipmappedArray
+cudaFreeMipmappedArray
+cudaGetMipmappedArrayLevel
+cudaMemcpy3D
+cudaMemcpy3D_ptds
+cudaMemcpy3DAsync
+cudaMemcpy3DAsync_ptsz
+cudaMemcpy3DPeer
+cudaMemcpy3DPeer_ptds
+cudaMemcpy3DPeerAsync
+cudaMemcpy3DPeerAsync_ptsz
+cudaCreateTextureObject
+cudaDestroyTextureObject
+cudaCreateSurfaceObject
+cudaDestroySurfaceObject
+cudaGetTextureObjectResourceDesc
+cudaGetSurfaceObjectResourceDesc

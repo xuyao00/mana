@@ -337,20 +337,22 @@ elapsed_time(float *ms, cudaEvent_t start, cudaEvent_t end, Elapsed call)
   }
   Event *s = event_of(start);
   Event *e = event_of(end);
+  // Within the gate: a checkpoint changes the saved times.
+  FRONT_ENTER();
+  int rc = 0;
   if (s->time_saved && e->time_saved) {
     *ms = s->before_ref - e->before_ref;
-    return 0;
+  } else {
+    rc = call(ms, front_real_event(start), front_real_event(end));
+    // A restored event stands where the restart recorded it: as if the
+    // checkpoint took no time.
+    if (rc == 0 && s->time_saved) {
+      *ms += s->before_ref;
+    } else if (rc == 0 && e->time_saved) {
+      *ms -= e->before_ref;
+    }
   }
-  FRONT_ENTER();
-  int rc = call(ms, front_real_event(start), front_real_event(end));
   FRONT_LEAVE();
-  // A restored event stands where the restart recorded it: as if the
-  // checkpoint took no time.
-  if (rc == 0 && s->time_saved) {
-    *ms += s->before_ref;
-  } else if (rc == 0 && e->time_saved) {
-    *ms -= e->before_ref;
-  }
   return rc;
 }
 
@@ -438,6 +440,8 @@ front_events_quiesce()
     } else {
       FRONT_LH(rc = DRV(cuEventElapsedTime_v2)(&ms, (CUevent)e->real, ref));
     }
+    front_log("event %p: %d, %f ms before the reference%s\n", (void *)e, rc,
+              ms, e->time_saved ? " (restored)" : "");
     if (rc != CUDA_SUCCESS) {
       continue;  // not recorded yet: no time
     }

@@ -85,7 +85,8 @@ front_bad_handle(const void *handle, int kind)
 {
   static const char *const kinds[] = { "", "stream", "event", "kernel",
                                        "fatbin", "context", "module",
-                                       "function", "device" };
+                                       "function", "device", "CUDA array",
+                                       "mipmapped array", "texture object" };
   front_fatal("%p is not a %s that the front made\n", handle,
               kind > 0 && kind < FRONT_N_KINDS ? kinds[kind] : "handle");
 }

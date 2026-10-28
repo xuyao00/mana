@@ -48,11 +48,6 @@ cuMemcpyDtoD_v2
 cuMemcpyHtoDAsync_v2
 cuMemcpyDtoHAsync_v2
 cuMemcpyDtoDAsync_v2
-cuMemcpy2D_v2
-cuMemcpy2DUnaligned_v2
-cuMemcpy2DAsync_v2
-cuMemcpy3D_v2
-cuMemcpy3DAsync_v2
 cuMemsetD8_v2
 cuMemsetD16_v2
 cuMemsetD32_v2
@@ -65,6 +60,21 @@ cuMemsetD32Async
 cuMemsetD2D8Async
 cuMemsetD2D16Async
 cuMemsetD2D32Async
+
+# CUDA arrays and texture objects (by value; the records translate them).
+cuMemcpyHtoA_v2
+cuMemcpyAtoH_v2
+cuMemcpyAtoD_v2
+cuMemcpyDtoA_v2
+cuMemcpyAtoA_v2
+cuMemcpyHtoAAsync_v2
+cuMemcpyAtoHAsync_v2
+cuArrayGetDescriptor_v2
+cuArray3DGetDescriptor_v2
+cuArrayGetMemoryRequirements
+cuMipmappedArrayGetMemoryRequirements
+cuTexObjectGetTextureDesc
+cuTexObjectGetResourceViewDesc
 
 # Memory queries.
 cuMemGetInfo_v2

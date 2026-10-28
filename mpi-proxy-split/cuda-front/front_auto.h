@@ -47,7 +47,8 @@ front_is_handle()
 }
 
 // Whether the front can forward a parameter of type T as it is (after
-// translating streams, events, contexts, modules and functions).  Not: other
+// translating streams, events, contexts, modules, functions and arrays).
+// Not: other
 // handles, pointers to handles (results), and callbacks, which run on the
 // lower half's threads.
 template <typename T>
@@ -58,7 +59,13 @@ front_arg_ok()
   if constexpr (std::is_same_v<U, cudaStream_t> ||
                 std::is_same_v<U, cudaEvent_t> ||
                 std::is_same_v<U, CUcontext> || std::is_same_v<U, CUmodule> ||
-                std::is_same_v<U, CUfunction>) {
+                std::is_same_v<U, CUfunction> ||
+                std::is_same_v<U, cudaArray_t> ||
+                std::is_same_v<U, cudaArray_const_t> ||
+                std::is_same_v<U, CUarray> ||
+                std::is_same_v<U, cudaMipmappedArray_t> ||
+                std::is_same_v<U, cudaMipmappedArray_const_t> ||
+                std::is_same_v<U, CUmipmappedArray>) {
     return true;
   } else if constexpr (front_is_handle<U>()) {
     return false;
@@ -104,6 +111,44 @@ static inline CUfunction
 front_translate(CUfunction function)
 {
   return (CUfunction)front_real_obj(function, FRONT_FUNCTION);
+}
+
+// The runtime's and the driver's arrays are the same objects, under types
+// of different names.
+static inline cudaArray_t
+front_translate(cudaArray_t array)
+{
+  return (cudaArray_t)front_real_obj(array, FRONT_ARRAY);
+}
+
+static inline cudaArray_const_t
+front_translate(cudaArray_const_t array)
+{
+  return (cudaArray_const_t)front_real_obj(array, FRONT_ARRAY);
+}
+
+static inline CUarray
+front_translate(CUarray array)
+{
+  return (CUarray)front_real_obj(array, FRONT_ARRAY);
+}
+
+static inline cudaMipmappedArray_t
+front_translate(cudaMipmappedArray_t mipmap)
+{
+  return (cudaMipmappedArray_t)front_real_obj(mipmap, FRONT_MIPMAP);
+}
+
+static inline cudaMipmappedArray_const_t
+front_translate(cudaMipmappedArray_const_t mipmap)
+{
+  return (cudaMipmappedArray_const_t)front_real_obj(mipmap, FRONT_MIPMAP);
+}
+
+static inline CUmipmappedArray
+front_translate(CUmipmappedArray mipmap)
+{
+  return (CUmipmappedArray)front_real_obj(mipmap, FRONT_MIPMAP);
 }
 
 template <typename T>

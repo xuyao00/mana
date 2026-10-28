@@ -130,6 +130,13 @@ void front_drv_restore(FrontObj *obj) FRONT_HIDDEN;  // context, module,
 void front_modules_stash() FRONT_HIDDEN;
 void front_modules_drop_shadows() FRONT_HIDDEN;
 
+// Arrays, texture and surface objects (front_arrays.cpp).
+void front_arrays_stash() FRONT_HIDDEN;
+void front_arrays_drop_shadows() FRONT_HIDDEN;
+void front_arrays_restore(FrontObj *obj) FRONT_HIDDEN;  // in the replay
+void front_arrays_fill() FRONT_HIDDEN;
+void front_arrays_forget(Ctx *ctx) FRONT_HIDDEN;  // with objs_lock held
+
 // Event times (front_async.cpp).
 void front_events_quiesce() FRONT_HIDDEN;
 void front_events_resume() FRONT_HIDDEN;

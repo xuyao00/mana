@@ -84,3 +84,32 @@ cuIpcCloseMemHandle
 # Peer access, kept across restarts.
 cuCtxEnablePeerAccess
 cuCtxDisablePeerAccess
+
+# CUDA arrays, the copies whose structures hold them, texture and surface
+# objects (front_arrays.cpp).
+cuArrayCreate_v2
+cuArray3DCreate_v2
+cuArrayDestroy
+cuMipmappedArrayCreate
+cuMipmappedArrayDestroy
+cuMipmappedArrayGetLevel
+cuMemcpy2D_v2
+cuMemcpy2D_v2_ptds
+cuMemcpy2DUnaligned_v2
+cuMemcpy2DUnaligned_v2_ptds
+cuMemcpy2DAsync_v2
+cuMemcpy2DAsync_v2_ptsz
+cuMemcpy3D_v2
+cuMemcpy3D_v2_ptds
+cuMemcpy3DAsync_v2
+cuMemcpy3DAsync_v2_ptsz
+cuMemcpy3DPeer
+cuMemcpy3DPeer_ptds
+cuMemcpy3DPeerAsync
+cuMemcpy3DPeerAsync_ptsz
+cuTexObjectCreate
+cuTexObjectDestroy
+cuSurfObjectCreate
+cuSurfObjectDestroy
+cuTexObjectGetResourceDesc
+cuSurfObjectGetResourceDesc

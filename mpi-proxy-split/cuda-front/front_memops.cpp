@@ -118,3 +118,19 @@ front_drain_memops()
     FRONT_LH(DRV(cuEventSynchronize)(event));
   }
 }
+
+// cuCtxDestroy: the context's events go with it (the destroy waits for its
+// work), so no drain waits for them.
+void
+front_memops_forget(CUcontext ctx)
+{
+  std::lock_guard<std::mutex> guard(memops_lock);
+  for (MemopEvents *m : all_memops) {
+    if (m->ctx == ctx) {
+      m->ctx = NULL;
+      m->gen = 0;
+      m->pending[0] = m->pending[1] = false;
+      m->event[0] = m->event[1] = NULL;
+    }
+  }
+}

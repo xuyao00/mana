@@ -168,6 +168,9 @@ enum FrontKind {
   FRONT_MODULE,
   FRONT_FUNCTION,
   FRONT_DEVICE,          // cudart's context of a device was made
+  FRONT_ARRAY,           // a CUDA array, or a level of a mipmapped one
+  FRONT_MIPMAP,          // a mipmapped array
+  FRONT_TEXOBJ,          // a texture or surface object (not a handle)
   FRONT_N_KINDS
 };
 
@@ -267,6 +270,7 @@ void front_objs_restore() FRONT_HIDDEN;
 void front_order_memop(bool ptds) FRONT_HIDDEN;
 // MANA_CUDA_DRAIN_MEMOPS: libmana.so is about to call MPI.
 void front_drain_memops() FRONT_HIDDEN;
+void front_memops_forget(CUcontext ctx) FRONT_HIDDEN;
 
 // Bit d: cudart has a context of device d.
 extern uint64_t front_devices_used FRONT_HIDDEN;

@@ -38,6 +38,7 @@ GEN_CFLAGS = -I${CUDA_HOME}/include
 
 FRONT_OBJS = front_core.o front_vmm.o front_objs.o front_drv.o \
              front_async.o front_memops.o front_ipc.o front_static.o \
+             front_arrays.o \
              gen/cudart-gen.o gen/cuda-gen.o
 FRONT_HEADERS = front.h front_auto.h front_objs.h front_reg.h mana_cuda.h \
                 gen/cudart-index.h gen/cuda-index.h \

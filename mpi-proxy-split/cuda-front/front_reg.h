@@ -88,6 +88,22 @@ cudaError_t cudaEventRecord_ptsz(cudaEvent_t event, cudaStream_t stream);
 cudaError_t cudaEventRecordWithFlags_ptsz(cudaEvent_t event,
                                           cudaStream_t stream,
                                           unsigned int flags);
+cudaError_t cudaMemcpy3D_ptds(const struct cudaMemcpy3DParms *p);
+cudaError_t cudaMemcpy3DAsync_ptsz(const struct cudaMemcpy3DParms *p,
+                                   cudaStream_t stream);
+cudaError_t cudaMemcpy3DPeer_ptds(const struct cudaMemcpy3DPeerParms *p);
+cudaError_t cudaMemcpy3DPeerAsync_ptsz(const struct cudaMemcpy3DPeerParms *p,
+                                       cudaStream_t stream);
+CUresult cuMemcpy2D_v2_ptds(const CUDA_MEMCPY2D *pCopy);
+CUresult cuMemcpy2DUnaligned_v2_ptds(const CUDA_MEMCPY2D *pCopy);
+CUresult cuMemcpy2DAsync_v2_ptsz(const CUDA_MEMCPY2D *pCopy,
+                                 CUstream hStream);
+CUresult cuMemcpy3D_v2_ptds(const CUDA_MEMCPY3D *pCopy);
+CUresult cuMemcpy3DAsync_v2_ptsz(const CUDA_MEMCPY3D *pCopy,
+                                 CUstream hStream);
+CUresult cuMemcpy3DPeer_ptds(const CUDA_MEMCPY3D_PEER *pCopy);
+CUresult cuMemcpy3DPeerAsync_ptsz(const CUDA_MEMCPY3D_PEER *pCopy,
+                                  CUstream hStream);
 }
 
 #endif  // ifndef _MANA_CUDA_FRONT_REG_H

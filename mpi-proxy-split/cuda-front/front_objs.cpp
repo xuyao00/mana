@@ -982,6 +982,7 @@ front_objs_stash()
     }
   }
   front_modules_stash();
+  front_arrays_stash();
 }
 
 void
@@ -999,6 +1000,7 @@ front_objs_drop_shadows()
     }
   }
   front_modules_drop_shadows();
+  front_arrays_drop_shadows();
 }
 
 // Before any context exists in the new lower half.  The driver's call makes
@@ -1051,6 +1053,11 @@ restore_obj(FrontObj *o)
       front_ctx_use(((Event *)o)->ctx);
       front_event_restore((Event *)o);
       break;
+    case FRONT_ARRAY:
+    case FRONT_MIPMAP:
+    case FRONT_TEXOBJ:
+      front_arrays_restore(o);
+      break;
     default:
       front_drv_restore(o);
   }
@@ -1059,7 +1066,8 @@ restore_obj(FrontObj *o)
 // The fatbins' registrations first, as the application's constructors made
 // them.  Then every other record, in creation order over all kinds: so the
 // driver places module data where it was, and a record comes after the
-// context that it belongs to.  Then the settings and contents.  (Device
+// context that it belongs to (texture objects: see front_arrays.cpp).  Then
+// the settings and contents.  (Device
 // memory is already mapped, and is filled last: front_vmm.cpp.)  objs_lock
 // is not held: the checkpoint thread is the only one running.
 void
@@ -1089,7 +1097,8 @@ front_objs_restore()
   front_open_slot();
   std::vector<FrontObj *> order;
   for (int kind : { FRONT_CTX, FRONT_DEVICE, FRONT_MODULE, FRONT_FUNCTION,
-                    FRONT_KERNEL, FRONT_STREAM, FRONT_EVENT }) {
+                    FRONT_KERNEL, FRONT_STREAM, FRONT_EVENT, FRONT_ARRAY,
+                    FRONT_MIPMAP, FRONT_TEXOBJ }) {
     for (FrontObj *o = obj_heads[kind]; o != NULL; o = o->next) {
       order.push_back(o);
     }
@@ -1099,6 +1108,7 @@ front_objs_restore()
   for (FrontObj *o : order) {
     restore_obj(o);
   }
+  front_arrays_fill();
   for (auto &entry : func_settings) {
     front_use_device(entry.second.device);
     set_func(entry.first.first, entry.first.second, entry.second);

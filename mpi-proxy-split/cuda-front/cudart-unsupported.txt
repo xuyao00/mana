@@ -19,11 +19,9 @@ cudaLaunchKernelExC_ptsz
 cudaLaunchCooperativeKernelMultiDevice
 cudaGetExportTable
 
-# Texture and surface values must come back exactly (fillers, Phase 2).
-cudaCreateTextureObject
-cudaDestroyTextureObject
-cudaCreateSurfaceObject
-cudaDestroySurfaceObject
+# Their structures hold arrays, which the front would have to translate.
+cudaMemcpy3DBatchAsync
+cudaMemcpy3DBatchAsync_ptsz
 
 # Graphs come later; refuse the capture at its start.
 cudaStreamBeginCapture

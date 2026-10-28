@@ -155,6 +155,7 @@ drop_objects_of(Ctx *ctx)
   for (auto it = pinned.begin(); it != pinned.end();) {
     it = it->second.ctx == ctx ? pinned.erase(it) : std::next(it);
   }
+  front_arrays_forget(ctx);
 }
 
 // The size of a module image: a cubin (ELF), a fatbin, or PTX text.
@@ -719,6 +720,7 @@ cuCtxDestroy_v2(CUcontext ctx)
   CUresult rc;
   DRV_CALL(rc, DRV(cuCtxDestroy_v2)((CUcontext)c->real));
   if (rc == CUDA_SUCCESS) {
+    front_memops_forget((CUcontext)c->real);
     FrontThread *t = &front_thread;
     if (t->n_ctx > 0 && t->ctx_stack[t->n_ctx - 1] == c) {
       front_stack_pop();
