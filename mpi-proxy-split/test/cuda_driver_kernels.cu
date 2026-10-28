@@ -26,3 +26,24 @@ through_shared(int *a, int n)
   __syncthreads();
   for (int i = threadIdx.x; i < n; i += blockDim.x) a[i] = s[i] - a[i];
 }
+
+// A 2D float array: its surface object advances it, its texture object is
+// checked against base + x + w * y.
+extern "C" __global__ void
+bump_surface(unsigned long long surface, int w)
+{
+  int x = threadIdx.x, y = blockIdx.x;
+  if (x < w) {
+    float v = surf2Dread<float>(surface, x * sizeof(float), y);
+    surf2Dwrite(v + 1.0f, surface, x * sizeof(float), y);
+  }
+}
+
+extern "C" __global__ void
+check_texture(unsigned long long texture, int w, float base, int *bad)
+{
+  int x = threadIdx.x, y = blockIdx.x;
+  if (x < w && tex2D<float>(texture, x + 0.5f, y + 0.5f) != base + x + w * y) {
+    atomicAdd(bad, 1);
+  }
+}

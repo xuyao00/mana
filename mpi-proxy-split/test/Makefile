@@ -36,7 +36,8 @@ E2E_FORTRAN = fortran_p2p fortran_nonblocking fortran_handles fortran_attributes
 # CUDA-aware MPI tests (mana_launch --cuda); built if nvcc is there.
 NVCC ?= $(shell command -v nvcc 2>/dev/null)
 E2E_CUDA = $(if $(NVCC),cuda_aware cuda_threads cuda_driver cuda_async \
-                          cuda_ipc cuda_static cuda_static_stripped)
+                          cuda_ipc cuda_textures cuda_static \
+                          cuda_static_stripped)
 CUDA_HOME ?= $(if $(NVCC),$(realpath $(dir $(NVCC))..))
 
 # The suite also runs the example of ../examples (ring_example).
@@ -49,7 +50,7 @@ ${E2E_TESTS}: %: %.c mana_test.h
 mmap_threads: MPI_LDFLAGS += -pthread
 
 # With the shared CUDA runtime: the front stands for it under --cuda.
-cuda_aware cuda_async: %: %.cu mana_test.h
+cuda_aware cuda_async cuda_textures: %: %.cu mana_test.h
 	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $<
 
 # cuda_aware with nvcc's default, a static CUDA runtime; and stripped.

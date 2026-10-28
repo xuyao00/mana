@@ -3,8 +3,10 @@
 // module JIT-compiled from PTX with options and one from a fatbin, a module
 // global that only kernels update, a function whose attribute (more than
 // 48 KB of dynamic shared memory) a restart must set again, streams, events,
-// pinned memory, and a function pointer from cuGetProcAddress kept across
-// checkpoints.  MPI reduces a device buffer of the created context.
+// pinned memory, a function pointer from cuGetProcAddress kept across
+// checkpoints, and a CUDA array with a surface object that a kernel advances
+// and a texture object that another one checks.  MPI reduces a device buffer
+// of the created context.
 
 #include <cuda.h>
 
@@ -13,6 +15,8 @@
 
 #define N 4096
 #define SHARED_INTS (64 * 1024 / 4)
+#define AW 32
+#define AH 16
 
 #define CU_CHECK(call)                                                       \
   do {                                                                       \
@@ -102,6 +106,59 @@ main(int argc, char **argv)
   MT_CHECK(mem_alloc != NULL && status == CU_GET_PROC_ADDRESS_SUCCESS,
            "%s", "cuGetProcAddress(cuMemAlloc)");
 
+  // A CUDA array, filled through cuMemcpy2D, with a surface and a texture.
+  CUDA_ARRAY3D_DESCRIPTOR ad = { 0 };
+  ad.Width = AW;
+  ad.Height = AH;
+  ad.Format = CU_AD_FORMAT_FLOAT;
+  ad.NumChannels = 1;
+  ad.Flags = CUDA_ARRAY3D_SURFACE_LDST;
+  CUarray array;
+  CU_CHECK(cuArray3DCreate(&array, &ad));
+  static float pixels[AH][AW];
+  for (int y = 0; y < AH; y++) {
+    for (int x = 0; x < AW; x++) {
+      pixels[y][x] = (float)(x + AW * y);
+    }
+  }
+  CUDA_MEMCPY2D c2 = { 0 };
+  c2.srcMemoryType = CU_MEMORYTYPE_HOST;
+  c2.srcHost = pixels;
+  c2.srcPitch = sizeof pixels[0];
+  c2.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+  c2.dstArray = array;
+  c2.WidthInBytes = sizeof pixels[0];
+  c2.Height = AH;
+  CU_CHECK(cuMemcpy2D(&c2));
+  CUDA_RESOURCE_DESC res = { 0 };
+  res.resType = CU_RESOURCE_TYPE_ARRAY;
+  res.res.array.hArray = array;
+  CUsurfObject surface;
+  CU_CHECK(cuSurfObjectCreate(&surface, &res));
+  CUDA_TEXTURE_DESC td = { 0 };
+  td.addressMode[0] = td.addressMode[1] = CU_TR_ADDRESS_MODE_CLAMP;
+  td.filterMode = CU_TR_FILTER_MODE_POINT;
+  CUtexObject texture;
+  CU_CHECK(cuTexObjectCreate(&texture, &res, &td, NULL));
+  CUfunction bump_surface, check_texture;
+  CU_CHECK(cuModuleGetFunction(&bump_surface, module, "bump_surface"));
+  CU_CHECK(cuModuleGetFunction(&check_texture, module, "check_texture"));
+  CUdeviceptr d_bad;
+  CU_CHECK(cuMemAlloc(&d_bad, sizeof(int)));
+
+  // A 1D array, for cuMemcpyHtoA and cuMemcpyAtoH.
+  CUDA_ARRAY_DESCRIPTOR d1 = { 0 };
+  d1.Width = N;
+  d1.Format = CU_AD_FORMAT_SIGNED_INT32;
+  d1.NumChannels = 1;
+  CUarray array1d;
+  CU_CHECK(cuArrayCreate(&array1d, &d1));
+  static int values1d[N];
+  for (int i = 0; i < N; i++) {
+    values1d[i] = 3 * i;
+  }
+  CU_CHECK(cuMemcpyHtoA(array1d, 0, values1d, sizeof values1d));
+
   long it;
   for (it = 0; mt_continue(it); it++) {
     CUcontext cur;
@@ -157,6 +214,35 @@ main(int argc, char **argv)
              (void *)popped);
     MT_CHECK(host[3] == it + 1, "iteration %ld: primary %d", it, host[3]);
 
+    // The array, through its surface and its texture.
+    int aw = AW, bad = -1;
+    float base = (float)(it + 1);
+    void *bump_params[] = { &surface, &aw };
+    void *check_params[] = { &texture, &aw, &base, &d_bad };
+    launch(bump_surface, AH, AW, 0, stream, bump_params);
+    CU_CHECK(cuMemsetD32Async(d_bad, 0, 1, stream));
+    launch(check_texture, AH, AW, 0, stream, check_params);
+    CU_CHECK(cuMemcpyDtoHAsync(&bad, d_bad, sizeof bad, stream));
+    CU_CHECK(cuStreamSynchronize(stream));
+    MT_CHECK(bad == 0, "iteration %ld: %d bad texture values", it, bad);
+    float row[AW];
+    CUDA_MEMCPY2D back = { 0 };
+    back.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+    back.srcArray = array;
+    back.srcY = AH - 1;
+    back.dstMemoryType = CU_MEMORYTYPE_HOST;
+    back.dstHost = row;
+    back.dstPitch = sizeof row;
+    back.WidthInBytes = sizeof row;
+    back.Height = 1;
+    CU_CHECK(cuMemcpy2D(&back));
+    MT_CHECK(row[AW - 1] == AW * AH - 1 + it + 1, "iteration %ld: array %f",
+             it, row[AW - 1]);
+    int last1d = -1;
+    CU_CHECK(cuMemcpyAtoH(&last1d, array1d, sizeof(int) * (N - 1),
+                          sizeof last1d));
+    MT_CHECK(last1d == 3 * (N - 1), "iteration %ld: 1D array %d", it, last1d);
+
     if (it % 100 == 0) {
       CUdeviceptr p;
       CU_CHECK(mem_alloc(&p, 1 << 20));
@@ -164,6 +250,10 @@ main(int argc, char **argv)
     }
   }
 
+  CU_CHECK(cuTexObjectDestroy(texture));
+  CU_CHECK(cuSurfObjectDestroy(surface));
+  CU_CHECK(cuArrayDestroy(array));
+  CU_CHECK(cuArrayDestroy(array1d));
   CU_CHECK(cuMemFreeHost(host));
   CU_CHECK(cuEventDestroy(done));
   CU_CHECK(cuStreamDestroy(stream));
