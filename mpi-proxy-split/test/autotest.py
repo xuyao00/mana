@@ -47,11 +47,14 @@ class Test:
                progress.
   cuda:        a CUDA-aware MPI test: runs with MANA_CUDA=1 (mana_launch
                --cuda).  test/Makefile builds it if it finds nvcc.
+  mana_only:   checks something that only MANA does (e.g. a refusal):
+               --native skips it.
   """
 
   def __init__(self, name, ranks, args=(), kind="loop", expect=None,
                restart=False, fails=False, known_bug=None, native_args=None,
-               program=None, burst=1, restart_now=False, cuda=False):
+               program=None, burst=1, restart_now=False, cuda=False,
+               mana_only=False):
     self.name = name
     self.ranks = ranks
     self.args = list(args)
@@ -67,6 +70,7 @@ class Test:
     self.burst = burst
     self.restart_now = restart_now
     self.cuda = cuda
+    self.mana_only = mana_only
 
 
 TESTS = [
@@ -113,6 +117,13 @@ TESTS = [
   Test("mmap_threads", 2),
   Test("mmap_threads_quiet", 2, args=["-q"], program="mmap_threads"),
   Test("cuda_aware", 2, cuda=True),
+  Test("cuda_threads", 2, cuda=True),
+  Test("cuda_driver", 2, cuda=True),
+  Test("cuda_async", 2, cuda=True),
+  Test("cuda_ipc", 2, cuda=True),
+  Test("cuda_static", 2, cuda=True),
+  Test("cuda_static_stripped", 2, cuda=True, kind="run", fails=True,
+       expect="static CUDA runtime but no symbol table", mana_only=True),
   Test("fortran_nonblocking", 2),
   Test("fortran_handles", 2),
   Test("fortran_attributes", 2),
@@ -412,6 +423,9 @@ class Run:
 
   def run_native(self, report):
     t = self.test
+    if t.mana_only:
+      report("native:SKIPPED (MANA only)")
+      return
     if t.kind == "loop":
       self.launch([self.exe()] + t.args, "native.out")
       self.wait_progress("after the start")

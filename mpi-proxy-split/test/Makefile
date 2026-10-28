@@ -35,7 +35,9 @@ E2E_TESTS = p2p_blocking p2p_nonblocking p2p_ring p2p_any_source p2p_probe \
 E2E_FORTRAN = fortran_p2p fortran_nonblocking fortran_handles fortran_attributes
 # CUDA-aware MPI tests (mana_launch --cuda); built if nvcc is there.
 NVCC ?= $(shell command -v nvcc 2>/dev/null)
-E2E_CUDA = $(if $(NVCC),cuda_aware)
+E2E_CUDA = $(if $(NVCC),cuda_aware cuda_threads cuda_driver cuda_async \
+                          cuda_ipc cuda_static cuda_static_stripped)
+CUDA_HOME ?= $(if $(NVCC),$(realpath $(dir $(NVCC))..))
 
 # The suite also runs the example of ../examples (ring_example).
 e2e: ${E2E_TESTS} ${E2E_FORTRAN} dlopen_mpi ${E2E_CUDA}
@@ -47,8 +49,36 @@ ${E2E_TESTS}: %: %.c mana_test.h
 mmap_threads: MPI_LDFLAGS += -pthread
 
 # With the shared CUDA runtime: the front stands for it under --cuda.
-cuda_aware: %: %.cu mana_test.h
+cuda_aware cuda_async: %: %.cu mana_test.h
 	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $<
+
+# cuda_aware with nvcc's default, a static CUDA runtime; and stripped.
+cuda_static: cuda_aware.cu mana_test.h
+	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -DTEST_NAME='"cuda_static"' \
+	  -o $@ $<
+
+cuda_static_stripped: cuda_static
+	strip -o $@ $<
+
+cuda_ipc: %: %.cu mana_test.h
+	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $< \
+	  -lcuda
+
+# Also the _ptsz/_ptds functions of the per-thread default stream.
+cuda_threads: %: %.cu mana_test.h
+	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared \
+	  --default-stream per-thread -o $@ $< -lpthread
+
+# The driver API only, with its kernels as PTX and as a fatbin.
+cuda_driver: cuda_driver.c cuda_driver_kernels.h mana_test.h
+	$(MPICC) -g -O0 -I$(CUDA_HOME)/include -o $@ $< -lcuda
+
+cuda_driver_kernels.h: cuda_driver_kernels.cu
+	$(NVCC) -ptx -o cuda_driver_kernels.ptx $<
+	$(NVCC) -fatbin -o cuda_driver_kernels.fatbin $<
+	$(CUDA_HOME)/bin/bin2c -c -n driver_ptx cuda_driver_kernels.ptx > $@
+	$(CUDA_HOME)/bin/bin2c -c -n driver_fatbin cuda_driver_kernels.fatbin \
+	  >> $@
 
 # Opens the MPI library with dlopen(), so it is not linked with it.
 dlopen_mpi: dlopen_mpi.c
@@ -88,4 +118,6 @@ tidy:
 
 clean: tidy
 	rm -f *.pyc *.so
-	rm -f ${E2E_TESTS} ${E2E_FORTRAN} ${BENCH_FILES} cuda_aware
+	rm -f ${E2E_TESTS} ${E2E_FORTRAN} ${BENCH_FILES} ${E2E_CUDA}
+	rm -f cuda_driver_kernels.h cuda_driver_kernels.ptx \
+	  cuda_driver_kernels.fatbin

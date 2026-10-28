@@ -3,9 +3,12 @@
 test/*
 !test/*.c
 !test/*.cpp
+!test/*.cu
 !test/*.f90
 !test/*.h
 !test/*.py
+# Made by bin2c from cuda_driver_kernels.cu.
+test/cuda_driver_kernels.h
 examples/ring
 proxy
 mpi-wrappers/*.c*

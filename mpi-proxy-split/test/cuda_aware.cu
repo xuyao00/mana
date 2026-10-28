@@ -10,6 +10,11 @@
 
 #include "mana_test.h"
 
+// cuda_static is this test with nvcc's default, a static CUDA runtime.
+#ifndef TEST_NAME
+#define TEST_NAME "cuda_aware"
+#endif
+
 #define N 65536
 
 #define CUDA_CHECK(call)                                                     \
@@ -58,7 +63,7 @@ count_bad(const int *buf, const int *state, int from, long it, int *d_bad)
 int
 main(int argc, char **argv)
 {
-  mt_init(&argc, &argv, "cuda_aware");
+  mt_init(&argc, &argv, TEST_NAME);
   int ndev;
   CUDA_CHECK(cudaGetDeviceCount(&ndev));
   CUDA_CHECK(cudaSetDevice(mt_rank % ndev));
