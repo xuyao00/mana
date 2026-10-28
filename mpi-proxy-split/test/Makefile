@@ -38,7 +38,7 @@ NVCC ?= $(shell command -v nvcc 2>/dev/null)
 E2E_CUDA = $(if $(NVCC),cuda_aware cuda_threads cuda_driver cuda_async \
                           cuda_ipc cuda_textures cuda_static \
                           cuda_static_stripped cuda_cublas cuda_cufft \
-                          cuda_curand)
+                          cuda_curand cuda_graphs)
 CUDA_HOME ?= $(if $(NVCC),$(realpath $(dir $(NVCC))..))
 
 # The suite also runs the example of ../examples (ring_example).
@@ -75,7 +75,7 @@ cuda_static: cuda_aware.cu mana_test.h
 cuda_static_stripped: cuda_static
 	strip -o $@ $<
 
-cuda_ipc: %: %.cu mana_test.h
+cuda_ipc cuda_graphs: %: %.cu mana_test.h
 	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $< \
 	  -lcuda
 
