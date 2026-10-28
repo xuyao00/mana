@@ -124,6 +124,7 @@ TESTS = [
   Test("cuda_textures", 2, cuda=True),
   Test("cuda_cublas", 2, cuda=True),
   Test("cuda_cufft", 2, cuda=True),
+  Test("cuda_curand", 2, cuda=True),
   Test("cuda_static", 2, cuda=True),
   Test("cuda_static_stripped", 2, cuda=True, kind="run", fails=True,
        expect="static CUDA runtime but no symbol table", mana_only=True),

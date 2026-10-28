@@ -37,7 +37,8 @@ E2E_FORTRAN = fortran_p2p fortran_nonblocking fortran_handles fortran_attributes
 NVCC ?= $(shell command -v nvcc 2>/dev/null)
 E2E_CUDA = $(if $(NVCC),cuda_aware cuda_threads cuda_driver cuda_async \
                           cuda_ipc cuda_textures cuda_static \
-                          cuda_static_stripped cuda_cublas cuda_cufft)
+                          cuda_static_stripped cuda_cublas cuda_cufft \
+                          cuda_curand)
 CUDA_HOME ?= $(if $(NVCC),$(realpath $(dir $(NVCC))..))
 
 # The suite also runs the example of ../examples (ring_example).
@@ -61,6 +62,10 @@ cuda_cublas: %: %.cu mana_test.h
 cuda_cufft: %: %.cu mana_test.h
 	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $< \
 	  -lcufft
+
+cuda_curand: %: %.cu mana_test.h
+	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $< \
+	  -lcurand
 
 # cuda_aware with nvcc's default, a static CUDA runtime; and stripped.
 cuda_static: cuda_aware.cu mana_test.h
