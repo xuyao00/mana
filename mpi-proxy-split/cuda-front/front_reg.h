@@ -88,6 +88,29 @@ cudaError_t cudaEventRecord_ptsz(cudaEvent_t event, cudaStream_t stream);
 cudaError_t cudaEventRecordWithFlags_ptsz(cudaEvent_t event,
                                           cudaStream_t stream,
                                           unsigned int flags);
+cudaError_t cudaStreamBeginCapture_ptsz(cudaStream_t stream,
+                                        enum cudaStreamCaptureMode mode);
+cudaError_t cudaStreamBeginCaptureToGraph_ptsz(
+  cudaStream_t stream, cudaGraph_t graph,
+  const cudaGraphNode_t *dependencies,
+  const cudaGraphEdgeData *dependencyData, size_t numDependencies,
+  enum cudaStreamCaptureMode mode);
+cudaError_t cudaStreamEndCapture_ptsz(cudaStream_t stream,
+                                      cudaGraph_t *pGraph);
+cudaError_t cudaStreamGetCaptureInfo_ptsz(
+  cudaStream_t stream, enum cudaStreamCaptureStatus *captureStatus_out,
+  unsigned long long *id_out, cudaGraph_t *graph_out,
+  const cudaGraphNode_t **dependencies_out,
+  const cudaGraphEdgeData **edgeData_out, size_t *numDependencies_out);
+cudaError_t cudaStreamUpdateCaptureDependencies_ptsz(
+  cudaStream_t stream, cudaGraphNode_t *dependencies,
+  const cudaGraphEdgeData *dependencyData, size_t numDependencies,
+  unsigned int flags);
+cudaError_t cudaGraphInstantiateWithParams_ptsz(
+  cudaGraphExec_t *pGraphExec, cudaGraph_t graph,
+  cudaGraphInstantiateParams *instantiateParams);
+cudaError_t cudaGraphLaunch_ptsz(cudaGraphExec_t graphExec,
+                                 cudaStream_t stream);
 cudaError_t cudaMemcpy3D_ptds(const struct cudaMemcpy3DParms *p);
 cudaError_t cudaMemcpy3DAsync_ptsz(const struct cudaMemcpy3DParms *p,
                                    cudaStream_t stream);

@@ -64,7 +64,7 @@ GEN_CFLAGS = -I${CUDA_HOME}/include $(addprefix -I,${CUDA_MATH_INCLUDE})
 
 FRONT_OBJS = front_core.o front_vmm.o front_objs.o front_drv.o \
              front_async.o front_memops.o front_ipc.o front_static.o \
-             front_arrays.o \
+             front_arrays.o front_graphs.o \
              gen/cudart-gen.o gen/cuda-gen.o \
              $(if ${CUBLAS_SONAME},front_blas.o gen/cublas-gen.o \
                gen/cublasLt-gen.o) \

@@ -29,6 +29,10 @@
 // FS: it uses no libc, only atomics and raw futex system calls.  The
 // checkpoint's GPU synchronization waits for host functions too; the runner
 // is an ordinary thread then, and does not take the checkpoint gate.
+//
+// A host node of a graph runs at every launch, and the graph may outlive a
+// restart: its data for the driver is a target that lives as long as the
+// process, and each call puts its job on the driver thread's stack.
 
 #include <linux/futex.h>
 #include <pthread.h>
@@ -51,7 +55,17 @@ struct Job {
   cudaStream_t stream;     // virtual, for the stream callbacks
   int status;
   int state;               // 0 queued, 1 run (by the runner), 2 returned
+  bool on_stack;           // a host node's: not the runner's to free
 };
+
+// A host node's target (front_host_node()).
+struct HostTarget {
+  cudaHostFn_t fn;
+  void *user_data;
+};
+
+std::mutex targets_lock;
+std::map<std::pair<void *, void *>, HostTarget *> targets;
 
 Job *queue;                // pushed by the trampolines, newest first
 int queue_seq;             // futex word: bumped at each push
@@ -92,6 +106,24 @@ void CUDART_CB
 host_fn_trampoline(void *arg)
 {
   hand_to_runner((Job *)arg);
+}
+
+// A host node's: the job on this stack, filled field by field (no libc
+// here).
+void CUDART_CB
+host_node_trampoline(void *arg)
+{
+  HostTarget *target = (HostTarget *)arg;
+  Job job;
+  job.next = NULL;
+  job.kind = JOB_HOST_FN;
+  job.fn = (void *)target->fn;
+  job.user_data = target->user_data;
+  job.stream = NULL;
+  job.status = 0;
+  job.state = 0;
+  job.on_stack = true;
+  hand_to_runner(&job);
 }
 
 void CUDART_CB
@@ -135,6 +167,7 @@ runner_main(void *)
     }
     for (auto it = jobs.rbegin(); it != jobs.rend(); ++it) {
       Job *job = *it;
+      bool keep = !job->on_stack;  // the job is gone once its state is 1
       switch (job->kind) {
         case JOB_HOST_FN:
           ((cudaHostFn_t)job->fn)(job->user_data);
@@ -151,7 +184,9 @@ runner_main(void *)
       }
       __atomic_store_n(&job->state, 1, __ATOMIC_RELEASE);
       syscall(SYS_futex, &job->state, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
-      done.push_back(job);
+      if (keep) {
+        done.push_back(job);
+      }
     }
   }
   return NULL;
@@ -198,6 +233,33 @@ enqueue(int kind, void *fn, void *user_data, cudaStream_t stream,
     delete job;
   }
   return rc;
+}
+
+// cudaLaunchHostFunc, cuLaunchHostFunc: into a stream capture, the call
+// becomes a host node, which gets a target (front_host_node()).
+template <typename Launch>
+int
+launch_host_fn(void *fn, void *user_data, cudaStream_t stream, Launch call)
+{
+  if (fn != NULL && __atomic_load_n(&front_captures, __ATOMIC_ACQUIRE) > 0) {
+    FRONT_ENTER();
+    cudaStream_t real = front_real_stream(stream);
+    bool capturing = front_capturing(real);
+    int rc = 0;
+    if (capturing) {
+      void *driver_fn, *driver_data;
+      front_host_node((cudaHostFn_t)fn, user_data, &driver_fn, &driver_data);
+      rc = call(real, driver_fn, driver_data);
+    }
+    FRONT_LEAVE();
+    if (capturing) {
+      return rc;
+    }
+  }
+  return enqueue(JOB_HOST_FN, fn, user_data, stream,
+                 [&](cudaStream_t real, Job *job) {
+                   return call(real, (void *)host_fn_trampoline, job);
+                 });
 }
 
 // The device's default pool: the allocator's memory is VMM memory of its
@@ -280,10 +342,23 @@ pool_get(void *pool, int attr, void *value)
 // Stream-ordered allocation: the memory is the allocator's at once, which
 // is valid in stream order too.  A free waits for the stream's work so far,
 // through an event, before the memory is used again.
+// In a stream capture, it would be a graph's memory node, which the front
+// does not support.
+void
+check_not_capturing(cudaStream_t stream)
+{
+  if (__atomic_load_n(&front_captures, __ATOMIC_ACQUIRE) > 0 &&
+      front_capturing(front_real_stream(stream))) {
+    front_fatal("stream-ordered allocation in a stream capture (a graph's "
+                "memory node) is not supported\n");
+  }
+}
+
 int
-malloc_async(void **ptr, size_t size)
+malloc_async(void **ptr, size_t size, cudaStream_t stream)
 {
   FRONT_ENTER();
+  check_not_capturing(stream);
   int rc = front_vmm_alloc(ptr, size);
   FRONT_LEAVE();
   return rc;
@@ -293,6 +368,7 @@ int
 free_async(void *ptr, cudaStream_t stream, bool drv)
 {
   FRONT_ENTER();
+  check_not_capturing(stream);
   int rc = 0;
   if (!front_vmm_free_async(ptr, front_real_stream(stream), &rc)) {
     if (drv) {
@@ -487,14 +563,43 @@ front_events_restart()
 
 // ---- Host functions and stream callbacks ---------------------------------
 
+void
+front_host_node(cudaHostFn_t fn, void *user_data, void **driver_fn,
+                void **driver_data)
+{
+  pthread_once(&runner_once, start_runner);
+  std::lock_guard<std::mutex> guard(targets_lock);
+  HostTarget *&target = targets[std::make_pair((void *)fn, user_data)];
+  if (target == NULL) {
+    target = new HostTarget();
+    target->fn = fn;
+    target->user_data = user_data;
+  }
+  *driver_fn = (void *)host_node_trampoline;
+  *driver_data = target;
+}
+
+bool
+front_host_node_target(void *driver_fn, void *driver_data, cudaHostFn_t *fn,
+                       void **user_data)
+{
+  if (driver_fn != (void *)host_node_trampoline || driver_data == NULL) {
+    return false;
+  }
+  *fn = ((HostTarget *)driver_data)->fn;
+  *user_data = ((HostTarget *)driver_data)->user_data;
+  return true;
+}
+
 extern "C" cudaError_t
 cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void *userData)
 {
-  return (cudaError_t)enqueue(
-    JOB_HOST_FN, (void *)fn, userData, stream,
-    [](cudaStream_t real, Job *job) {
+  return (cudaError_t)launch_host_fn(
+    (void *)fn, userData, stream,
+    [](cudaStream_t real, void *driver_fn, void *driver_data) {
       cudaError_t rc;
-      FRONT_LH(rc = REAL(cudaLaunchHostFunc)(real, host_fn_trampoline, job));
+      FRONT_LH(rc = REAL(cudaLaunchHostFunc)(
+                 real, (cudaHostFn_t)driver_fn, driver_data));
       return (int)rc;
     });
 }
@@ -502,12 +607,12 @@ cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void *userData)
 extern "C" cudaError_t
 cudaLaunchHostFunc_ptsz(cudaStream_t stream, cudaHostFn_t fn, void *userData)
 {
-  return (cudaError_t)enqueue(
-    JOB_HOST_FN, (void *)fn, userData, stream,
-    [](cudaStream_t real, Job *job) {
+  return (cudaError_t)launch_host_fn(
+    (void *)fn, userData, stream,
+    [](cudaStream_t real, void *driver_fn, void *driver_data) {
       cudaError_t rc;
-      FRONT_LH(rc = REAL(cudaLaunchHostFunc_ptsz)(real, host_fn_trampoline,
-                                                  job));
+      FRONT_LH(rc = REAL(cudaLaunchHostFunc_ptsz)(
+                 real, (cudaHostFn_t)driver_fn, driver_data));
       return (int)rc;
     });
 }
@@ -543,11 +648,12 @@ cudaStreamAddCallback_ptsz(cudaStream_t stream, cudaStreamCallback_t callback,
 extern "C" CUresult
 cuLaunchHostFunc(CUstream hStream, CUhostFn fn, void *userData)
 {
-  return (CUresult)enqueue(
-    JOB_HOST_FN, (void *)fn, userData, hStream,
-    [](cudaStream_t real, Job *job) {
+  return (CUresult)launch_host_fn(
+    (void *)fn, userData, hStream,
+    [](cudaStream_t real, void *driver_fn, void *driver_data) {
       CUresult rc;
-      FRONT_LH(rc = DRV(cuLaunchHostFunc)(real, host_fn_trampoline, job));
+      FRONT_LH(rc = DRV(cuLaunchHostFunc)(
+                 real, (CUhostFn)driver_fn, driver_data));
       return (int)rc;
     });
 }
@@ -555,12 +661,12 @@ cuLaunchHostFunc(CUstream hStream, CUhostFn fn, void *userData)
 extern "C" CUresult
 cuLaunchHostFunc_ptsz(CUstream hStream, CUhostFn fn, void *userData)
 {
-  return (CUresult)enqueue(
-    JOB_HOST_FN, (void *)fn, userData, hStream,
-    [](cudaStream_t real, Job *job) {
+  return (CUresult)launch_host_fn(
+    (void *)fn, userData, hStream,
+    [](cudaStream_t real, void *driver_fn, void *driver_data) {
       CUresult rc;
-      FRONT_LH(rc = DRV(cuLaunchHostFunc_ptsz)(real, host_fn_trampoline,
-                                               job));
+      FRONT_LH(rc = DRV(cuLaunchHostFunc_ptsz)(
+                 real, (CUhostFn)driver_fn, driver_data));
       return (int)rc;
     });
 }
@@ -596,31 +702,31 @@ cuStreamAddCallback_ptsz(CUstream hStream, CUstreamCallback callback,
 // ---- Stream-ordered allocation and default pools -------------------------
 
 extern "C" cudaError_t
-cudaMallocAsync(void **devPtr, size_t size, cudaStream_t)
+cudaMallocAsync(void **devPtr, size_t size, cudaStream_t stream)
 {
-  return (cudaError_t)malloc_async(devPtr, size);
+  return (cudaError_t)malloc_async(devPtr, size, stream);
 }
 
 extern "C" cudaError_t
-cudaMallocAsync_ptsz(void **devPtr, size_t size, cudaStream_t)
+cudaMallocAsync_ptsz(void **devPtr, size_t size, cudaStream_t stream)
 {
-  return (cudaError_t)malloc_async(devPtr, size);
+  return (cudaError_t)malloc_async(devPtr, size, stream);
 }
 
 extern "C" cudaError_t
 cudaMallocFromPoolAsync(void **ptr, size_t size, cudaMemPool_t memPool,
-                        cudaStream_t)
+                        cudaStream_t stream)
 {
   pool_of(memPool);
-  return (cudaError_t)malloc_async(ptr, size);
+  return (cudaError_t)malloc_async(ptr, size, stream);
 }
 
 extern "C" cudaError_t
 cudaMallocFromPoolAsync_ptsz(void **ptr, size_t size, cudaMemPool_t memPool,
-                             cudaStream_t)
+                             cudaStream_t stream)
 {
   pool_of(memPool);
-  return (cudaError_t)malloc_async(ptr, size);
+  return (cudaError_t)malloc_async(ptr, size, stream);
 }
 
 extern "C" cudaError_t
@@ -636,31 +742,31 @@ cudaFreeAsync_ptsz(void *devPtr, cudaStream_t hStream)
 }
 
 extern "C" CUresult
-cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, CUstream)
+cuMemAllocAsync(CUdeviceptr *dptr, size_t bytesize, CUstream stream)
 {
-  return (CUresult)malloc_async((void **)dptr, bytesize);
+  return (CUresult)malloc_async((void **)dptr, bytesize, stream);
 }
 
 extern "C" CUresult
-cuMemAllocAsync_ptsz(CUdeviceptr *dptr, size_t bytesize, CUstream)
+cuMemAllocAsync_ptsz(CUdeviceptr *dptr, size_t bytesize, CUstream stream)
 {
-  return (CUresult)malloc_async((void **)dptr, bytesize);
+  return (CUresult)malloc_async((void **)dptr, bytesize, stream);
 }
 
 extern "C" CUresult
 cuMemAllocFromPoolAsync(CUdeviceptr *dptr, size_t bytesize, CUmemoryPool pool,
-                        CUstream)
+                        CUstream stream)
 {
   pool_of(pool);
-  return (CUresult)malloc_async((void **)dptr, bytesize);
+  return (CUresult)malloc_async((void **)dptr, bytesize, stream);
 }
 
 extern "C" CUresult
 cuMemAllocFromPoolAsync_ptsz(CUdeviceptr *dptr, size_t bytesize,
-                             CUmemoryPool pool, CUstream)
+                             CUmemoryPool pool, CUstream stream)
 {
   pool_of(pool);
-  return (CUresult)malloc_async((void **)dptr, bytesize);
+  return (CUresult)malloc_async((void **)dptr, bytesize, stream);
 }
 
 extern "C" CUresult

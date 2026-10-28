@@ -260,6 +260,39 @@ front_libs_forget(Ctx *ctx)
   }
 }
 
+static void
+libs_stash()
+{
+  for (const FrontLibRecords *records : lib_records) {
+    if (records != NULL && records->stash != NULL) {
+      records->stash();
+    }
+  }
+}
+
+static void
+libs_drop()
+{
+  for (const FrontLibRecords *records : lib_records) {
+    if (records != NULL && records->drop != NULL) {
+      records->drop();
+    }
+  }
+}
+
+bool
+front_registered_kernel(const void *host)
+{
+  for (FrontObj *o = obj_heads[FRONT_FATBIN]; o != NULL; o = o->next) {
+    for (const Registration &r : ((Fatbin *)o)->regs) {
+      if (!r.is_var && r.host == host) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 // Loads the modules of the fatbins registered before 'seq' into cudart's
 // context of the current device, by a variable or function of each.  CUDA
 // loads a module at its first use, and so does a library its kernels; the
@@ -1086,6 +1119,7 @@ front_objs_stash()
   }
   front_modules_stash();
   front_arrays_stash();
+  libs_stash();
 }
 
 void
@@ -1104,6 +1138,7 @@ front_objs_drop_shadows()
   }
   front_modules_drop_shadows();
   front_arrays_drop_shadows();
+  libs_drop();
 }
 
 // Before any context exists in the new lower half.  The driver's call makes

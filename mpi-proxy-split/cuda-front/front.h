@@ -177,6 +177,9 @@ enum FrontKind {
   FRONT_BLASLT,          // a cuBLASLt handle
   FRONT_FFT,             // a cuFFT plan (not a handle: plans are ints)
   FRONT_RAND,            // a cuRAND generator
+  FRONT_GRAPH,           // a CUDA graph
+  FRONT_GNODE,           // a node of a graph
+  FRONT_GEXEC,           // an executable graph
   FRONT_N_KINDS
 };
 

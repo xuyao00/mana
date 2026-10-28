@@ -89,7 +89,9 @@ front_bad_handle(const void *handle, int kind)
                                        "function", "device", "CUDA array",
                                        "mipmapped array", "texture object",
                                        "cuBLAS handle", "cuBLASLt handle",
-                                       "cuFFT plan", "cuRAND generator" };
+                                       "cuFFT plan", "cuRAND generator",
+                                       "graph", "graph node",
+                                       "executable graph" };
   front_fatal("%p is not a %s that the front made\n", handle,
               kind > 0 && kind < FRONT_N_KINDS ? kinds[kind] : "handle");
 }

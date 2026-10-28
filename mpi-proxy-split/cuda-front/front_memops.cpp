@@ -51,6 +51,12 @@ static std::vector<MemopEvents *> all_memops;
 void
 front_order_memop(bool ptds)
 {
+  // Not into a stream capture (the per-thread stream can be captured): the
+  // event would be the graph's.
+  if (ptds && __atomic_load_n(&front_captures, __ATOMIC_ACQUIRE) > 0 &&
+      front_capturing(cudaStreamPerThread)) {
+    return;
+  }
   FrontThread *t = &front_thread;
   CUcontext ctx = NULL;
   CUresult rc;

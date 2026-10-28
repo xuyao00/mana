@@ -94,6 +94,8 @@ void front_peer_access(int device, int peer, unsigned flags, bool on)
 //
 // The record of a device's primary context, made on first use.
 Ctx *front_ctx_primary(int device) FRONT_HIDDEN;
+// The record of a real context, or NULL (not with objs_lock held).
+Ctx *front_ctx_of_real(CUcontext real) FRONT_HIDDEN;
 // The calling thread's current context, or NULL.
 Ctx *front_ctx_current() FRONT_HIDDEN;
 // Makes 'ctx' current on the checkpoint thread.
@@ -154,10 +156,30 @@ struct FrontLibRecords {
   void (*restore)(FrontObj *obj);
   void (*settle)();
   void (*forget)(Ctx *ctx);
+  void (*stash)();       // or NULL: at the checkpoint, after the GPUs sync
+  void (*drop)();        // or NULL: after a resume or a restart
 };
 void front_lib_records(FrontKind kind, const FrontLibRecords *records)
   FRONT_HIDDEN;
 void front_libs_forget(Ctx *ctx) FRONT_HIDDEN;  // with objs_lock held
+// Whether 'host' is the host stub of a kernel that the application
+// registered (with objs_lock held).
+bool front_registered_kernel(const void *host) FRONT_HIDDEN;
+// Stream capture (front_graphs.cpp): the captures begun and not ended.  A
+// thread holds the checkpoint gate during its capture.
+extern int front_captures FRONT_HIDDEN;
+// Whether 'real' (a stream of the lower half's) is capturing.
+bool front_capturing(cudaStream_t real) FRONT_HIDDEN;
+// A host node's function and data for the driver (front_async.cpp): a
+// trampoline that hands each call to the runner, and a target that lives as
+// long as the process, since a graph may run it again and keep it across a
+// restart.
+void front_host_node(cudaHostFn_t fn, void *user_data, void **driver_fn,
+                     void **driver_data) FRONT_HIDDEN;
+// The application's function and data of a host node made so; false if the
+// driver's are not the front's.
+bool front_host_node_target(void *driver_fn, void *driver_data,
+                            cudaHostFn_t *fn, void **user_data) FRONT_HIDDEN;
 
 // Event times (front_async.cpp).
 void front_events_quiesce() FRONT_HIDDEN;

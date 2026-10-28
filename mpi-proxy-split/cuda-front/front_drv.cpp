@@ -319,6 +319,12 @@ front_entry_point(void *real)
 
 }  // namespace
 
+Ctx *
+front_ctx_of_real(CUcontext real)
+{
+  return ctx_of_real(real, false);
+}
+
 // ---- Contexts, shared with the runtime -----------------------------------
 
 Ctx *

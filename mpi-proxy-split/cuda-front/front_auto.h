@@ -47,9 +47,9 @@ front_is_handle()
 }
 
 // The handle types that forwarded calls translate, each by its
-// front_translate() below: streams, events, contexts, modules, functions and
-// arrays here; a library's handles in its own header (front_blas.h), which
-// its generated table includes after this one.
+// front_translate() below: streams, events, contexts, modules, functions,
+// arrays and graphs here; a library's handles in its own header
+// (front_blas.h), which its generated table includes after this one.
 template <typename T>
 struct front_translated : std::false_type {};
 #define FRONT_TRANSLATED(type) \
@@ -66,6 +66,11 @@ FRONT_TRANSLATED(CUarray);
 FRONT_TRANSLATED(cudaMipmappedArray_t);
 FRONT_TRANSLATED(cudaMipmappedArray_const_t);
 FRONT_TRANSLATED(CUmipmappedArray);
+// Graphs (front_graphs.cpp); the driver's CUgraph, CUgraphNode and
+// CUgraphExec are the same types.
+FRONT_TRANSLATED(cudaGraph_t);
+FRONT_TRANSLATED(cudaGraphNode_t);
+FRONT_TRANSLATED(cudaGraphExec_t);
 
 // Whether the front can forward a parameter of type T as it is (after
 // translating the handles above).  Not: other handles, pointers to handles
@@ -159,6 +164,24 @@ static inline CUmipmappedArray
 front_translate(CUmipmappedArray mipmap)
 {
   return (CUmipmappedArray)front_real_obj(mipmap, FRONT_MIPMAP);
+}
+
+static inline cudaGraph_t
+front_translate(cudaGraph_t graph)
+{
+  return (cudaGraph_t)front_real_obj(graph, FRONT_GRAPH);
+}
+
+static inline cudaGraphNode_t
+front_translate(cudaGraphNode_t node)
+{
+  return (cudaGraphNode_t)front_real_obj(node, FRONT_GNODE);
+}
+
+static inline cudaGraphExec_t
+front_translate(cudaGraphExec_t exec)
+{
+  return (cudaGraphExec_t)front_real_obj(exec, FRONT_GEXEC);
 }
 
 template <typename T>
