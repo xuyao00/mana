@@ -33,15 +33,22 @@ E2E_TESTS = p2p_blocking p2p_nonblocking p2p_ring p2p_any_source p2p_probe \
             p2p_issend_envelope p2p_issend_twice p2p_issend_nbx \
             shared_memory mmap_threads comm_free keyvals
 E2E_FORTRAN = fortran_p2p fortran_nonblocking fortran_handles fortran_attributes
+# CUDA-aware MPI tests (mana_launch --cuda); built if nvcc is there.
+NVCC ?= $(shell command -v nvcc 2>/dev/null)
+E2E_CUDA = $(if $(NVCC),cuda_aware)
 
 # The suite also runs the example of ../examples (ring_example).
-e2e: ${E2E_TESTS} ${E2E_FORTRAN} dlopen_mpi
+e2e: ${E2E_TESTS} ${E2E_FORTRAN} dlopen_mpi ${E2E_CUDA}
 	+ $(MAKE) -C ../examples
 
 ${E2E_TESTS}: %: %.c mana_test.h
 	$(MPICC) -g3 -O0 -o $@ $< $(MPI_CFLAGS) ${MPI_LDFLAGS}
 
 mmap_threads: MPI_LDFLAGS += -pthread
+
+# With the shared CUDA runtime: the front stands for it under --cuda.
+cuda_aware: %: %.cu mana_test.h
+	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $<
 
 # Opens the MPI library with dlopen(), so it is not linked with it.
 dlopen_mpi: dlopen_mpi.c
@@ -81,4 +88,4 @@ tidy:
 
 clean: tidy
 	rm -f *.pyc *.so
-	rm -f ${E2E_TESTS} ${E2E_FORTRAN} ${BENCH_FILES}
+	rm -f ${E2E_TESTS} ${E2E_FORTRAN} ${BENCH_FILES} cuda_aware

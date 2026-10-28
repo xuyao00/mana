@@ -45,11 +45,13 @@ class Test:
   burst:       checkpoints in a row per cycle, without waiting for progress.
   restart_now: restart right after the checkpoints, without waiting for
                progress.
+  cuda:        a CUDA-aware MPI test: runs with MANA_CUDA=1 (mana_launch
+               --cuda).  test/Makefile builds it if it finds nvcc.
   """
 
   def __init__(self, name, ranks, args=(), kind="loop", expect=None,
                restart=False, fails=False, known_bug=None, native_args=None,
-               program=None, burst=1, restart_now=False):
+               program=None, burst=1, restart_now=False, cuda=False):
     self.name = name
     self.ranks = ranks
     self.args = list(args)
@@ -64,6 +66,7 @@ class Test:
     self.native_args = native_args if native_args is not None else self.args
     self.burst = burst
     self.restart_now = restart_now
+    self.cuda = cuda
 
 
 TESTS = [
@@ -109,6 +112,7 @@ TESTS = [
   Test("misc_calls", 2),
   Test("mmap_threads", 2),
   Test("mmap_threads_quiet", 2, args=["-q"], program="mmap_threads"),
+  Test("cuda_aware", 2, cuda=True),
   Test("fortran_nonblocking", 2),
   Test("fortran_handles", 2),
   Test("fortran_attributes", 2),
@@ -192,6 +196,8 @@ class Run:
       # DMTCP writes its error messages here when stderr is not a file.
       "JALIB_STDERR_PATH": os.path.join(self.dir, "dmtcp-errors.log"),
     })
+    if test.cuda and not opts.native:
+      self.env["MANA_CUDA"] = "1"
     self.proc = None
     self.logs = []
 
