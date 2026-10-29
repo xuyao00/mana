@@ -81,6 +81,8 @@ void mana_set_rank(int rank);
 // A "name=value" line for the checkpoint's header.mana, which mana_restart
 // reads.
 void mana_set_header(const char *name, const char *value);
+// The checkpoint directory (ckpt_rank_N), from MANA_STEP_SAVE on.
+const char *mana_ckpt_dir(void);
 // DMTCP's key-value store, which takes one caller at a time from the
 // application's threads.
 int mana_kv_set(const char *db, const char *key, const char *val);

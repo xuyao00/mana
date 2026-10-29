@@ -425,6 +425,9 @@ mana_cuda_event(int event)
       front_objs_stash();
       front_vmm_stash();
       break;
+    case MANA_STEP_SAVE:
+      front_vmm_save();
+      break;
     case MANA_STEP_RESUME:
       front_vmm_drop_shadows();
       front_objs_drop_shadows();

@@ -115,6 +115,8 @@ typedef struct _LowerHalfInfo
   // the process gets (reserve_cuda_slot()); call it right before that, with
   // any lower-half FS.
   void *cuda_open_slot;
+  // At restart, the path of the image being restored; NULL at launch.
+  const char *restart_image;
 } LowerHalfInfo_t;
 
 extern LowerHalfInfo_t *lh_info;

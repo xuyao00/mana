@@ -239,7 +239,11 @@ bool front_vmm_free(void *ptr, cudaError_t *result) FRONT_HIDDEN;
 // cudaFreeAsync, cuMemFreeAsync: free once 'real_stream' gets there.
 bool front_vmm_free_async(void *ptr, cudaStream_t real_stream, int *result)
   FRONT_HIDDEN;
+// At a checkpoint: the contents of the live allocations into shadows, or,
+// with MANA_CUDA_DEVICE_DATA=file, into a file of the checkpoint directory
+// (front_vmm_save(), once it is named).
 void front_vmm_stash() FRONT_HIDDEN;
+void front_vmm_save() FRONT_HIDDEN;
 void front_vmm_drop_shadows() FRONT_HIDDEN;
 // At restart: the mappings, before anything else; their contents, last.
 void front_vmm_map() FRONT_HIDDEN;

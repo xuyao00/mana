@@ -472,6 +472,7 @@ int main(int argc, char *argv[], char *envp[]) {
       if (strcmp(argv[i], "--restartdir") == 0) {
         // Repace the --restartdir flags and its value to the path of the actual checkpoint image file.
         image_path = get_restore_target_info(argv[i+1], rank);
+        lh_info->restart_image = strdup(image_path.c_str());
         argc--;
         for (int j = i; j < argc; j++) {
           argv[j] = argv[j + 1];

@@ -29,11 +29,22 @@
 // vmm-alloc.c: a chunk is an allocation of its own, which stays mapped.  So
 // CU_POINTER_ATTRIBUTE_RANGE_START/SIZE, and a CUDA IPC export, cover the
 // chunk.
+//
+// At a checkpoint, the contents go into shadows in the upper half, which
+// DMTCP saves with the image, or with MANA_CUDA_DEVICE_DATA=file into
+// cuda_memory.mana in the checkpoint directory, through a pinned buffer of
+// the lower half: then no host memory holds them (Perlmutter's 4 GPUs have
+// 320 GB, its nodes 256 GB).
 
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <map>
 #include <mutex>
+#include <string>
 #include "front.h"
 
 namespace {
@@ -44,6 +55,7 @@ struct Alloc {
   int device;
   CUmemGenericAllocationHandle handle;  // of generation 'gen'
   void *shadow;                         // device contents during a checkpoint
+  bool in_file;                         // or they are in the device file
   bool live;                            // false: freed, kept mapped for reuse
   int export_fd;                        // CUDA IPC: of generation export_gen
   unsigned export_gen;                  // 0: never exported
@@ -60,6 +72,16 @@ struct Chunk {
   uint32_t n_free;
   std::vector<uint64_t> used;    // a bit per block
   std::vector<size_t> requested; // per block, for the checkpoint
+};
+
+#define DEVICE_FILE "cuda_memory.mana"
+#define DEVICE_FILE_MAGIC 0x414455434e414d00ULL  // "\0MANCUDA"
+#define DEVICE_FILE_BUFFER (64 << 20)
+
+// One allocation's contents in the device file, after this header.
+struct FileRecord {
+  uint64_t addr;
+  uint64_t size;
 };
 
 // cudaFreeAsync: a block is free once its stream has passed this event (of
@@ -307,7 +329,7 @@ big_alloc_locked(void **ptr, size_t size, int device)
   if (va == 0) {
     return cudaErrorMemoryAllocation;
   }
-  Alloc a = { rounded, size, device, 0, NULL, true, -1, 0 };
+  Alloc a = { rounded, size, device, 0, NULL, false, true, -1, 0 };
   if (map_physical(va, rounded, device, &a.handle) != CUDA_SUCCESS) {
     give_back_va(va, rounded);
     return cudaErrorMemoryAllocation;
@@ -343,7 +365,8 @@ small_alloc_locked(void **ptr, size_t size, int device)
     if (base == 0) {
       return cudaErrorMemoryAllocation;
     }
-    Alloc a = { chunk_size, chunk_size, device, 0, NULL, true, -1, 0 };
+    Alloc a = { chunk_size, chunk_size, device, 0, NULL, false, true, -1,
+                0 };
     if (map_physical(base, chunk_size, device, &a.handle) != CUDA_SUCCESS) {
       give_back_va(base, chunk_size);
       return cudaErrorMemoryAllocation;
@@ -484,11 +507,19 @@ front_vmm_free_async(void *ptr, cudaStream_t real_stream, int *result)
   return true;
 }
 
+static bool
+device_data_to_file()
+{
+  const char *where = getenv("MANA_CUDA_DEVICE_DATA");
+  return where != NULL && strcmp(where, "file") == 0;
+}
+
 void
 front_vmm_stash()
 {
   std::lock_guard<std::mutex> guard(vmm_lock);
   reap_locked(true);
+  bool to_file = device_data_to_file();
   size_t bytes = 0;
   for (auto &entry : allocs) {
     Alloc &a = entry.second;
@@ -509,6 +540,11 @@ front_vmm_stash()
         continue;
       }
     }
+    if (to_file) {
+      a.in_file = true;  // front_vmm_save(); the GPU is idle until resume
+      bytes += a.requested;
+      continue;
+    }
     a.shadow = malloc(a.requested);
     if (a.shadow == NULL) {
       front_fatal("no host memory for a %zu-byte device shadow\n",
@@ -523,7 +559,105 @@ front_vmm_stash()
     }
     bytes += a.requested;
   }
-  front_log("saved %zu bytes of device memory\n", bytes);
+  front_log("%s %zu bytes of device memory\n", to_file ? "to save" : "saved",
+            bytes);
+}
+
+static void
+write_all(int fd, const void *buf, size_t size, const std::string &path)
+{
+  for (size_t done = 0; done < size;) {
+    ssize_t n = write(fd, (const char *)buf + done, size - done);
+    if (n <= 0) {
+      front_fatal("writing %s: %s\n", path.c_str(), strerror(errno));
+    }
+    done += n;
+  }
+}
+
+static void
+read_all(int fd, void *buf, size_t size, const std::string &path)
+{
+  for (size_t done = 0; done < size;) {
+    ssize_t n = read(fd, (char *)buf + done, size - done);
+    if (n <= 0) {
+      front_fatal("reading %s: %s\n", path.c_str(),
+                  n == 0 ? "too short" : strerror(errno));
+    }
+    done += n;
+  }
+}
+
+static void *
+pinned_buffer()
+{
+  void *buf = NULL;
+  cudaError_t rc;
+  FRONT_LH(rc = REAL(cudaHostAlloc)(&buf, DEVICE_FILE_BUFFER,
+                                    cudaHostAllocPortable));
+  if (rc != cudaSuccess) {
+    front_fatal("no pinned buffer for the device file: error %d\n", rc);
+  }
+  return buf;
+}
+
+static void
+free_pinned_buffer(void *buf)
+{
+  cudaError_t rc;
+  FRONT_LH(rc = REAL(cudaFreeHost)(buf));
+  (void)rc;
+}
+
+// MANA_STEP_SAVE, with MANA_CUDA_DEVICE_DATA=file: the contents that
+// front_vmm_stash() left on the device, into the checkpoint directory.
+void
+front_vmm_save()
+{
+  std::lock_guard<std::mutex> guard(vmm_lock);
+  uint64_t count = 0;
+  for (auto &entry : allocs) {
+    count += entry.second.in_file;
+  }
+  if (count == 0) {
+    return;
+  }
+  std::string path = std::string(mana_ckpt_dir()) + "/" DEVICE_FILE;
+  int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) {
+    front_fatal("cannot create %s: %s\n", path.c_str(), strerror(errno));
+  }
+  uint64_t header[2] = { DEVICE_FILE_MAGIC, count };
+  write_all(fd, header, sizeof header, path);
+  void *buf = pinned_buffer();
+  size_t bytes = 0;
+  for (auto &entry : allocs) {
+    Alloc &a = entry.second;
+    if (!a.in_file) {
+      continue;
+    }
+    FileRecord record = { entry.first, a.requested };
+    write_all(fd, &record, sizeof record, path);
+    for (size_t done = 0; done < a.requested;) {
+      size_t n = a.requested - done < DEVICE_FILE_BUFFER
+                   ? a.requested - done : DEVICE_FILE_BUFFER;
+      cudaError_t rc;
+      FRONT_LH(rc = REAL(cudaMemcpy)(buf, (void *)(entry.first + done), n,
+                                     cudaMemcpyDeviceToHost));
+      if (rc != cudaSuccess) {
+        front_fatal("saving device memory at %#llx: error %d\n",
+                    (unsigned long long)entry.first, rc);
+      }
+      write_all(fd, buf, n, path);
+      done += n;
+    }
+    bytes += a.requested;
+  }
+  free_pinned_buffer(buf);
+  if (close(fd) != 0) {
+    front_fatal("writing %s: %s\n", path.c_str(), strerror(errno));
+  }
+  front_log("saved %zu bytes of device memory in %s\n", bytes, path.c_str());
 }
 
 void
@@ -533,6 +667,7 @@ front_vmm_drop_shadows()
   for (auto &entry : allocs) {
     free(entry.second.shadow);
     entry.second.shadow = NULL;
+    entry.second.in_file = false;
   }
 }
 
@@ -669,11 +804,72 @@ front_vmm_peer_access(int device, int peer, bool on)
   }
 }
 
+// The contents that front_vmm_save() wrote, from the device file next to the
+// image being restored.
+static void
+fill_from_file()
+{
+  uint64_t count = 0;
+  for (auto &entry : allocs) {
+    count += entry.second.in_file;
+  }
+  if (count == 0) {
+    return;
+  }
+  if (lh_info->restart_image == NULL) {
+    front_fatal("device memory is in a file, but the lower half names no "
+                "image\n");
+  }
+  std::string path = lh_info->restart_image;
+  path = path.substr(0, path.rfind('/') + 1) + DEVICE_FILE;
+  int fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    front_fatal("cannot open %s: %s\n", path.c_str(), strerror(errno));
+  }
+  uint64_t header[2];
+  read_all(fd, header, sizeof header, path);
+  if (header[0] != DEVICE_FILE_MAGIC || header[1] != count) {
+    front_fatal("%s is not this checkpoint's device memory\n", path.c_str());
+  }
+  void *buf = pinned_buffer();
+  for (uint64_t i = 0; i < count; i++) {
+    FileRecord record;
+    read_all(fd, &record, sizeof record, path);
+    auto it = allocs.find(record.addr);
+    if (it == allocs.end() || !it->second.in_file ||
+        it->second.requested != record.size) {
+      front_fatal("%s: no allocation of %llu bytes at %#llx\n", path.c_str(),
+                  (unsigned long long)record.size,
+                  (unsigned long long)record.addr);
+    }
+    cudaError_t rc;
+    FRONT_LH(rc = REAL(cudaSetDevice)(it->second.device));
+    if (rc == cudaSuccess) {
+      ready_device(it->second.device);
+    }
+    for (size_t done = 0; rc == cudaSuccess && done < record.size;) {
+      size_t n = record.size - done < DEVICE_FILE_BUFFER
+                   ? record.size - done : DEVICE_FILE_BUFFER;
+      read_all(fd, buf, n, path);
+      FRONT_LH(rc = REAL(cudaMemcpy)((void *)(record.addr + done), buf, n,
+                                     cudaMemcpyHostToDevice));
+      done += n;
+    }
+    if (rc != cudaSuccess) {
+      front_fatal("restoring device memory at %#llx: error %d\n",
+                  (unsigned long long)record.addr, rc);
+    }
+  }
+  free_pinned_buffer(buf);
+  close(fd);
+}
+
 // Last at restart: the contents, once cudart's contexts are back.
 void
 front_vmm_fill()
 {
   std::lock_guard<std::mutex> guard(vmm_lock);
+  fill_from_file();
   for (auto &entry : allocs) {
     Alloc &a = entry.second;
     if (a.shadow == NULL) {

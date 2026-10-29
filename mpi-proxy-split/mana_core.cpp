@@ -662,6 +662,12 @@ mana_cuda_drain_memops()
   run_layer(MANA_LAYER_CUDA, MANA_STEP_DRAIN_MEMOPS);
 }
 
+extern "C" const char *
+mana_ckpt_dir(void)
+{
+  return dmtcp_get_ckpt_dir();
+}
+
 // DMTCP's key-value store, for the front's CUDA IPC.  From the application's
 // threads, one caller at a time: they share one socket to the coordinator.
 extern "C" int
