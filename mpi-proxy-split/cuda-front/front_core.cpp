@@ -295,26 +295,28 @@ front_open_slot()
   __atomic_store_n(&front_slot_gen, front_gen, __ATOMIC_RELEASE);
 }
 
-// libmana.so calls mana_cuda_event() through the function that it is given
-// here, also if the application dlopen()s a front library.
+// libmana.so, the core, calls mana_cuda_event() through the function that
+// it is given here, also if the application dlopen()s a front library.
 __attribute__((constructor)) static void
 front_register()
 {
-  typedef void (*register_t)(mana_cuda_event_t);
-  register_t reg = (register_t)dlsym(RTLD_DEFAULT, "mana_cuda_register");
+  typedef void (*register_t)(int, mana_layer_fn_t);
+  register_t reg = (register_t)dlsym(RTLD_DEFAULT, "mana_register_layer");
   if (reg != NULL) {
-    reg(mana_cuda_event);
+    reg(MANA_LAYER_CUDA, mana_cuda_event);
   }
 }
 
-// Called by libmana.so (mpi_plugin.cpp) on the checkpoint thread, with the
-// lower half closed to the application's threads; MANA_CUDA_THREAD_EXIT, on
-// an exiting thread; MANA_CUDA_DRAIN_MEMOPS, in an MPI call.
+// The CUDA layer's steps (mana_core.h).  Called by libmana.so (mana_core.cpp)
+// on the checkpoint thread, with the lower half closed to the application's
+// threads; MANA_STEP_THREAD_EXIT, on an exiting thread;
+// MANA_STEP_DRAIN_MEMOPS, in an MPI call.  The other steps are not the
+// front's.
 extern "C" void
 mana_cuda_event(int event)
 {
   switch (event) {
-    case MANA_CUDA_QUIESCE: {
+    case MANA_STEP_QUIESCE: {
       // The application's threads are out of the lower half, so no new
       // work can start, and their context stacks stay as they are: the
       // copies learn what the MPI made current.  Then wait for the work
@@ -345,16 +347,16 @@ mana_cuda_event(int event)
       front_events_quiesce();
       break;
     }
-    case MANA_CUDA_STASH:
+    case MANA_STEP_STASH:
       front_objs_stash();
       front_vmm_stash();
       break;
-    case MANA_CUDA_RESUME:
+    case MANA_STEP_RESUME:
       front_vmm_drop_shadows();
       front_objs_drop_shadows();
       front_events_resume();
       break;
-    case MANA_CUDA_RESTART:
+    case MANA_STEP_RESTART:
       if (lh_info == NULL || !lh_info->cuda_enabled) {
         front_fatal("the new lower half has no CUDA; restart with "
                     "mana_restart --cuda\n");
@@ -393,16 +395,16 @@ mana_cuda_event(int event)
         front_thread.gen = 0;
       }
       break;
-    case MANA_CUDA_RESTART_IPC:
+    case MANA_STEP_RESTART_PEERS:
       front_ipc_reimport();
       break;
-    case MANA_CUDA_THREAD_EXIT:
+    case MANA_STEP_THREAD_EXIT:
       front_thread_exit();
       break;
-    case MANA_CUDA_DRAIN_MEMOPS:
+    case MANA_STEP_DRAIN_MEMOPS:
       front_drain_memops();
       break;
     default:
-      front_fatal("unknown event %d\n", event);
+      break;
   }
 }

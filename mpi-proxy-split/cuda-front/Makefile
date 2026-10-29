@@ -72,7 +72,7 @@ FRONT_OBJS = front_core.o front_vmm.o front_objs.o front_drv.o \
              $(if ${CURAND_SONAME},front_rand.o gen/curand-gen.o)
 FRONT_LIBS = ${CUDART_SONAME} libcuda.so.1 ${CUBLAS_SONAME} \
              ${CUBLASLT_SONAME} ${CUFFT_SONAME} ${CURAND_SONAME}
-FRONT_HEADERS = front.h front_auto.h front_objs.h front_reg.h mana_cuda.h \
+FRONT_HEADERS = front.h front_auto.h front_objs.h front_reg.h ../mana_core.h \
                 gen/cudart-index.h gen/cuda-index.h \
                 ../lower-half/lower-half-api.h
 

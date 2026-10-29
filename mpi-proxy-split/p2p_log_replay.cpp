@@ -33,7 +33,6 @@
 #include "dmtcp.h"
 #include "util.h"
 #include "dmtcp_assert.h"
-#include "jfilesystem.h"
 
 #include "mpi_plugin.h"
 #include "mpi_nextfunc.h"
@@ -86,33 +85,6 @@ getLocalRankInfo()
     ASSERT(MPI_Comm_size(MPI_COMM_WORLD, &g_world_size) == MPI_SUCCESS &&
         g_world_size != -1, "MPI_Comm_size failed");
   }
-}
-
-void
-updateCkptDirByRank()
-{
-  const char *ckptDir = dmtcp_get_ckpt_dir();
-  dmtcp::string baseDir;
-
-  if (strstr(ckptDir, "ckpt_rank_") != NULL) {
-    baseDir = jalib::Filesystem::DirName(ckptDir);
-  } else {
-    baseDir = ckptDir;
-  }
-  TRACE("Updating checkpoint directory: ckptDir={} baseDir={}", ckptDir,
-        baseDir);
-  dmtcp::ostringstream o;
-  o << baseDir << "/ckpt_rank_" << g_world_rank;
-  dmtcp_set_ckpt_dir(o.str().c_str());
-
-#if 0
-  o << "/lhregions.dat";
-  dmtcp::string fname = o.str();
-  int fd = open(fname.c_str(), O_CREAT | O_WRONLY, 0600);
-  // g_range (lh_memory_range) was written for debugging here.
-  Util::writeAll(fd, g_range, sizeof(*g_range));
-  close(fd);
-#endif
 }
 
 void

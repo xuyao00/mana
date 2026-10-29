@@ -57,7 +57,7 @@ void wait_for_unblocked_threads_to_leave_lower_half();
 void allow_threads_to_enter_lower_half();
 
 // Under --cuda, nonzero while the application's synchronous CUDA copies and
-// sets may still run: an MPI call waits for them first (mpi_plugin.cpp,
+// sets may still run: an MPI call waits for them first (mana_core.cpp,
 // cuda-front/front_memops.cpp).
 extern int mana_cuda_memops_pending;
 void mana_cuda_drain_memops();

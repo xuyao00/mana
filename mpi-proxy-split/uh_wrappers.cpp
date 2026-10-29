@@ -32,7 +32,8 @@
 
 #include "lower-half-api.h"
 #include "dmtcp.h"
-#include "mpi_plugin.h"
+#include "mana_core.h"
+#include "uh_wrappers.h"
 
 int initialized = 0;
 

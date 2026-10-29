@@ -41,7 +41,7 @@
 #include "lower-half-api.h"
 #include "lower-half/switch-context.h"
 #include "lower_half_ckpt.h"
-#include "mana_cuda.h"
+#include "mana_core.h"
 
 #define FRONT_HIDDEN __attribute__((visibility("hidden")))
 
@@ -280,7 +280,7 @@ void front_objs_restore() FRONT_HIDDEN;
 // After a synchronous copy or set of the application, on the legacy (or
 // with 'ptds', the per-thread) default stream; within the gate.
 void front_order_memop(bool ptds) FRONT_HIDDEN;
-// MANA_CUDA_DRAIN_MEMOPS: libmana.so is about to call MPI.
+// MANA_STEP_DRAIN_MEMOPS: an MPI wrapper is about to call MPI.
 void front_drain_memops() FRONT_HIDDEN;
 void front_memops_forget(CUcontext ctx) FRONT_HIDDEN;
 

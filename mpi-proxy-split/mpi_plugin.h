@@ -28,6 +28,7 @@
 
 #include "lower-half-api.h"
 #include "dmtcp_dlsym.h"
+#include "mana_core.h"
 
 #define   _real_fork      NEXT_FNC_DEFAULT(fork)
 
@@ -55,17 +56,6 @@ void init_predefined_attributes();
 int copy_comm_attributes(MPI_Comm oldcomm, MPI_Comm newcomm);
 int delete_self_attributes();
 
-enum mana_state_t {
-  UNKNOWN_STATE,
-  RUNNING,
-  CKPT_COLLECTIVE,
-  CKPT_P2P,
-  RESTART_RETORE,
-  RESTART_REPLAY
-};
-
-extern mana_state_t mana_state;
-extern bool g_libmana_is_initialized;
 extern bool g_libmpi_is_initialized;  // MANA's MPI_Init has returned
 
 #endif // ifndef _MPI_PLUGIN_H

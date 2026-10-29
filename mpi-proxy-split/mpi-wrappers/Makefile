@@ -44,7 +44,7 @@ override CXXFLAGS += -fPIC -I${DMTCP_INCLUDE} -I${JALIB_INCLUDE} \
 # code is in libmpi_cxx.so.
 override CXXFLAGS += -DOMPI_SKIP_MPICXX -DMPICH_SKIP_MPICXX
 
-# We don't build libmpiwrappers.a.  Instead, we use *.o to build libmana.so.
+# We don't build libmpiwrappers.a.  Instead, we use *.o to build libmana_mpi.so.
 default: ${LIBNAME}.a libmpistub.so libmpistub_audit.so
 
 # If any .o file is re-built, then re-build mpi_collective_wrappers.o .

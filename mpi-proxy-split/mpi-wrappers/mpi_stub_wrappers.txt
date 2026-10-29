@@ -2,7 +2,7 @@
 //   each MPI function of libmpi.so.  libmpistub.so stands in for the MPI
 //   library in the upper half: the upper half loads it in place of the
 //   application's MPI library (see mpi_stub_audit.c), and a program may also
-//   be linked with it.  libmana.so, preloaded, takes the MPI calls (with
+//   be linked with it.  libmana_mpi.so, preloaded, takes the MPI calls (with
 //   mpi_unimplemented_wrappers.cpp for those that MANA does not support), so
 //   no function of libmpistub.so is called.
 
@@ -421,7 +421,7 @@ int MPI_Init_thread(int *argc, char ***argv, int required, int *provided);
 int MPI_Get_count(const MPI_Status *status, MPI_Datatype datatype, int *count);
 int MPI_Group_incl(MPI_Group group, int n, const int ranks[], MPI_Group *newgroup);
 
-// The tool information interface (libmana's mpi_t_wrappers.cpp);
+// The tool information interface (libmana_mpi's mpi_t_wrappers.cpp);
 int MPI_T_init_thread(int required, int *provided);
 int MPI_T_finalize(void);
 int MPI_T_enum_get_info(MPI_T_enum enumtype, int *num, char *name, int *name_len);

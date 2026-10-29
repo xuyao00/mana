@@ -141,9 +141,12 @@ while index < len(dmtcp_flags):
     index = index + 1
 dmtcp_flags = filtered_flags
 
-mana_plugin = mana_root_path + "lib/dmtcp/libmana.so"
+# libmana.so, the core (the DMTCP plugin), and its layers: libmana_mpi.so,
+# which takes the MPI calls, and with --cuda the CUDA front.
+mana_plugins = [mana_root_path + "lib/dmtcp/libmana.so",
+                mana_root_path + "lib/dmtcp/libmana_mpi.so"]
 # Libraries in MANA_PRELOAD (colon-separated, e.g. a PMPI profiler) load
-# ahead of the mana plugin, so they intercept MPI calls before MANA does.
+# ahead of the mana plugins, so they intercept MPI calls before MANA does.
 # A library in LD_PRELOAD loads after them.
 pre_plugins = [p for p in os.environ.get("MANA_PRELOAD", "").split(":") if p]
 # --cuda: the CUDA front loads first, so that it can redirect a static CUDA
@@ -154,7 +157,7 @@ if os.environ.get("MANA_CUDA", "") not in ("", "0"):
   cuda_front = mana_root_path + "lib/dmtcp/cuda-front/libmana_cuda.so"
   if os.path.exists(cuda_front):
     cuda_plugins.append(cuda_front)
-plugin_list = ":".join(pre_plugins + [mana_plugin] + cuda_plugins +
+plugin_list = ":".join(pre_plugins + mana_plugins + cuda_plugins +
                        user_plugins)
 
 # Build the command line to be executed

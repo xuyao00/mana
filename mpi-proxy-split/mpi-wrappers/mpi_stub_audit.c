@@ -29,7 +29,7 @@
 //
 // A program that dlopen()s the MPI library and calls dlsym() on its handle
 // would get the stub's function, which aborts.  la_symbind64() gives it
-// libmana.so's function of the same name instead.
+// libmana_mpi.so's function of the same name instead.
 //
 // Built without libc: an audit module gets its own link namespace, and a
 // second libc there would call mmap() without MANA's wrappers.
@@ -131,7 +131,7 @@ la_objsearch(const char *name, uintptr_t *cookie, unsigned int flag)
   return (char *)name;
 }
 
-// libmana.so, which defines MANA's MPI functions; set by la_objopen().
+// libmana_mpi.so, which defines MANA's MPI functions; set by la_objopen().
 static struct link_map *libmana;
 
 // Whether s and t are the same string.
@@ -179,7 +179,7 @@ defines(const ElfW(Sym) *sym, const char *strtab, const char *name)
 }
 
 // The address of the function or variable 'name' that 'map' defines, or 0.
-// Uses the GNU hash table, which the toolchain gives libmana.so.
+// Uses the GNU hash table, which the toolchain gives libmana_mpi.so.
 static uintptr_t
 lookup(const struct link_map *map, const char *name)
 {
@@ -233,14 +233,14 @@ la_objopen(struct link_map *map, Lmid_t lmid, uintptr_t *cookie)
 {
   (void)lmid;
   (void)cookie;
-  if (is_file(map->l_name, "libmana.so")) {
+  if (is_file(map->l_name, "libmana_mpi.so")) {
     libmana = map;
   }
   return is_file(map->l_name, STUB_LIBRARY) ? LA_FLG_BINDTO : 0;
 }
 
 // Called for a symbol of libmpistub.so that dlsym() finds.  Returns
-// libmana.so's definition of the same name if there is one.
+// libmana_mpi.so's definition of the same name if there is one.
 uintptr_t
 la_symbind64(Elf64_Sym *sym, unsigned int ndx, uintptr_t *refcook,
              uintptr_t *defcook, unsigned int *flags, const char *symname)

@@ -36,12 +36,6 @@
 #include <unistd.h>
 #include "front_objs.h"
 
-// libmana.so (mpi_plugin.cpp): DMTCP's key-value store, which takes one
-// caller at a time from the application's threads.
-extern "C" int mana_kv_set(const char *db, const char *key, const char *val);
-extern "C" int mana_kv_get(const char *db, const char *key, char *val,
-                           size_t size);
-
 namespace {
 
 #define IPC_MAGIC 0x4d414e41u  // "MANA"

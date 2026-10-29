@@ -23,7 +23,7 @@
 // loads MPI at run time does, and gets the MPI functions with dlsym() on the
 // handle.  Runs MPI_Allreduce for SECONDS (time for a checkpoint).  Under
 // MANA (libmana.so is loaded), the handle must be libmpistub.so, the
-// functions libmana.so's, and the upper half must have no MPI library.  The
+// functions libmana_mpi.so's, and the upper half must have no MPI library.  The
 // program is not linked with the MPI library.
 // usage: dlopen_mpi LIBRARY SECONDS
 
@@ -77,8 +77,8 @@ lookup(void *handle, const char *name, int under_mana)
     fail("dlsym: ", name);
   }
   if (under_mana && (dladdr(f, &info) == 0 ||
-                     strcmp(base_name(info.dli_fname), "libmana.so") != 0)) {
-    fail("not a function of libmana.so: ", name);
+                     strcmp(base_name(info.dli_fname), "libmana_mpi.so") != 0)) {
+    fail("not a function of libmana_mpi.so: ", name);
   }
   return f;
 }

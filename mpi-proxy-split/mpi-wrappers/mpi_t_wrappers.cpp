@@ -191,7 +191,8 @@ int PMPI_T_pvar_handle_free(MPI_T_pvar_session session,
 
 // MPI_T_PVAR_ALL_HANDLES names all of a session's handles: none here.  It
 // is a variable of the MPI library (here libmpistub.so), looked up at the
-// call: a program that dlopen()s the MPI library loads it after libmana.so.
+// call: a program that dlopen()s the MPI library loads it after
+// libmana_mpi.so.
 static bool
 is_all_handles(MPI_T_pvar_handle handle)
 {
