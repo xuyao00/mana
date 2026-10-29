@@ -14,18 +14,28 @@ ifndef DMTCP_ROOT
   DMTCP_ROOT=${MANA_ROOT}/dmtcp
 endif
 
-NVCC_PATH := $(shell which nvcc 2>/dev/null)
-ifdef NVCC_PATH
-  CUDA_HOME ?= $(realpath $(dir $(NVCC_PATH))/..)
+# CUDA_HOME: configure's (Makefile_config), or nvcc's.
+ifeq (${CUDA_HOME},)
+  NVCC_PATH := $(shell which nvcc 2>/dev/null)
+  ifdef NVCC_PATH
+    CUDA_HOME := $(realpath $(dir $(NVCC_PATH))/..)
+  else
+    CUDA_HOME := /usr/local/cuda
+  endif
 endif
-CUDA_HOME ?= /usr/local/cuda
 
-# The CUDA libraries of the lower half's MPI: the front stands for them.
+# The real libraries, for which the front stands: those of the lower half's
+# MPI if it uses CUDA, since the application must use the same; otherwise
+# the toolkit's libcudart and the driver's libcuda.
 LOWER_HALF = ../lower-half/lower-half
-REAL_LIBCUDART ?= $(shell ldd ${LOWER_HALF} 2>/dev/null | \
-                    awk '/libcudart\.so/ {print $$3; exit}')
-REAL_LIBCUDA ?= $(shell ldd ${LOWER_HALF} 2>/dev/null | \
-                  awk '/libcuda\.so/ {print $$3; exit}')
+REAL_LIBCUDART ?= $(or $(shell ldd ${LOWER_HALF} 2>/dev/null | \
+                    awk '/libcudart\.so/ {print $$3; exit}'), \
+                    $(firstword $(wildcard \
+                      ${CUDA_HOME}/lib64/libcudart.so.[0-9]*)))
+REAL_LIBCUDA ?= $(or $(shell ldd ${LOWER_HALF} 2>/dev/null | \
+                  awk '/libcuda\.so/ {print $$3; exit}'), \
+                  $(shell /sbin/ldconfig -p 2>/dev/null | \
+                    awk '/libcuda\.so\.1 / {print $$NF; exit}'))
 soname = $(shell readelf -d $(1) 2>/dev/null | \
            sed -n 's/.*soname: \[\(.*\)\]/\1/p')
 CUDART_SONAME := $(call soname,${REAL_LIBCUDART})
@@ -80,8 +90,8 @@ default: check-real libmana_cuda.so ${FRONT_LIBS} libmana_cuda_audit.so
 
 check-real:
 	@test -n "${REAL_LIBCUDART}" -a -n "${REAL_LIBCUDA}" || \
-	  { echo "cuda-front: ${LOWER_HALF} links no libcudart/libcuda;" \
-	         "set REAL_LIBCUDART and REAL_LIBCUDA"; exit 1; }
+	  { echo "cuda-front: no libcudart in ${CUDA_HOME}/lib64 or no" \
+	         "libcuda.so.1; set REAL_LIBCUDART and REAL_LIBCUDA"; exit 1; }
 
 gen/cudart-gen.cpp gen/cudart-tramp.S gen/cudart.map gen/cudart-index.h: \
     gen-cuda-front.py cudart-own.txt cudart-unsupported.txt \
@@ -138,46 +148,46 @@ front_fft.o: gen/cufft-index.h
 front_rand.o: gen/curand-index.h
 
 %.o: %.cpp ${FRONT_HEADERS}
-	${MPICXX} ${FRONT_CXXFLAGS} -c -o $@ $<
+	${CXX} ${FRONT_CXXFLAGS} -c -o $@ $<
 
 gen/%.o: gen/%.cpp ${FRONT_HEADERS}
-	${MPICXX} ${FRONT_CXXFLAGS} -Wno-deprecated-declarations -c -o $@ $<
+	${CXX} ${FRONT_CXXFLAGS} -Wno-deprecated-declarations -c -o $@ $<
 
 gen/%.o: gen/%.S
-	${MPICXX} -c -o $@ $<
+	${CXX} -c -o $@ $<
 
 # Everything but the exported functions: those are the front libraries'.
 libmana_cuda.so: ${FRONT_OBJS} libmana_cuda.map
-	${MPICXX} -shared -o $@ ${FRONT_OBJS} -Wl,-soname,libmana_cuda.so \
+	${CXX} -shared -o $@ ${FRONT_OBJS} -Wl,-soname,libmana_cuda.so \
 	  -Wl,--version-script=libmana_cuda.map -Wl,-z,now
 
 ${CUDART_SONAME}: gen/cudart-tramp.o gen/cudart.map libmana_cuda.so
-	${MPICXX} -shared -o $@ gen/cudart-tramp.o libmana_cuda.so \
+	${CXX} -shared -o $@ gen/cudart-tramp.o libmana_cuda.so \
 	  -Wl,-soname,${CUDART_SONAME} -Wl,--version-script=gen/cudart.map \
 	  -Wl,-rpath,'$$ORIGIN' -Wl,-z,now
 
 libcuda.so.1: gen/cuda-tramp.o gen/cuda.map libmana_cuda.so
-	${MPICXX} -shared -o $@ gen/cuda-tramp.o libmana_cuda.so \
+	${CXX} -shared -o $@ gen/cuda-tramp.o libmana_cuda.so \
 	  -Wl,-soname,libcuda.so.1 -Wl,--version-script=gen/cuda.map \
 	  -Wl,-rpath,'$$ORIGIN' -Wl,-z,now
 
 ${CUBLAS_SONAME}: gen/cublas-tramp.o gen/cublas.map libmana_cuda.so
-	${MPICXX} -shared -o $@ gen/cublas-tramp.o libmana_cuda.so \
+	${CXX} -shared -o $@ gen/cublas-tramp.o libmana_cuda.so \
 	  -Wl,-soname,${CUBLAS_SONAME} -Wl,--version-script=gen/cublas.map \
 	  -Wl,-rpath,'$$ORIGIN' -Wl,-z,now
 
 ${CUBLASLT_SONAME}: gen/cublasLt-tramp.o gen/cublasLt.map libmana_cuda.so
-	${MPICXX} -shared -o $@ gen/cublasLt-tramp.o libmana_cuda.so \
+	${CXX} -shared -o $@ gen/cublasLt-tramp.o libmana_cuda.so \
 	  -Wl,-soname,${CUBLASLT_SONAME} -Wl,--version-script=gen/cublasLt.map \
 	  -Wl,-rpath,'$$ORIGIN' -Wl,-z,now
 
 ${CUFFT_SONAME}: gen/cufft-tramp.o gen/cufft.map libmana_cuda.so
-	${MPICXX} -shared -o $@ gen/cufft-tramp.o libmana_cuda.so \
+	${CXX} -shared -o $@ gen/cufft-tramp.o libmana_cuda.so \
 	  -Wl,-soname,${CUFFT_SONAME} -Wl,--version-script=gen/cufft.map \
 	  -Wl,-rpath,'$$ORIGIN' -Wl,-z,now
 
 ${CURAND_SONAME}: gen/curand-tramp.o gen/curand.map libmana_cuda.so
-	${MPICXX} -shared -o $@ gen/curand-tramp.o libmana_cuda.so \
+	${CXX} -shared -o $@ gen/curand-tramp.o libmana_cuda.so \
 	  -Wl,-soname,${CURAND_SONAME} -Wl,--version-script=gen/curand.map \
 	  -Wl,-rpath,'$$ORIGIN' -Wl,-z,now
 

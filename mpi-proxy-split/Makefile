@@ -2,6 +2,10 @@
 PLATFORM=${shell echo $$HOST}
 include Makefile_config
 
+ifeq (${MANA_MPI},)
+  $(error Makefile_config predates --with-mpi and --with-cuda: rerun ./configure)
+endif
+
 # These are needed for libmana.so, since the wrapper functions there will
 # call the lower half.  That requires temporarily changing the FS register,
 # and apparently, glibc detects this as an attempt to do stack smashing.
@@ -19,8 +23,10 @@ endif
 # Targets to install:
 #   libmana.so, the core: the DMTCP plugin, which keeps the split process and
 #     calls the layers' checkpoint and restart steps (mana_core.h),
-#   libmana_mpi.so, the MPI layer (using mpi-wrappers/libmpiwrappers.a),
-#   libmpistub.so, libmpistub_audit.so,
+#   libmana_audit.so, its LD_AUDIT module (mana_audit.c),
+#   with MANA_MPI=yes (configure): libmana_mpi.so, the MPI layer (using
+#     mpi-wrappers/libmpiwrappers.a), libmpistub.so, libmpistub_audit.so,
+#   with MANA_CUDA=yes: the CUDA front (cuda-front/),
 #   mana_coordinator.o (needed to compile dmtcp_coordinator)
 
 # Subdirectories needed to install
@@ -34,7 +40,7 @@ LH_SRCDIR=lower-half
 # As you add new files to your plugin library, add the object file names here.
 
 CORE_OBJS = mana_core.o uh_wrappers.o lower_half_ckpt.o \
-            lower-half/switch-context.o
+            lower-half/nompi/switch-context.o
 MPI_OBJS = mpi_plugin.o p2p_drain_send_recv.o p2p_log_replay.o seq_num.o \
            virtual_id.o
 LIBOBJS = ${CORE_OBJS} ${MPI_OBJS}
@@ -66,13 +72,26 @@ override CXXFLAGS += -DOMPI_SKIP_MPICXX -DMPICH_SKIP_MPICXX
 # ${WRAPPERS_SRCDIR}/libmpiwrappers.a ia a prerequisite for libmana.so
 # Always do 'make default' or 'make install' -- not 'make libmana.so'
 default: ${MANA_COORD_OBJS}
-	make -C ${LH_SRCDIR} lower-half lower-half-nompi
+	make -C ${LH_SRCDIR} default
+ifeq (${MANA_MPI},yes)
 	make -C ${WRAPPERS_SRCDIR} libmpiwrappers.a libmpistub.so \
 	  libmpistub_audit.so
-	make libmana.so libmana_mpi.so
+	make libmana_mpi.so
+endif
+	make libmana.so libmana_audit.so
 
 libmana.so: ${CORE_OBJS}
 	${CXX} -shared -fPIC -g3 -O0 -o $@ ${CORE_OBJS} -Wl,-soname,libmana.so
+
+# The plain compiler's, as in bin/lower-half-nompi.
+lower-half/nompi/switch-context.o: lower-half/switch-context.cpp \
+                                   lower-half/switch-context.h
+	+ make -C ${LH_SRCDIR} nompi/switch-context.o
+
+# An LD_AUDIT module for the upper half; it must not need libc.
+libmana_audit.so: mana_audit.c ${WRAPPERS_SRCDIR}/mpi_library.h
+	${CC} -O2 -fPIC -shared -nostdlib -fno-stack-protector \
+	  -Wl,--no-undefined -o $@ $<
 
 # ${WRAPPERS_SRCDIR}/libmpiwrappers.a made in install/default before
 # libmana_mpi.so.  libmana_mpi.so needs libmana.so, and libmpistub.so (in the
@@ -113,13 +132,17 @@ touch: ${FILE}
 
 tests:
 	+ @make -C test/ default
+ifeq (${MANA_MPI},yes)
 	+ @make -C examples/
+endif
 
-check: libmana.so libmana_mpi.so
+check: default
 	@make -C test/ e2e
 	@test/autotest.py
 
 ${MANA_ROOT}/lib/dmtcp/libmana.so: libmana.so
+	cp -f $< $@
+${MANA_ROOT}/lib/dmtcp/libmana_audit.so: libmana_audit.so
 	cp -f $< $@
 ${MANA_ROOT}/lib/dmtcp/libmana_mpi.so: libmana_mpi.so
 	cp -f $< $@
@@ -134,15 +157,20 @@ ${MANA_ROOT}/lib/dmtcp/libmpistub_audit.so: ${WRAPPERS_SRCDIR}/mpi_stub_audit.c
 # Always do 'make default' or 'make install' -- not 'make libmana.so'
 # MANA_COORD_OBJS needed for 'make mana' at top level.
 install: ${MANA_COORD_OBJS}
-	+ make -C ${WRAPPERS_SRCDIR} libmpiwrappers.a libmpistub.so
 	+ make ${MANA_ROOT}/lib/dmtcp/libmana.so
+	+ make ${MANA_ROOT}/lib/dmtcp/libmana_audit.so
+ifeq (${MANA_MPI},yes)
+	+ make -C ${WRAPPERS_SRCDIR} libmpiwrappers.a libmpistub.so
 	+ make ${MANA_ROOT}/lib/dmtcp/libmana_mpi.so
 	+ make ${MANA_ROOT}/lib/dmtcp/libmpistub.so
 	+ make ${MANA_ROOT}/lib/dmtcp/libmpistub_audit.so
+endif
 	+ make -C ${LH_SRCDIR} install
-	@# --cuda: the CUDA front, if the lower half's MPI uses CUDA.
-	+ if ldd ${LH_SRCDIR}/lower-half 2>/dev/null | grep -q libcudart; then \
-	    make -C cuda-front install; fi
+ifeq (${MANA_CUDA},yes)
+	@# --cuda: the CUDA front, after the lower half, whose MPI's CUDA
+	@# libraries it prefers.
+	+ make -C cuda-front install
+endif
 
 tidy:
 	rm -f *~ .*.swp dmtcp_restart_script*.sh ckpt_*.dmtcp
@@ -152,8 +180,9 @@ tidy:
 clean: tidy
 	+ make -C cuda-front clean
 	rm -f ${LIBOBJS} ${MANA_COORD_OBJS}
-	rm -f libmana.so libmana_mpi.so
+	rm -f libmana.so libmana_mpi.so libmana_audit.so
 	rm -f ${MANA_ROOT}/lib/dmtcp/libmana.so ${MANA_ROOT}/lib/dmtcp/libmana_mpi.so
+	rm -f ${MANA_ROOT}/lib/dmtcp/libmana_audit.so
 	cd ${LOWER_HALF_SRCDIR} && make clean
 	cd ${WRAPPERS_SRCDIR} && make clean
 

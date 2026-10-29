@@ -70,6 +70,11 @@ if "--no-mpi" in dmtcp_flags:
   dmtcp_flags.remove("--no-mpi")
 no_mpi = os.environ.get("MANA_NO_MPI", "") not in ("", "0")
 lower_half = "bin/lower-half-nompi" if no_mpi else "bin/lower-half"
+if not no_mpi and not os.path.exists(mana_root_path +
+                                     "lib/dmtcp/libmana_mpi.so"):
+  print("mana_launch: MANA was built without MPI (see ./configure);"
+        " use --no-mpi for a program without MPI")
+  sys.exit(1)
 if not os.path.exists(mana_root_path + lower_half):
   print("mana_launch: " + mana_root_path + lower_half + " not found")
   sys.exit(1)
@@ -169,8 +174,11 @@ pre_plugins = [p for p in os.environ.get("MANA_PRELOAD", "").split(":") if p]
 cuda_plugins = []
 if os.environ.get("MANA_CUDA", "") not in ("", "0"):
   cuda_front = mana_root_path + "lib/dmtcp/cuda-front/libmana_cuda.so"
-  if os.path.exists(cuda_front):
-    cuda_plugins.append(cuda_front)
+  if not os.path.exists(cuda_front):
+    print("mana_launch: --cuda, but MANA was built without CUDA"
+          " (see ./configure)")
+    sys.exit(1)
+  cuda_plugins.append(cuda_front)
 plugin_list = ":".join(pre_plugins + mana_plugins + cuda_plugins +
                        user_plugins)
 

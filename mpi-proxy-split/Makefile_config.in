@@ -1,8 +1,16 @@
-# The plain C compiler, for what must not be linked with MPI (libmpistub.so,
-# libmpistub_audit.so, dlopen_mpi).  Make's default, cc, is the MPI compiler
-# wrapper on Cray systems; with craype-accel-nvidia80, it links even a
-# -nostdlib library with libcuda and the GTL.
+# What configure builds (./configure --help): yes or no.  The core is always
+# built; the MPI layer and the CUDA front if configure found what they need.
+MANA_MPI = @MANA_MPI@
+MANA_CUDA = @MANA_CUDA@
+CUDA_HOME = @CUDA_HOME@
+
+# The plain compilers, for what must not be linked with MPI (libmana.so,
+# bin/lower-half-nompi, libmpistub.so, the LD_AUDIT modules, dlopen_mpi).
+# Make's default, cc, is the MPI compiler wrapper on Cray systems; with
+# craype-accel-nvidia80, it links even a -nostdlib library with libcuda and
+# the GTL.
 CC = @CC@
+CXX = @CXX@
 CFLAGS = @CFLAGS@
 CXXFLAGS = @CXXFLAGS@
 FFLAGS = ${CXXFLAGS} @FFLAGS@
@@ -18,12 +26,14 @@ ifeq ($(findstring login,$(PLATFORM)),login)
 IS_PERLMUTTER = 1
 endif
 
+# The MPI compilers that configure found (MPICC, MPICXX, ... --with-mpi).
+MPICC = @MPICC@
+MPICXX = @MPICXX@ -std=c++20
+MPIFORTRAN = @MPIFORTRAN@
+MPIRUN = @MPIRUN@
+
 ifeq (${IS_PERLMUTTER}, 1)
-  MPICC = cc
-  MPICXX = CC -std=c++20
-  MPIFORTRAN = ftn
   MPI_LD_FLAG = -lmpich
-  MPIRUN = srun
   MPI_CFLAGS?= @CFLAGS@ -g3 -fPIC
   MPI_CXXFLAGS?= @CXXFLAGS@ -g3 -fPIC
   MPI_LDFLAGS?= -dynamic
@@ -33,10 +43,6 @@ default2: default
 #	${CXX} ${CXXFLAGS} `CC --cray-print-opts=cflags` -c -o $@ $<
 ## On Perlmutter, the generic settings of 'else' seem to work.
 else
-  MPICC = mpicc
-  MPICXX = mpic++ -std=c++20
-  MPIFORTRAN = mpifort
-  MPIRUN = mpirun
   # FIXME: The following paths are hardwired for non-NERSC platforms on which
   # MPICH and other extra libraries are installed from source.
   # Eventually, the LD_FLAGS for MPI should be configured in the

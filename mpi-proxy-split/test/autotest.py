@@ -51,12 +51,17 @@ class Test:
                --native skips it.
   no_mpi:      a program without MPI: runs with MANA_NO_MPI=1 (mana_launch
                --no-mpi), in bin/lower-half-nompi.
+  needs_mpi, needs_cuda: what MANA must be built with (configure's MPI layer,
+               CUDA front), or the test is skipped.  By default, MPI unless
+               no_mpi, and CUDA if cuda.
+  env:         environment variables of the run, over the suite's.
   """
 
   def __init__(self, name, ranks, args=(), kind="loop", expect=None,
                restart=False, fails=False, known_bug=None, native_args=None,
                program=None, burst=1, restart_now=False, cuda=False,
-               mana_only=False, no_mpi=False):
+               mana_only=False, no_mpi=False, needs_mpi=None,
+               needs_cuda=None, env=None):
     self.name = name
     self.ranks = ranks
     self.args = list(args)
@@ -74,6 +79,9 @@ class Test:
     self.cuda = cuda
     self.mana_only = mana_only
     self.no_mpi = no_mpi
+    self.needs_mpi = not no_mpi if needs_mpi is None else needs_mpi
+    self.needs_cuda = cuda if needs_cuda is None else needs_cuda
+    self.env = env or {}
 
 
 TESTS = [
@@ -132,6 +140,14 @@ TESTS = [
   Test("cuda_graphs", 2, cuda=True),
   Test("cuda_static", 2, cuda=True),
   Test("cuda_nompi", 2, cuda=True, no_mpi=True),
+  # An MPI library under --no-mpi, and a CUDA library without --cuda, are
+  # refused (mana_audit.c).
+  Test("nompi_refuses_mpi", 2, kind="run", fails=True, no_mpi=True,
+       needs_mpi=True, mana_only=True, program="p2p_blocking",
+       expect="an MPI library, refused under mana_launch --no-mpi"),
+  Test("refuses_cuda", 2, kind="run", fails=True, needs_cuda=True,
+       mana_only=True, program="cuda_aware", env={"MANA_CUDA": "0"},
+       expect="a CUDA library, refused without mana_launch --cuda"),
   Test("cuda_static_stripped", 2, cuda=True, kind="run", fails=True,
        expect="static CUDA runtime but no symbol table", mana_only=True),
   Test("fortran_nonblocking", 2),
@@ -221,6 +237,7 @@ class Run:
       self.env["MANA_CUDA"] = "1"
     if test.no_mpi and not opts.native:
       self.env["MANA_NO_MPI"] = "1"
+    self.env.update(test.env)
     self.proc = None
     self.logs = []
 
@@ -492,6 +509,18 @@ def mpi_library():
   return m.group(1)
 
 
+def built_layers(mana_root):
+  """The layers that MANA was built with (configure): "MPI", "CUDA"."""
+  layers = set()
+  if (os.path.exists(os.path.join(mana_root, "lib/dmtcp/libmana_mpi.so")) and
+      os.path.exists(os.path.join(mana_root, "bin/lower-half"))):
+    layers.add("MPI")
+  if os.path.exists(os.path.join(mana_root,
+                                 "lib/dmtcp/cuda-front/libmana_cuda.so")):
+    layers.add("CUDA")
+  return layers
+
+
 def run_test(test, opts):
   """Runs one test; returns (passed, text of the result)."""
   steps = []
@@ -552,11 +581,19 @@ def main():
   opts.workdir = opts.workdir or tempfile.gettempdir()
   os.makedirs(opts.workdir, exist_ok=True)
 
-  failed, known, xpass = [], [], []
+  failed, known, xpass, skipped = [], [], [], []
+  layers = built_layers(opts.mana_root)
   suite_start = time.time()
   for test in tests:
     sys.stdout.write("%-26s " % test.name)
     sys.stdout.flush()
+    missing = [layer for layer, needed in (("MPI", test.needs_mpi),
+                                           ("CUDA", test.needs_cuda))
+               if needed and layer not in layers]
+    if missing:
+      skipped.append(test.name)
+      print("SKIPPED (MANA built without %s)" % " and ".join(missing))
+      continue
     start = time.time()
     passed, steps, detail = run_test(test, opts)
     if not passed and opts.retry_once and not test.known_bug:
@@ -581,9 +618,10 @@ def main():
       print("%s %s" % (steps, detail))
     sys.stdout.flush()
 
-  total = len(tests)
-  print("== Tests passed: %d of %d%s%s, in %.0f s ==" % (
+  total = len(tests) - len(skipped)
+  print("== Tests passed: %d of %d%s%s%s, in %.0f s ==" % (
       total - len(failed) - len(known), total,
+      ", skipped: %d" % len(skipped) if skipped else "",
       ", known bugs: %d" % len(known) if known else "",
       ", failed: %s" % " ".join(failed) if failed else "",
       time.time() - suite_start))

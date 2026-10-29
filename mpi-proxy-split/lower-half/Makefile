@@ -32,7 +32,11 @@ override CXXFLAGS += -fPIC -I${DMTCP_INCLUDE} -I${JALIB_INCLUDE} -I${MANA_INCLUD
 
 TEXTSEG_ADDR_FLAG=-Wl,-Ttext-segment=0x10000000
 
-default: lower-half lower-half-nompi
+# bin/lower-half with the MPI layer (configure's MANA_MPI), and
+# bin/lower-half-nompi always.
+LOWER_HALVES = $(if $(filter yes,${MANA_MPI}),lower-half) lower-half-nompi
+
+default: ${LOWER_HALVES}
 
 .cpp.o:
 	${MPICXX} ${CXXFLAGS} -c -o $@ $<
@@ -70,7 +74,7 @@ build-id-debug.o lower-half.o nompi/build-id-debug.o nompi/lower-half.o: \
 lower-half.o lh-mpi.o nompi/lower-half.o nompi/lh-nompi.o: lh-mpi.h
 lh-mpi.o: lower-half-mpi.h
 
-install: lower-half lower-half-nompi
+install: ${LOWER_HALVES}
 	cp -f $^ ${MANA_ROOT}/bin/
 
 tidy:

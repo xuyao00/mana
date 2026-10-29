@@ -110,6 +110,10 @@ if no_mpi and p2p_wait is not None:
 if headers and p2p_wait is None:
   no_mpi = True
 lower_half = "bin/lower-half-nompi" if no_mpi else "bin/lower-half"
+if not os.path.exists(mana_root_path + lower_half):
+  print("mana_restart: the checkpoint in " + restart_dir + " needs " +
+        mana_root_path + lower_half + ", which this MANA has not built")
+  sys.exit(1)
 if reserved_fds:
   os.environ["MANA_RESERVED_FDS"] = ",".join(map(str, sorted(reserved_fds)))
 if "--ckptdir" in dmtcp_flags:

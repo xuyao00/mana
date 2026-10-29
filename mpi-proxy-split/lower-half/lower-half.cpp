@@ -1314,9 +1314,10 @@ void print_usage_and_exit(char *prog_name)
  * @brief Updates the LD_LIBRARY_PATH for the upper-half application.
  *
  * Prepends the location of libmpistub.so, which defines the MPI symbols of
- *  the user's MPI application, to LD_LIBRARY_PATH for the upper half.  With
- *  MPI, it also sets LD_AUDIT, so that the upper half loads libmpistub.so in
- *  place of the MPI library that the application was linked with.
+ *  the user's MPI application, to LD_LIBRARY_PATH for the upper half.  It
+ *  also sets LD_AUDIT: the core's module, then with MPI the one that makes the
+ *  upper half load libmpistub.so in place of the MPI library that the
+ *  application was linked with, and with --cuda the CUDA front's.
  *
  * @param argv0 the path to the executing binary. 
  */
@@ -1352,20 +1353,27 @@ void update_library_path(const char *argv0)
     exit(1);
   }
 
-  // The upper half loads libmpistub.so in place of the MPI library (see
-  // mpi-wrappers/mpi_stub_audit.c).  ld.so ignores LD_AUDIT in
-  // secure-execution mode.  The upper half's ld.so gets the lower half's
-  // AT_SECURE (copy-stack.c copies the auxv), so if the lower half runs
-  // set-user-ID or with file capabilities, the upper half loads the real
-  // MPI library.
-  string audit;
-  if (lh_info->mpi != NULL) {
-    audit = string(lib1) + "/libmpistub_audit.so";
-    if (access(audit.c_str(), R_OK) != 0) {
-      fprintf(stderr, "MANA: cannot read %s: %s\n", audit.c_str(),
-              strerror(errno));
+  // LD_AUDIT: with MPI, first the module that makes the upper half load
+  // libmpistub.so in place of the MPI library (see
+  // mpi-wrappers/mpi_stub_audit.c); after another module, glibc does not call
+  // its la_symbind64() for dlsym() (test/dlopen_mpi).  Then the core's module
+  // (mana_audit.c), which refuses an MPI library under --no-mpi and a CUDA
+  // library without --cuda.  ld.so ignores LD_AUDIT in secure-execution
+  // mode.  The upper half's ld.so gets the lower half's AT_SECURE
+  // (copy-stack.c copies the auxv), so if the lower half runs set-user-ID or
+  // with file capabilities, the upper half loads the real MPI library.
+  string audit = string(lib1) + "/libmana_audit.so";
+  string mpi_audit = string(lib1) + "/libmpistub_audit.so";
+  const char *modules[] = { audit.c_str(),
+                            lh_info->mpi != NULL ? mpi_audit.c_str() : NULL };
+  for (const char *module : modules) {
+    if (module != NULL && access(module, R_OK) != 0) {
+      fprintf(stderr, "MANA: cannot read %s: %s\n", module, strerror(errno));
       exit(1);
     }
+  }
+  if (lh_info->mpi != NULL) {
+    audit = mpi_audit + ":" + audit;
   }
   // --cuda: the upper half loads MANA's CUDA front libraries in place of
   // libcudart and libcuda (cuda-front/cuda_audit.c).
@@ -1382,13 +1390,13 @@ void update_library_path(const char *argv0)
       perror("MANA: prepending the CUDA front to LD_LIBRARY_PATH failed");
       exit(1);
     }
-    audit = audit.empty() ? cuda_audit : audit + ":" + cuda_audit;
+    audit = audit + ":" + cuda_audit;
   }
   const char *old_audit = getenv("LD_AUDIT");
   if (old_audit != NULL && old_audit[0] != '\0') {
-    audit = audit.empty() ? string(old_audit) : audit + ":" + old_audit;
+    audit = audit + ":" + old_audit;
   }
-  if (!audit.empty() && setenv("LD_AUDIT", audit.c_str(), 1) != 0) {
+  if (setenv("LD_AUDIT", audit.c_str(), 1) != 0) {
     perror("MANA: setenv(LD_AUDIT) failed");
     exit(1);
   }

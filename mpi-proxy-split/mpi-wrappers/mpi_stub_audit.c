@@ -39,78 +39,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "mpi_library.h"
+
 #define STUB_LIBRARY "libmpistub.so"
-
-// The names of MPICH-ABI MPI libraries, without ".so...": MPICH, Intel MPI,
-// MVAPICH, and Cray MPICH (libmpi_cray, libmpich_gnu_82, ...).  Not a
-// profiler like libmpiP, nor libmpistub itself.
-static const char *const mpi_libraries[] = {
-  "libmpi", "libmpich", "libmpifort", "libmpicxx", "libmpichfort",
-  "libmpichcxx", "libfmpich", "libmpichf90", NULL
-};
-static const char *const mpi_library_prefixes[] = {
-  "libmpi_", "libmpich_", "libmpifort_", NULL
-};
-
-// Whether s[0..len) is 'word'.
-static int
-equals(const char *s, size_t len, const char *word)
-{
-  size_t i;
-  for (i = 0; i < len; i++) {
-    if (word[i] != s[i]) {
-      return 0;
-    }
-  }
-  return word[len] == '\0';
-}
-
-// Whether s[0..len) starts with 'prefix'.
-static int
-starts_with(const char *s, size_t len, const char *prefix)
-{
-  size_t i;
-  for (i = 0; prefix[i] != '\0'; i++) {
-    if (i >= len || s[i] != prefix[i]) {
-      return 0;
-    }
-  }
-  return 1;
-}
-
-static int
-is_mpi_library(const char *path)
-{
-  const char *name = path;
-  const char *p;
-  size_t len;
-  int i;
-
-  for (p = path; *p != '\0'; p++) {
-    if (*p == '/') {
-      name = p + 1;
-    }
-  }
-  for (len = 0; name[len] != '\0'; len++) {
-    if (name[len] == '.' && name[len + 1] == 's' && name[len + 2] == 'o') {
-      break;
-    }
-  }
-  if (name[len] == '\0') {
-    return 0;
-  }
-  for (i = 0; mpi_libraries[i] != NULL; i++) {
-    if (equals(name, len, mpi_libraries[i])) {
-      return 1;
-    }
-  }
-  for (i = 0; mpi_library_prefixes[i] != NULL; i++) {
-    if (starts_with(name, len, mpi_library_prefixes[i])) {
-      return 1;
-    }
-  }
-  return 0;
-}
 
 unsigned int
 la_version(unsigned int version)

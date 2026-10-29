@@ -19,7 +19,7 @@ LIBNAME=libmana
 BENCH_FILES = virtid_bench synthetic_app
 
 default: default_prereqs
-	+ $(MAKE) ${BENCH_FILES} e2e
+	+ $(MAKE) $(if $(filter yes,${MANA_MPI}),${BENCH_FILES}) e2e
 
 # End-to-end tests, run by autotest.py natively and under MANA.  Each test is
 # one program, named after the test and linked as any MPI program.
@@ -35,17 +35,22 @@ E2E_TESTS = p2p_blocking p2p_nonblocking p2p_ring p2p_any_source p2p_probe \
 E2E_FORTRAN = fortran_p2p fortran_nonblocking fortran_handles fortran_attributes
 # Without MPI (mana_launch --no-mpi), built with the plain compilers.
 E2E_NOMPI = nompi
-# CUDA-aware MPI tests (mana_launch --cuda); built if nvcc is there.
-NVCC ?= $(shell command -v nvcc 2>/dev/null)
-E2E_CUDA = $(if $(NVCC),cuda_aware cuda_threads cuda_driver cuda_async \
-                          cuda_ipc cuda_textures cuda_static \
-                          cuda_static_stripped cuda_cublas cuda_cufft \
-                          cuda_curand cuda_graphs cuda_nompi)
-CUDA_HOME ?= $(if $(NVCC),$(realpath $(dir $(NVCC))..))
+# CUDA tests (mana_launch --cuda); built with the CUDA front (configure's
+# MANA_CUDA).  All but cuda_nompi use MPI.
+NVCC = $(if $(filter yes,${MANA_CUDA}),${CUDA_HOME}/bin/nvcc)
+E2E_CUDA_MPI = cuda_aware cuda_threads cuda_driver cuda_async cuda_ipc \
+               cuda_textures cuda_static cuda_static_stripped cuda_cublas \
+               cuda_cufft cuda_curand cuda_graphs
+E2E_CUDA = $(if $(NVCC),cuda_nompi $(if $(filter yes,${MANA_MPI}),${E2E_CUDA_MPI}))
 
-# The suite also runs the example of ../examples (ring_example).
-e2e: ${E2E_TESTS} ${E2E_FORTRAN} dlopen_mpi ${E2E_NOMPI} ${E2E_CUDA}
+# What MANA builds (configure's MANA_MPI and MANA_CUDA): the MPI tests with
+# the MPI layer, and the suite also runs the example of ../examples
+# (ring_example).
+e2e: $(if $(filter yes,${MANA_MPI}),${E2E_TESTS} ${E2E_FORTRAN} dlopen_mpi) \
+     ${E2E_NOMPI} ${E2E_CUDA}
+ifeq (${MANA_MPI},yes)
 	+ $(MAKE) -C ../examples
+endif
 
 ${E2E_TESTS}: %: %.c mana_test.h
 	$(MPICC) -g3 -O0 -o $@ $< $(MPI_CFLAGS) ${MPI_LDFLAGS}
