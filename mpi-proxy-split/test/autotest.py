@@ -144,6 +144,7 @@ TESTS = [
   Test("cuda_static", 2, cuda=True),
   Test("cuda_nompi", 2, cuda=True, no_mpi=True),
   Test("cuda_pools", 2, cuda=True, no_mpi=True),
+  Test("cuda_managed", 2, cuda=True, no_mpi=True),
   # A kernel that waits for a host thread that the checkpoint stopped: the
   # checkpoint's wait for the GPUs times out (cuda-front/front_core.cpp).
   Test("cuda_quiesce", 2, kind="run", args=["-n", "1000"], restart=True,

@@ -60,6 +60,10 @@ cudaMemPoolDestroy
 cudaDeviceSetMemPool
 cudaMemPoolSetAccess
 cudaMemPoolGetAccess
+cudaMallocManaged
+cudaMemPrefetchAsync
+cudaMemPrefetchAsync_ptsz
+cudaMemAdvise
 cudaEventRecord
 cudaEventRecord_ptsz
 cudaEventRecordWithFlags

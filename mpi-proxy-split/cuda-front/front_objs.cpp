@@ -771,10 +771,155 @@ cudaFree(void *devPtr)
 {
   FRONT_ENTER();
   cudaError_t rc = cudaSuccess;
-  if (!front_vmm_free(devPtr, &rc)) {
+  int managed_rc = 0;
+  if (front_managed_free(devPtr, &managed_rc, false)) {
+    rc = (cudaError_t)managed_rc;
+  } else if (!front_vmm_free(devPtr, &rc)) {
     // NULL (which initializes the context), or not ours.
     FRONT_LH(rc = REAL(cudaFree)(devPtr));
   }
+  FRONT_LEAVE();
+  return rc;
+}
+
+// ---- Managed memory ------------------------------------------------------
+//
+// The driver places managed memory itself, so a restart could not put it
+// back at its address.  Instead it is mapped pinned memory of the upper
+// half, saved with the image and registered again at restart: the same
+// address on the host and on the devices (UVA), where a device can use host
+// pointers for registered memory.  It is not migrated to a GPU, so kernels
+// reach it over the bus: correct, but slower than managed memory.  Prefetches
+// and advice on it do nothing.
+
+int
+front_managed_alloc(void **ptr, size_t size, bool drv)
+{
+  if (ptr == NULL) {
+    return cudaErrorInvalidValue;
+  }
+  int same = 0;
+  int rc;
+  FRONT_ENTER();
+  if (drv) {
+    CUdevice device = 0;
+    FRONT_LH(rc = DRV(cuCtxGetDevice)(&device));
+    if (rc == 0) {
+      FRONT_LH(rc = DRV(cuDeviceGetAttribute)(
+        &same, CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM,
+        device));
+    }
+  } else {
+    int device = 0;
+    FRONT_LH(rc = REAL(cudaGetDevice)(&device));
+    if (rc == 0) {
+      FRONT_LH(rc = REAL(cudaDeviceGetAttribute)(
+        &same, cudaDevAttrCanUseHostPointerForRegisteredMem, device));
+    }
+  }
+  FRONT_LEAVE();
+  if (rc != 0) {
+    return rc;
+  }
+  if (!same) {
+    front_unsupported("managed memory on a device that cannot use host "
+                      "pointers for registered memory");
+  }
+  static std::once_flag notice;
+  std::call_once(notice, [] {
+    fprintf(stderr, "MANA: --cuda: managed memory is mapped host memory "
+            "under MANA, which a restart can make again; kernels reach it "
+            "over the bus, more slowly than managed memory.\n");
+  });
+  rc = front_host_alloc(ptr, size,
+                        cudaHostRegisterMapped | cudaHostRegisterPortable, drv);
+  if (rc == 0 && *ptr != NULL) {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    pinned[*ptr].managed = true;
+  }
+  return rc;
+}
+
+bool
+front_managed_free(void *ptr, int *rc, bool drv)
+{
+  {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    auto it = pinned.find(ptr);
+    if (ptr == NULL || it == pinned.end() || !it->second.managed) {
+      return false;
+    }
+  }
+  *rc = front_host_free(ptr, drv);
+  return true;
+}
+
+bool
+front_is_managed(const void *ptr, size_t count)
+{
+  std::lock_guard<std::mutex> guard(objs_lock);
+  auto it = pinned.upper_bound((void *)ptr);
+  if (it == pinned.begin()) {
+    return false;
+  }
+  --it;
+  const char *base = (const char *)it->first;
+  return it->second.managed && (const char *)ptr >= base &&
+         (const char *)ptr + count <= base + it->second.size;
+}
+
+extern "C" cudaError_t
+cudaMallocManaged(void **devPtr, size_t size, unsigned int flags)
+{
+  if (flags != cudaMemAttachGlobal && flags != cudaMemAttachHost) {
+    return cudaErrorInvalidValue;
+  }
+  return (cudaError_t)front_managed_alloc(devPtr, size, false);
+}
+
+extern "C" cudaError_t
+cudaMemPrefetchAsync(const void *devPtr, size_t count,
+                     struct cudaMemLocation location, unsigned int flags,
+                     cudaStream_t stream)
+{
+  if (front_is_managed(devPtr, count)) {
+    return cudaSuccess;
+  }
+  FRONT_ENTER();
+  cudaError_t rc;
+  FRONT_LH(rc = REAL(cudaMemPrefetchAsync)(devPtr, count, location, flags,
+                                           front_real_stream(stream)));
+  FRONT_LEAVE();
+  return rc;
+}
+
+extern "C" cudaError_t
+cudaMemPrefetchAsync_ptsz(const void *devPtr, size_t count,
+                          struct cudaMemLocation location, unsigned int flags,
+                          cudaStream_t stream)
+{
+  if (front_is_managed(devPtr, count)) {
+    return cudaSuccess;
+  }
+  FRONT_ENTER();
+  cudaError_t rc;
+  FRONT_LH(rc = REAL(cudaMemPrefetchAsync_ptsz)(devPtr, count, location,
+                                                flags,
+                                                front_real_stream(stream)));
+  FRONT_LEAVE();
+  return rc;
+}
+
+extern "C" cudaError_t
+cudaMemAdvise(const void *devPtr, size_t count, enum cudaMemoryAdvise advice,
+              struct cudaMemLocation location)
+{
+  if (front_is_managed(devPtr, count)) {
+    return cudaSuccess;
+  }
+  FRONT_ENTER();
+  cudaError_t rc;
+  FRONT_LH(rc = REAL(cudaMemAdvise)(devPtr, count, advice, location));
   FRONT_LEAVE();
   return rc;
 }

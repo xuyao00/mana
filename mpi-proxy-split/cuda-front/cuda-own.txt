@@ -75,6 +75,7 @@ cuMemPoolDestroy
 cuDeviceSetMemPool
 cuMemPoolSetAccess
 cuMemPoolGetAccess
+cuMemAllocManaged
 cuEventRecord
 cuEventRecord_ptsz
 cuEventRecordWithFlags

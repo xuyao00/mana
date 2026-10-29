@@ -78,6 +78,10 @@ cudaError_t cudaLaunchHostFunc_ptsz(cudaStream_t stream, cudaHostFn_t fn,
 cudaError_t cudaStreamAddCallback_ptsz(cudaStream_t stream,
                                        cudaStreamCallback_t callback,
                                        void *userData, unsigned int flags);
+cudaError_t cudaMemPrefetchAsync_ptsz(const void *devPtr, size_t count,
+                                      struct cudaMemLocation location,
+                                      unsigned int flags,
+                                      cudaStream_t stream);
 cudaError_t cudaMallocAsync_ptsz(void **devPtr, size_t size,
                                  cudaStream_t hStream);
 cudaError_t cudaFreeAsync_ptsz(void *devPtr, cudaStream_t hStream);

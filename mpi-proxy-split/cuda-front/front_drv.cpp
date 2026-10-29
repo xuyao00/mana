@@ -979,13 +979,25 @@ cuMemFree_v2(CUdeviceptr dptr)
   FRONT_ENTER();
   cudaError_t result = cudaSuccess;
   CUresult rc;
-  if (front_vmm_free((void *)dptr, &result)) {
+  int managed_rc = 0;
+  if (front_managed_free((void *)dptr, &managed_rc, true)) {
+    rc = (CUresult)managed_rc;
+  } else if (front_vmm_free((void *)dptr, &result)) {
     rc = result == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_UNKNOWN;
   } else {
     DRV_CALL(rc, DRV(cuMemFree_v2)(dptr));
   }
   FRONT_LEAVE();
   return rc;
+}
+
+extern "C" CUresult
+cuMemAllocManaged(CUdeviceptr *dptr, size_t bytesize, unsigned int flags)
+{
+  if (flags != CU_MEM_ATTACH_GLOBAL && flags != CU_MEM_ATTACH_HOST) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  return (CUresult)front_managed_alloc((void **)dptr, bytesize, true);
 }
 
 extern "C" CUresult

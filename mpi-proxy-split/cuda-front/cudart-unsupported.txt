@@ -10,7 +10,6 @@ cudaIpcGetEventHandle
 cudaIpcOpenEventHandle
 
 # Memory that the VMM allocator does not make yet.
-cudaMallocManaged
 cudaMalloc3D
 
 # Their structures hold handles, or they hand out lower-half pointers.
