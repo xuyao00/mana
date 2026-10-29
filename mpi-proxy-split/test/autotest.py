@@ -49,12 +49,14 @@ class Test:
                --cuda).  test/Makefile builds it if it finds nvcc.
   mana_only:   checks something that only MANA does (e.g. a refusal):
                --native skips it.
+  no_mpi:      a program without MPI: runs with MANA_NO_MPI=1 (mana_launch
+               --no-mpi), in bin/lower-half-nompi.
   """
 
   def __init__(self, name, ranks, args=(), kind="loop", expect=None,
                restart=False, fails=False, known_bug=None, native_args=None,
                program=None, burst=1, restart_now=False, cuda=False,
-               mana_only=False):
+               mana_only=False, no_mpi=False):
     self.name = name
     self.ranks = ranks
     self.args = list(args)
@@ -71,6 +73,7 @@ class Test:
     self.restart_now = restart_now
     self.cuda = cuda
     self.mana_only = mana_only
+    self.no_mpi = no_mpi
 
 
 TESTS = [
@@ -116,6 +119,7 @@ TESTS = [
   Test("misc_calls", 2),
   Test("mmap_threads", 2),
   Test("mmap_threads_quiet", 2, args=["-q"], program="mmap_threads"),
+  Test("nompi", 2, no_mpi=True),
   Test("cuda_aware", 2, cuda=True),
   Test("cuda_threads", 2, cuda=True),
   Test("cuda_driver", 2, cuda=True),
@@ -127,6 +131,7 @@ TESTS = [
   Test("cuda_curand", 2, cuda=True),
   Test("cuda_graphs", 2, cuda=True),
   Test("cuda_static", 2, cuda=True),
+  Test("cuda_nompi", 2, cuda=True, no_mpi=True),
   Test("cuda_static_stripped", 2, cuda=True, kind="run", fails=True,
        expect="static CUDA runtime but no symbol table", mana_only=True),
   Test("fortran_nonblocking", 2),
@@ -214,6 +219,8 @@ class Run:
     })
     if test.cuda and not opts.native:
       self.env["MANA_CUDA"] = "1"
+    if test.no_mpi and not opts.native:
+      self.env["MANA_NO_MPI"] = "1"
     self.proc = None
     self.logs = []
 

@@ -93,7 +93,8 @@ void *old_end_of_brk;
 char *uh_stack_start;
 char *uh_stack_end;
 
-// From mana_set_rank(); -1 until the MPI layer knows it.
+// The launcher's rank (launcher_rank()), then the MPI layer's
+// (mana_set_rank()).
 static int mana_rank = -1;
 // mana_set_header()'s lines of header.mana.
 static map<string, string> *header_fields = NULL;
@@ -583,6 +584,21 @@ updateCkptDirByRank()
   dmtcp_set_ckpt_dir(o.str().c_str());
 }
 
+// The launcher's rank of this process, as mana_restart and
+// bin/lower-half-nompi read it, or 0 if there is none: a single process.
+static int
+launcher_rank()
+{
+  const char *vars[] = {"PMI_RANK", "PMIX_RANK", "SLURM_PROCID"};
+  for (const char *var : vars) {
+    const char *value = getenv(var);
+    if (value != NULL && value[0] >= '0' && value[0] <= '9') {
+      return atoi(value);
+    }
+  }
+  return 0;
+}
+
 // The layers that have registered (mana_register_layer()), by ManaLayer.
 static mana_layer_fn_t layers[MANA_NUM_LAYERS];
 
@@ -677,6 +693,9 @@ mana_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       initialize_segv_handler();
       init_lower_half_ckpt();
       mana_state = RUNNING;
+      if (mana_rank == -1) {
+        mana_rank = launcher_rank();
+      }
 
       DmtcpMutexInit(&g_upper_half_fsbase_lock, DMTCP_MUTEX_LLL);
       if (g_upper_half_fsbase != NULL) {
@@ -760,6 +779,7 @@ mana_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
     case DMTCP_EVENT_PRESUSPEND: {
       printEventToStderr("EVENT_PRESUSPEND (finish collective op's)");
       run_layers(MANA_STEP_WAIT_FOR_INIT);
+      mana_state = CKPT_COLLECTIVE;  // Not RUNNING: the checkpoint has begun.
       run_layers(MANA_STEP_DRAIN);
       openCkptFileFds();
       // No thread may be in the lower half when DMTCP suspends the threads.

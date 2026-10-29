@@ -200,7 +200,7 @@ initialize_drain_send_recv()
   MPI_Comm ack_comm;
   int retval;
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-  retval = NEXT_FUNC(Comm_dup)(lh_info->MANA_COMM_WORLD, &ack_comm);
+  retval = NEXT_FUNC(Comm_dup)(LH_MPI->MANA_COMM_WORLD, &ack_comm);
   RETURN_TO_UPPER_HALF();
   ASSERT(retval == MPI_SUCCESS, "retval={}", retval);
   g_ssend_ack_comm = new_virt_comm(ack_comm);
@@ -245,7 +245,7 @@ recvMsgIntoInternalBuffer(MPI_Status status, MPI_Comm comm)
   // avoided by going through NEXT_FUNC(Recv) directly.
   MPI_Comm realComm = get_real_id((mana_mpi_handle){.comm = comm}).comm;
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-  int retval = NEXT_FUNC(Recv)(buf, count, lh_info->MANA_BYTE,
+  int retval = NEXT_FUNC(Recv)(buf, count, LH_MPI->MANA_BYTE,
                                status.MPI_SOURCE, status.MPI_TAG,
                                realComm, MPI_STATUS_IGNORE);
   ASSERT(retval == MPI_SUCCESS, "retval={}", retval);
@@ -318,7 +318,7 @@ completePendingP2pRequests()
         }
         update_virt_id(
           (mana_mpi_handle){.request = request},
-          (mana_mpi_handle){.request = lh_info->MANA_REQUEST_NULL});
+          (mana_mpi_handle){.request = LH_MPI->MANA_REQUEST_NULL});
       }
       clearPendingRequestFromLog(request);
     } else {
@@ -467,7 +467,7 @@ completePendingIsends()
       continue;
     }
     update_virt_id((mana_mpi_handle){.request = request},
-                   (mana_mpi_handle){.request = lh_info->MANA_REQUEST_NULL});
+                   (mana_mpi_handle){.request = LH_MPI->MANA_REQUEST_NULL});
     clearPendingRequestFromLog(request);
     g_drain_stats.isends_completed++;
   }
@@ -570,8 +570,8 @@ reduceDrainCounters(int64_t *local, int64_t *sums, int n)
   int done = 0;
   int retval;
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-  retval = NEXT_FUNC(Iallreduce)(local, sums, n, lh_info->MANA_INT64_T,
-                                 lh_info->MANA_SUM, realComm, &request);
+  retval = NEXT_FUNC(Iallreduce)(local, sums, n, LH_MPI->MANA_INT64_T,
+                                 LH_MPI->MANA_SUM, realComm, &request);
   RETURN_TO_UPPER_HALF();
   ASSERT(retval == MPI_SUCCESS, "retval={}", retval);
   for (;;) {
@@ -927,13 +927,13 @@ sendPostedDummies(bool nonblocking)
     // local_sent_messages (the receiver doesn't count it either).
     void *dummy_buf = calloc(bytes > 0 ? bytes : 1, 1);
     int ret;
-    MPI_Request request = lh_info->MANA_REQUEST_NULL;
+    MPI_Request request = LH_MPI->MANA_REQUEST_NULL;
     JUMP_TO_LOWER_HALF(lh_info->fsaddr);
     if (nonblocking) {
-      ret = NEXT_FUNC(Isend)(dummy_buf, (int)bytes, lh_info->MANA_BYTE, dest,
+      ret = NEXT_FUNC(Isend)(dummy_buf, (int)bytes, LH_MPI->MANA_BYTE, dest,
                              tag, realComm, &request);
     } else {
-      ret = NEXT_FUNC(Send)(dummy_buf, (int)bytes, lh_info->MANA_BYTE, dest,
+      ret = NEXT_FUNC(Send)(dummy_buf, (int)bytes, LH_MPI->MANA_BYTE, dest,
                             tag, realComm);
     }
     RETURN_TO_UPPER_HALF();
@@ -1000,7 +1000,7 @@ awaitSsendAck(MPI_Request request)
   MPI_Request realRequest;
   int retval;
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-  retval = NEXT_FUNC(Irecv)(NULL, 0, lh_info->MANA_BYTE, notice->receiver,
+  retval = NEXT_FUNC(Irecv)(NULL, 0, LH_MPI->MANA_BYTE, notice->receiver,
                             notice->ack_tag, realComm, &realRequest);
   RETURN_TO_UPPER_HALF();
   ASSERT(retval == MPI_SUCCESS, "retval={} receiver={}", retval,
@@ -1183,7 +1183,7 @@ localRankToGlobalRank(int localRank, MPI_Comm localComm)
   MPI_Group worldGroup, localGroup;
   MPI_Comm realComm = get_real_id((mana_mpi_handle){.comm = localComm}).comm;
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-  NEXT_FUNC(Comm_group)(lh_info->MANA_COMM_WORLD, &worldGroup);
+  NEXT_FUNC(Comm_group)(LH_MPI->MANA_COMM_WORLD, &worldGroup);
   NEXT_FUNC(Comm_group)(realComm, &localGroup);
   NEXT_FUNC(Group_translate_ranks)(localGroup, 1, &localRank,
                                    worldGroup, &worldRank);

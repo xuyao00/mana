@@ -128,7 +128,7 @@ lower_half_tag_ub()
   int flag = 0;
   int retval;
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-  retval = NEXT_FUNC(Comm_get_attr)(lh_info->MANA_COMM_WORLD, MPI_TAG_UB, &ub,
+  retval = NEXT_FUNC(Comm_get_attr)(LH_MPI->MANA_COMM_WORLD, MPI_TAG_UB, &ub,
                                     &flag);
   RETURN_TO_UPPER_HALF();
   ASSERT(retval == MPI_SUCCESS && flag, "retval={} flag={}", retval, flag);
@@ -164,7 +164,7 @@ copy_lower_half_attr(int keyval, int *value, int *flag)
   int *val = NULL;
   int retval;
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-  retval = NEXT_FUNC(Comm_get_attr)(lh_info->MANA_COMM_WORLD, keyval, &val,
+  retval = NEXT_FUNC(Comm_get_attr)(LH_MPI->MANA_COMM_WORLD, keyval, &val,
                                     flag);
   RETURN_TO_UPPER_HALF();
   ASSERT(retval == MPI_SUCCESS, "keyval={} retval={}", keyval, retval);
@@ -279,7 +279,7 @@ int PMPI_Comm_create(MPI_Comm comm, MPI_Group group, MPI_Comm *newcomm)
   retval = NEXT_FUNC(Comm_create)(real_comm, real_group, newcomm);
   RETURN_TO_UPPER_HALF();
   if (retval == MPI_SUCCESS) {
-    if (*newcomm == lh_info->MANA_COMM_NULL) {
+    if (*newcomm == LH_MPI->MANA_COMM_NULL) {
       *newcomm = MPI_COMM_NULL;
     } else {
       *newcomm = new_virt_comm(*newcomm);
@@ -541,7 +541,7 @@ int PMPI_Comm_split_type(MPI_Comm comm, int split_type,
                                       newcomm);
   RETURN_TO_UPPER_HALF();
   if (retval == MPI_SUCCESS) {
-    if (*newcomm == lh_info->MANA_COMM_NULL) {
+    if (*newcomm == LH_MPI->MANA_COMM_NULL) {
       *newcomm = MPI_COMM_NULL;
     } else {
       *newcomm = new_virt_comm(*newcomm);
@@ -675,7 +675,7 @@ int PMPI_Comm_create_group(MPI_Comm comm,
   commit_begin(comm);
   int retval = MPI_Comm_create_group_internal(comm, group, tag, newcomm);
   if (retval == MPI_SUCCESS) {
-    if (*newcomm == lh_info->MANA_COMM_NULL) {
+    if (*newcomm == LH_MPI->MANA_COMM_NULL) {
       *newcomm = MPI_COMM_NULL;
     } else {
       *newcomm = new_virt_comm(*newcomm);

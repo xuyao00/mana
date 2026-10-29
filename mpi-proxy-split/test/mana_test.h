@@ -25,11 +25,17 @@
 // the environment variable MT_CONTROL names a directory, at the iteration
 // written in MT_CONTROL/stop.  With MT_CONTROL, each rank also prints
 // "<name>: rank R: iteration I" at most every 0.1 s.
+//
+// With MT_NO_MPI defined, for a test that runs without MPI (mana_launch
+// --no-mpi): the rank and size come from the launcher, and a test that fails
+// exits with status 1.
 
 #ifndef MANA_TEST_H
 #define MANA_TEST_H
 
+#ifndef MT_NO_MPI
 #include <mpi.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +47,12 @@ static int mt_rank, mt_size;
 static long mt_iterations = -1;  // -1: no stop yet
 static char mt_stop_file[4096];   // empty: no MT_CONTROL
 
+#ifndef MT_NO_MPI
+#define MT_ABORT() MPI_Abort(MPI_COMM_WORLD, 1)
+#else
+#define MT_ABORT() exit(1)
+#endif
+
 #define MT_CHECK(cond, ...)                                                  \
   do {                                                                       \
     if (!(cond)) {                                                           \
@@ -49,21 +61,44 @@ static char mt_stop_file[4096];   // empty: no MT_CONTROL
       fprintf(stderr, __VA_ARGS__);                                          \
       fprintf(stderr, "\n");                                                 \
       fflush(stderr);                                                        \
-      MPI_Abort(MPI_COMM_WORLD, 1);                                          \
+      MT_ABORT();                                                            \
       exit(1); /* MPICH's MPI_Abort may return before the job is killed */   \
     }                                                                        \
   } while (0)
 
+#ifndef MT_NO_MPI
 #define MT_MPI(call) MT_CHECK((call) == MPI_SUCCESS, "%s", "MPI error")
+#else
+// The first of the launcher's variables that is set, or dflt: Hydra's,
+// PMIx's (Open MPI), then Slurm's.
+static int
+mt_launcher_value(const char *vars[], int n, int dflt)
+{
+  for (int i = 0; i < n; i++) {
+    const char *value = getenv(vars[i]);
+    if (value != NULL && value[0] >= '0' && value[0] <= '9') {
+      return atoi(value);
+    }
+  }
+  return dflt;
+}
+#endif
 
 // Initializes MPI and reads '-n ITERATIONS'; other arguments stay in argv.
 static void
 mt_init(int *argc, char ***argv, const char *name)
 {
   mt_name = name;
+#ifndef MT_NO_MPI
   MPI_Init(argc, argv);
   MPI_Comm_rank(MPI_COMM_WORLD, &mt_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &mt_size);
+#else
+  const char *ranks[] = {"PMI_RANK", "PMIX_RANK", "SLURM_PROCID"};
+  const char *sizes[] = {"PMI_SIZE", "OMPI_COMM_WORLD_SIZE", "SLURM_NTASKS"};
+  mt_rank = mt_launcher_value(ranks, 3, 0);
+  mt_size = mt_launcher_value(sizes, 3, 1);
+#endif
   for (int i = 1; i + 1 < *argc; i++) {
     if (strcmp((*argv)[i], "-n") == 0) {
       mt_iterations = atol((*argv)[i + 1]);
@@ -108,16 +143,21 @@ mt_continue(long iteration)
   return mt_iterations < 0 || iteration < mt_iterations;
 }
 
-// Rank 0 prints "<name>: PASS" when all ranks get here.
+// Rank 0 prints "<name>: PASS" when all ranks get here (without MPI: when
+// it gets here; the launcher reports the others' exit status).
 static void
 mt_finish(long iterations)
 {
+#ifndef MT_NO_MPI
   MPI_Barrier(MPI_COMM_WORLD);
+#endif
   if (mt_rank == 0) {
     printf("%s: PASS (%ld iterations)\n", mt_name, iterations);
     fflush(stdout);
   }
+#ifndef MT_NO_MPI
   MPI_Finalize();
+#endif
 }
 
 // A value that depends on who sent it, when, and where in the buffer.

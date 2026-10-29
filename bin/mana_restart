@@ -4,7 +4,8 @@ import os
 import shutil
 
 help_msg = '''
-  USAGE: [srun/mpirun] mana_restart [--verbose] [--timing] [--cuda] [DMTCP_OPTIONS ...]
+  USAGE: [srun/mpirun] mana_restart [--verbose] [--timing] [--cuda] [--no-mpi]
+                                    [DMTCP_OPTIONS ...]
                                     [--restartdir DIR] [--ckptdir DIR]
           For DMTCP options, do: dmtcp_restart --help
 '''
@@ -34,6 +35,10 @@ if "--timing" in dmtcp_flags:
 if "--cuda" in dmtcp_flags:
   os.environ["MANA_CUDA"] = "1"
   dmtcp_flags.remove("--cuda")
+# --no-mpi: as for mana_launch.  Same as MANA_NO_MPI=1.
+if "--no-mpi" in dmtcp_flags:
+  os.environ["MANA_NO_MPI"] = "1"
+  dmtcp_flags.remove("--no-mpi")
 if "--restartdir" not in dmtcp_flags:
   dmtcp_flags.extend(["--restartdir", "./"])
 restartdir_index = dmtcp_flags.index("--restartdir")
@@ -95,6 +100,16 @@ for header in headers:
                       if x.isdigit())
 if p2p_wait is not None:
   os.environ["MANA_P2P_WAIT"] = p2p_wait
+# Only the MPI layer writes p2p_wait: a checkpoint without it was taken with
+# --no-mpi, and restarts in bin/lower-half-nompi.
+no_mpi = os.environ.get("MANA_NO_MPI", "") not in ("", "0")
+if no_mpi and p2p_wait is not None:
+  print("mana_restart: --no-mpi, but the checkpoint in " + restart_dir +
+        " was taken with MPI")
+  sys.exit(1)
+if headers and p2p_wait is None:
+  no_mpi = True
+lower_half = "bin/lower-half-nompi" if no_mpi else "bin/lower-half"
 if reserved_fds:
   os.environ["MANA_RESERVED_FDS"] = ",".join(map(str, sorted(reserved_fds)))
 if "--ckptdir" in dmtcp_flags:
@@ -155,9 +170,9 @@ if gdb:
   cmd_line = shutil.which("gdb") + " --args "
 else:
   cmd_line = ""
-cmd_line += mana_root_path + "bin/lower-half -j --restore " + host_flag + port_flag + " ".join(dmtcp_flags)
+cmd_line += mana_root_path + lower_half + " -j --restore " + host_flag + port_flag + " ".join(dmtcp_flags)
 if verbose:
-  print(cmd_line)
+  print(cmd_line, flush=True)  # before os.execv() replaces this process
 
 # This is for debug only
 # cmd_line = "/usr/bin/echo " + cmd_line

@@ -26,7 +26,7 @@
 #include <cstdint>
 #include <cstddef>
 
-#include "lower-half-api.h"
+#include "lower-half-mpi.h"
 #include "dmtcp_dlsym.h"
 #include "mana_core.h"
 

@@ -32,7 +32,7 @@ override CXXFLAGS += -fPIC -I${DMTCP_INCLUDE} -I${JALIB_INCLUDE} -I${MANA_INCLUD
 
 TEXTSEG_ADDR_FLAG=-Wl,-Ttext-segment=0x10000000
 
-default: lower-half
+default: lower-half lower-half-nompi
 
 .cpp.o:
 	${MPICXX} ${CXXFLAGS} -c -o $@ $<
@@ -43,12 +43,34 @@ default: lower-half
 # Normally, gcc (or clang) will automatically link with libatomic.so.
 # However, for come MPICXX it's hard to know if they cover it.
 # So this is good as a safety measure.
-lower-half: get-symbol-offset.o build-id-debug.o copy-stack.o patch-trampoline.o lh-func-ptr.o mem-wrapper.o switch-context.o lower-half.o mmap-fixed-noreplace.o ${DMTCP_DEPS}
+lower-half: get-symbol-offset.o build-id-debug.o copy-stack.o patch-trampoline.o lh-func-ptr.o mem-wrapper.o switch-context.o lower-half.o mmap-fixed-noreplace.o lh-mpi.o ${DMTCP_DEPS}
 	${MPICXX} -g3 ${TEXTSEG_ADDR_FLAG} ${CXXFLAGS} -o $@ $^ -lpthread -ldl -latomic
 
-build-id-debug.o lower-half.o: build-id-debug.h
+# bin/lower-half-nompi: the same lower half without MPI, with lh-nompi.cpp
+# in place of lh-mpi.cpp and lh-func-ptr.c.  Built with the plain compiler,
+# so that it runs where no MPI library is installed.
+NOMPI_OBJS = $(addprefix nompi/,get-symbol-offset.o build-id-debug.o \
+               copy-stack.o patch-trampoline.o mem-wrapper.o switch-context.o \
+               lower-half.o mmap-fixed-noreplace.o lh-nompi.o)
 
-install: lower-half
+lower-half-nompi: ${NOMPI_OBJS} ${DMTCP_DEPS}
+	${CXX} -g3 ${TEXTSEG_ADDR_FLAG} ${CXXFLAGS} -o $@ $^ -lpthread -ldl -latomic
+
+# With the C++ standard that MPICXX sets.
+nompi/%.o: %.cpp
+	@mkdir -p nompi
+	${CXX} -std=c++20 ${CXXFLAGS} -c -o $@ $<
+
+nompi/%.o: %.c
+	@mkdir -p nompi
+	${CXX} -std=c++20 ${CFLAGS} -c -o $@ $<
+
+build-id-debug.o lower-half.o nompi/build-id-debug.o nompi/lower-half.o: \
+  build-id-debug.h
+lower-half.o lh-mpi.o nompi/lower-half.o nompi/lh-nompi.o: lh-mpi.h
+lh-mpi.o: lower-half-mpi.h
+
+install: lower-half lower-half-nompi
 	cp -f $^ ${MANA_ROOT}/bin/
 
 tidy:
@@ -57,9 +79,10 @@ tidy:
 	rm -rf dmtcp_coordinator_db-*.json
 
 clean: tidy
-	rm -f lower-half
-	rm -f ${MANA_ROOT}/bin/lower-half
+	rm -f lower-half lower-half-nompi
+	rm -f ${MANA_ROOT}/bin/lower-half ${MANA_ROOT}/bin/lower-half-nompi
 	rm -f *.o
+	rm -rf nompi
 
 distclean: clean
 

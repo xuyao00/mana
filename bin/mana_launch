@@ -4,8 +4,9 @@ import os
 import shutil
 
 help_msg = '''
-  USAGE: [srun] mana_launch [--verbose] [--timing] [--cuda] [DMTCP_OPTIONS ...]
-                            [--ckptdir DIR] MPI_EXECUTABLE [...]
+  USAGE: [srun] mana_launch [--verbose] [--timing] [--cuda] [--no-mpi]
+                            [DMTCP_OPTIONS ...] [--ckptdir DIR]
+                            MPI_EXECUTABLE [...]
           For DMTCP options, do: dmtcp_launch --help
 '''
 
@@ -61,6 +62,17 @@ if "--timing" in dmtcp_flags:
 if "--cuda" in dmtcp_flags:
   os.environ["MANA_CUDA"] = "1"
   dmtcp_flags.remove("--cuda")
+# --no-mpi: a program that doesn't use MPI (one that uses NCCL, started by
+# srun, ...).  Nothing of MPI loads, and bin/lower-half-nompi runs where no
+# MPI library is installed.  Same as MANA_NO_MPI=1.
+if "--no-mpi" in dmtcp_flags:
+  os.environ["MANA_NO_MPI"] = "1"
+  dmtcp_flags.remove("--no-mpi")
+no_mpi = os.environ.get("MANA_NO_MPI", "") not in ("", "0")
+lower_half = "bin/lower-half-nompi" if no_mpi else "bin/lower-half"
+if not os.path.exists(mana_root_path + lower_half):
+  print("mana_launch: " + mana_root_path + lower_half + " not found")
+  sys.exit(1)
 if "srun" in target_app or "sbatch" in target_app:
   print(help_msg)
   sys.exit(1)
@@ -142,9 +154,11 @@ while index < len(dmtcp_flags):
 dmtcp_flags = filtered_flags
 
 # libmana.so, the core (the DMTCP plugin), and its layers: libmana_mpi.so,
-# which takes the MPI calls, and with --cuda the CUDA front.
-mana_plugins = [mana_root_path + "lib/dmtcp/libmana.so",
-                mana_root_path + "lib/dmtcp/libmana_mpi.so"]
+# which takes the MPI calls (not with --no-mpi), and with --cuda the CUDA
+# front.
+mana_plugins = [mana_root_path + "lib/dmtcp/libmana.so"]
+if not no_mpi:
+  mana_plugins.append(mana_root_path + "lib/dmtcp/libmana_mpi.so")
 # Libraries in MANA_PRELOAD (colon-separated, e.g. a PMPI profiler) load
 # ahead of the mana plugins, so they intercept MPI calls before MANA does.
 # A library in LD_PRELOAD loads after them.
@@ -170,10 +184,10 @@ else:
 cmd_line += mana_root_path + "bin/dmtcp_launch --kernel-loader " + host_flag + port_flag + \
             " --no-gzip --join-coordinator --disable-dl-plugin" + \
             " --with-plugin " + plugin_list + " " + \
-            " ".join(dmtcp_flags) + " " + mana_root_path + "bin/lower-half " + \
+            " ".join(dmtcp_flags) + " " + mana_root_path + lower_half + " " + \
             " " .join(target_app)
 if verbose:
-  print(cmd_line)
+  print(cmd_line, flush=True)  # before os.execv() replaces this process
 
 # This is for debug only
 # cmd_line = "/usr/bin/echo " + cmd_line

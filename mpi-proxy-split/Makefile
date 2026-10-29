@@ -66,7 +66,7 @@ override CXXFLAGS += -DOMPI_SKIP_MPICXX -DMPICH_SKIP_MPICXX
 # ${WRAPPERS_SRCDIR}/libmpiwrappers.a ia a prerequisite for libmana.so
 # Always do 'make default' or 'make install' -- not 'make libmana.so'
 default: ${MANA_COORD_OBJS}
-	make -C ${LH_SRCDIR} lower-half
+	make -C ${LH_SRCDIR} lower-half lower-half-nompi
 	make -C ${WRAPPERS_SRCDIR} libmpiwrappers.a libmpistub.so \
 	  libmpistub_audit.so
 	make libmana.so libmana_mpi.so
@@ -92,6 +92,11 @@ mpi_unimplemented_wrappers.cpp: generate-mpi-unimplemented-wrappers.py \
 
 .cpp.o:
 	${MPICXX} ${CXXFLAGS} -c -o $@ $<
+
+# The core needs no MPI: the plain compiler, with the C++ standard that
+# MPICXX sets.
+$(filter-out lower-half/%,${CORE_OBJS}): %.o: %.cpp
+	${CXX} -std=c++20 ${CXXFLAGS} -c -o $@ $<
 
 # Make ignores prerequisites on suffix rules, so list header dependencies
 # here: the headers that define inline code.

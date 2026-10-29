@@ -22,14 +22,11 @@
 #ifndef _LOWER_HALF_API_H
 #define _LOWER_HALF_API_H
 
-#include <mpi.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <vector>
 
 #include "switch-context.h"
-
-extern "C" int MPI_MANA_Internal(char *dummy);
 
 typedef char* VA;
 
@@ -56,7 +53,8 @@ typedef struct __MmapInfo
 
 // The transient lh_proxy process introspects its memory layout and passes this
 // information back to the main application process using this struct.
-// This must be same in restart_plugin and low
+// This must be same in restart_plugin and low.  It needs no mpi.h: it is the
+// same in bin/lower-half and bin/lower-half-nompi.
 typedef struct _LowerHalfInfo
 {
   void *fsaddr; // The base value of the FS register of the lower half
@@ -72,113 +70,9 @@ typedef struct _LowerHalfInfo
   char *uh_stack_end;
   char *uh_next_free_addr;
 
-  // MPI Constants
-  MPI_Group MANA_GROUP_NULL;
-  MPI_Comm MANA_COMM_NULL;
-  MPI_Request MANA_REQUEST_NULL;
-  MPI_Message MANA_MESSAGE_NULL;
-  MPI_Op MANA_OP_NULL;
-  MPI_Errhandler MANA_ERRHANDLER_NULL;
-  MPI_Info MANA_INFO_NULL;
-  MPI_Win MANA_WIN_NULL;
-  MPI_File MANA_FILE_NULL;
-  MPI_Info MANA_INFO_ENV;
-  MPI_Comm MANA_COMM_WORLD;
-  MPI_Comm MANA_COMM_SELF;
-  MPI_Group MANA_GROUP_EMPTY;
-  MPI_Message MANA_MESSAGE_NO_PROC;
-  MPI_Op MANA_MAX;
-  MPI_Op MANA_MIN;
-  MPI_Op MANA_SUM;
-  MPI_Op MANA_PROD;
-  MPI_Op MANA_LAND;
-  MPI_Op MANA_BAND;
-  MPI_Op MANA_LOR;
-  MPI_Op MANA_BOR;
-  MPI_Op MANA_LXOR;
-  MPI_Op MANA_BXOR;
-  MPI_Op MANA_MAXLOC;
-  MPI_Op MANA_MINLOC;
-  MPI_Op MANA_REPLACE;
-  MPI_Op MANA_NO_OP;
-  MPI_Datatype MANA_DATATYPE_NULL;
-  MPI_Datatype MANA_BYTE;
-  MPI_Datatype MANA_PACKED;
-  MPI_Datatype MANA_CHAR;
-  MPI_Datatype MANA_SHORT;
-  MPI_Datatype MANA_INT;
-  MPI_Datatype MANA_LONG;
-  MPI_Datatype MANA_FLOAT;
-  MPI_Datatype MANA_DOUBLE;
-  MPI_Datatype MANA_LONG_DOUBLE;
-  MPI_Datatype MANA_UNSIGNED_CHAR;
-  MPI_Datatype MANA_SIGNED_CHAR;
-  MPI_Datatype MANA_UNSIGNED_SHORT;
-  MPI_Datatype MANA_UNSIGNED_LONG;
-  MPI_Datatype MANA_UNSIGNED;
-  MPI_Datatype MANA_FLOAT_INT;
-  MPI_Datatype MANA_DOUBLE_INT;
-  MPI_Datatype MANA_LONG_DOUBLE_INT;
-  MPI_Datatype MANA_LONG_INT;
-  MPI_Datatype MANA_SHORT_INT;
-  MPI_Datatype MANA_2INT;
-  MPI_Datatype MANA_WCHAR;
-  MPI_Datatype MANA_LONG_LONG_INT;
-  MPI_Datatype MANA_LONG_LONG;
-  MPI_Datatype MANA_UNSIGNED_LONG_LONG;
-#if 0
-  MPI_Datatype MANA_2COMPLEX;
-  MPI_Datatype MANA_2DOUBLE_COMPLEX;
-  MPI_Datatype MANA_CXX_COMPLEX;
-#endif
-  MPI_Datatype MANA_CHARACTER;
-  MPI_Datatype MANA_LOGICAL;
-#if 0
-  MPI_Datatype MANA_LOGICAL1;
-  MPI_Datatype MANA_LOGICAL2;
-  MPI_Datatype MANA_LOGICAL4;
-  MPI_Datatype MANA_LOGICAL8;
-#endif
-  MPI_Datatype MANA_INTEGER;
-  MPI_Datatype MANA_INTEGER1;
-  MPI_Datatype MANA_INTEGER2;
-  MPI_Datatype MANA_INTEGER4;
-  MPI_Datatype MANA_INTEGER8;
-  MPI_Datatype MANA_REAL;
-  MPI_Datatype MANA_REAL4;
-  MPI_Datatype MANA_REAL8;
-  MPI_Datatype MANA_REAL16;
-  MPI_Datatype MANA_DOUBLE_PRECISION;
-  MPI_Datatype MANA_COMPLEX;
-  MPI_Datatype MANA_COMPLEX8;
-  MPI_Datatype MANA_COMPLEX16;
-  MPI_Datatype MANA_COMPLEX32;
-  MPI_Datatype MANA_DOUBLE_COMPLEX;
-  MPI_Datatype MANA_2REAL;
-  MPI_Datatype MANA_2DOUBLE_PRECISION;
-  MPI_Datatype MANA_2INTEGER;
-  MPI_Datatype MANA_INT8_T;
-  MPI_Datatype MANA_UINT8_T;
-  MPI_Datatype MANA_INT16_T;
-  MPI_Datatype MANA_UINT16_T;
-  MPI_Datatype MANA_INT32_T;
-  MPI_Datatype MANA_UINT32_T;
-  MPI_Datatype MANA_INT64_T;
-  MPI_Datatype MANA_UINT64_T;
-  MPI_Datatype MANA_AINT;
-  MPI_Datatype MANA_OFFSET;
-  MPI_Datatype MANA_C_BOOL;
-  MPI_Datatype MANA_C_COMPLEX;
-  MPI_Datatype MANA_C_FLOAT_COMPLEX;
-  MPI_Datatype MANA_C_DOUBLE_COMPLEX;
-  MPI_Datatype MANA_C_LONG_DOUBLE_COMPLEX;
-  MPI_Datatype MANA_CXX_BOOL;
-  MPI_Datatype MANA_CXX_FLOAT_COMPLEX;
-  MPI_Datatype MANA_CXX_DOUBLE_COMPLEX;
-  MPI_Datatype MANA_CXX_LONG_DOUBLE_COMPLEX;
-  MPI_Datatype MANA_COUNT;
-  MPI_Errhandler MANA_ERRORS_ARE_FATAL;
-  MPI_Errhandler MANA_ERRORS_RETURN;
+  // LowerHalfMpiInfo_t (lower-half-mpi.h): the MPI library's constants.
+  // NULL in bin/lower-half-nompi, which has no MPI.
+  void *mpi;
   // Blocking mode with MPI_THREAD_MULTIPLE: the FS of
   // lh_thread_for_extra_tls(), which the checkpoint thread uses in the lower
   // half, and the checkpoint thread's own FS meanwhile (see lower_half_fs()).
@@ -197,7 +91,8 @@ typedef struct _LowerHalfInfo
   unsigned long reserved_fd_ino;
   // int handle_c2f(int kind, int64_t handle): the Fortran handle of a
   // handle of the lower half (MANA_*_KIND), from MPI_Comm_c2f() and others.
-  // With MPICH, those are macros, which the upper half cannot look up.
+  // With MPICH, those are macros, which the upper half cannot look up.  NULL
+  // without MPI, as are lh_dlsym and mpi.
   void *handle_c2f;
   // --cuda (MANA_CUDA=1): the application's CUDA runs in the lower half
   // (cuda/DESIGN-lower-half-cuda.md).  Set up by init_lower_half_cuda(),

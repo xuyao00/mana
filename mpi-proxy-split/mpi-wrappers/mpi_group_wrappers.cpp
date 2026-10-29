@@ -42,7 +42,7 @@ int PMPI_Comm_group(MPI_Comm comm, MPI_Group *group)
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
   retval = NEXT_FUNC(Comm_group)(real_comm, group);
   RETURN_TO_UPPER_HALF();
-  if (*group == lh_info->MANA_GROUP_NULL) {
+  if (*group == LH_MPI->MANA_GROUP_NULL) {
     *group = MPI_GROUP_NULL;
   } else {
     *group = new_virt_group(*group);
@@ -112,7 +112,7 @@ int PMPI_Group_incl(MPI_Group group, int n, const int* ranks, MPI_Group * newgro
   retval = NEXT_FUNC(Group_incl)(real_group, n, ranks, newgroup);
   RETURN_TO_UPPER_HALF();
   if (retval == MPI_SUCCESS) {
-    if (*newgroup == lh_info->MANA_GROUP_NULL) {
+    if (*newgroup == LH_MPI->MANA_GROUP_NULL) {
       *newgroup = MPI_GROUP_NULL;
     } else {
       *newgroup = new_virt_group(*newgroup);

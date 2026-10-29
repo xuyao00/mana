@@ -31,6 +31,7 @@
 #include "mem-wrapper.h"
 #include "patch-trampoline.h"
 #include "lower-half-api.h"
+#include "lh-mpi.h"
 #include "logging.h"
 #include "build-id-debug.h"
 #include "dmtcp.h"
@@ -88,7 +89,6 @@ void set_addr_no_randomize(char *argv[]);
 static void reserve_restart_fds();
 void create_heap_guard_page();
 void initialize_lh_info();
-void *lh_dlsym(enum MPI_Fncs fnc);
 void write_lh_info_addr(int restore_mode);
 void remove_dangling_env_entries(char **argv);
 
@@ -443,28 +443,18 @@ int main(int argc, char *argv[], char *envp[]) {
   lh_info->fsaddr = (void*)fsaddr;
   lh_info->fsgsbase_enabled = CheckAndEnableFsGsBase();
 
-  // Initialize MPI in advance.  In blocking mode (MANA_P2P_WAIT=blocking;
-  // mana_restart sets it from the checkpoint), the checkpoint thread's P2P
-  // drain calls MPI while an application thread waits in the library's
-  // MPI_Recv or MPI_Send.  So two threads are in the library at once: this
-  // needs MPI_THREAD_MULTIPLE.  In polling mode no thread waits in the
-  // library during the drain, so the cheaper MPI_THREAD_SINGLE is enough.
-  int rank;
+  // Initialize MPI in advance (lh-mpi.cpp; lh-nompi.cpp has none).
   char **initial_argv = argv;
-  const char *p2p_wait = getenv("MANA_P2P_WAIT");
-  int required = (p2p_wait != NULL && strcmp(p2p_wait, "blocking") == 0)
-                   ? MPI_THREAD_MULTIPLE : MPI_THREAD_SINGLE;
-  int provided = MPI_THREAD_SINGLE;
+  bool extra_tls = false;
   reserve_restart_fds();
   prepare_lower_half_cuda();
-  MPI_Init_thread(&argc, &argv, required, &provided);
-  if (required == MPI_THREAD_MULTIPLE && provided == MPI_THREAD_MULTIPLE) {
+  int rank = init_lower_half_mpi(&argc, &argv, &extra_tls);
+  if (extra_tls) {
     create_lh_thread_for_extra_tls();
   }
   remove_dangling_env_entries(initial_argv);
   record_lower_half_pid();
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  
+
   // Initialize MPI Functions and Constants mapping table in lower-half
   initialize_lh_info();
   init_lower_half_cuda();
@@ -745,158 +735,21 @@ void create_heap_guard_page()
   }
 }
 
-// lh_info->handle_c2f: see lower-half-api.h.
-static int
-handle_c2f(int kind, int64_t handle)
-{
-  intptr_t h = (intptr_t)handle;
-  switch (kind) {
-    case MANA_COMM_KIND:
-      return MPI_Comm_c2f((MPI_Comm)h);
-    case MANA_GROUP_KIND:
-      return MPI_Group_c2f((MPI_Group)h);
-    case MANA_DATATYPE_KIND:
-      return MPI_Type_c2f((MPI_Datatype)h);
-    case MANA_OP_KIND:
-      return MPI_Op_c2f((MPI_Op)h);
-    case MANA_REQUEST_KIND:
-      return MPI_Request_c2f((MPI_Request)h);
-    case MANA_FILE_KIND:
-      return MPI_File_c2f((MPI_File)h);
-    case MANA_ERRHANDLER_KIND:
-      return MPI_Errhandler_c2f((MPI_Errhandler)h);
-    case MANA_INFO_KIND:
-      return MPI_Info_c2f((MPI_Info)h);
-    case MANA_WIN_KIND:
-      return MPI_Win_c2f((MPI_Win)h);
-    case MANA_MESSAGE_KIND:
-      return MPI_Message_c2f((MPI_Message)h);
-  }
-  abort();
-}
-
 /**
  * @brief Initializes the LowerHalfInfo_t structure with 
  *        MPI constants and function pointers.
  *
  * This function sets up the `lh_info` object by assigning function pointers
- *  and various MPI constants. It should be called after MPI has been initialized.
+ *  and, with MPI, the MPI constants (lh-mpi.cpp). It should be called after
+ *  MPI has been initialized.
  *
  */
 void initialize_lh_info()
 {
   lh_info->mmap = (void*)&mmap_wrapper;
   lh_info->munmap = (void*)&munmap_wrapper;
-  lh_info->lh_dlsym = (void*)&lh_dlsym;
-  lh_info->handle_c2f = (void*)&handle_c2f;
   lh_info->mmap_list_fptr = (void*)&get_mmapped_list;
-  // MPI constants values
-  lh_info->MANA_GROUP_NULL = MPI_GROUP_NULL;
-  lh_info->MANA_COMM_NULL = MPI_COMM_NULL;
-  lh_info->MANA_REQUEST_NULL = MPI_REQUEST_NULL;
-  lh_info->MANA_MESSAGE_NULL = MPI_MESSAGE_NULL;
-  lh_info->MANA_OP_NULL = MPI_OP_NULL;
-  lh_info->MANA_ERRHANDLER_NULL = MPI_ERRHANDLER_NULL;
-  lh_info->MANA_INFO_NULL = MPI_INFO_NULL;
-  lh_info->MANA_WIN_NULL = MPI_WIN_NULL;
-  lh_info->MANA_FILE_NULL = MPI_FILE_NULL;
-  lh_info->MANA_INFO_ENV = MPI_INFO_ENV;
-  lh_info->MANA_COMM_WORLD = MPI_COMM_WORLD;
-  lh_info->MANA_COMM_SELF = MPI_COMM_SELF;
-  lh_info->MANA_GROUP_EMPTY = MPI_GROUP_EMPTY;
-  lh_info->MANA_MESSAGE_NO_PROC = MPI_MESSAGE_NO_PROC;
-  lh_info->MANA_MAX = MPI_MAX;
-  lh_info->MANA_MIN = MPI_MIN;
-  lh_info->MANA_SUM = MPI_SUM;
-  lh_info->MANA_PROD = MPI_PROD;
-  lh_info->MANA_LAND = MPI_LAND;
-  lh_info->MANA_BAND = MPI_BAND;
-  lh_info->MANA_LOR = MPI_LOR;
-  lh_info->MANA_BOR = MPI_BOR;
-  lh_info->MANA_LXOR = MPI_LXOR;
-  lh_info->MANA_BXOR = MPI_BXOR;
-  lh_info->MANA_MAXLOC = MPI_MAXLOC;
-  lh_info->MANA_MINLOC = MPI_MINLOC;
-  lh_info->MANA_REPLACE = MPI_REPLACE;
-  lh_info->MANA_NO_OP = MPI_NO_OP;
-  lh_info->MANA_DATATYPE_NULL = MPI_DATATYPE_NULL;
-  lh_info->MANA_BYTE = MPI_BYTE;
-  lh_info->MANA_PACKED = MPI_PACKED;
-  lh_info->MANA_CHAR = MPI_CHAR;
-  lh_info->MANA_SHORT = MPI_SHORT;
-  lh_info->MANA_INT = MPI_INT;
-  lh_info->MANA_LONG = MPI_LONG;
-  lh_info->MANA_FLOAT = MPI_FLOAT;
-  lh_info->MANA_DOUBLE = MPI_DOUBLE;
-  lh_info->MANA_LONG_DOUBLE = MPI_LONG_DOUBLE;
-  lh_info->MANA_UNSIGNED_CHAR = MPI_UNSIGNED_CHAR;
-  lh_info->MANA_SIGNED_CHAR = MPI_SIGNED_CHAR;
-  lh_info->MANA_UNSIGNED_SHORT = MPI_UNSIGNED_SHORT;
-  lh_info->MANA_UNSIGNED_LONG = MPI_UNSIGNED_LONG;
-  lh_info->MANA_UNSIGNED = MPI_UNSIGNED;
-  lh_info->MANA_FLOAT_INT = MPI_FLOAT_INT;
-  lh_info->MANA_DOUBLE_INT = MPI_DOUBLE_INT;
-  lh_info->MANA_LONG_DOUBLE_INT = MPI_LONG_DOUBLE_INT;
-  lh_info->MANA_LONG_INT = MPI_LONG_INT;
-  lh_info->MANA_SHORT_INT = MPI_SHORT_INT;
-  lh_info->MANA_2INT = MPI_2INT;
-  lh_info->MANA_WCHAR = MPI_WCHAR;
-  lh_info->MANA_LONG_LONG_INT = MPI_LONG_LONG_INT;
-  lh_info->MANA_LONG_LONG = MPI_LONG_LONG;
-  lh_info->MANA_UNSIGNED_LONG_LONG = MPI_UNSIGNED_LONG_LONG;
-#if 0
-  lh_info->MANA_2COMPLEX = MPI_2COMPLEX;
-  lh_info->MANA_CXX_COMPLEX = MPI_CXX_COMPLEX;
-  lh_info->MANA_2DOUBLE_COMPLEX = MPI_2DOUBLE_COMPLEX;
-#endif
-  lh_info->MANA_CHARACTER = MPI_CHARACTER;
-  lh_info->MANA_LOGICAL = MPI_LOGICAL;
-#if 0
-  lh_info->MANA_LOGICAL1 = MPI_LOGICAL1;
-  lh_info->MANA_LOGICAL2 = MPI_LOGICAL2;
-  lh_info->MANA_LOGICAL4 = MPI_LOGICAL4;
-  lh_info->MANA_LOGICAL8 = MPI_LOGICAL8;
-#endif
-  lh_info->MANA_INTEGER = MPI_INTEGER;
-  lh_info->MANA_INTEGER1 = MPI_INTEGER1;
-  lh_info->MANA_INTEGER2 = MPI_INTEGER2;
-  lh_info->MANA_INTEGER4 = MPI_INTEGER4;
-  lh_info->MANA_INTEGER8 = MPI_INTEGER8;
-  lh_info->MANA_REAL = MPI_REAL;
-  lh_info->MANA_REAL4 = MPI_REAL4;
-  lh_info->MANA_REAL8 = MPI_REAL8;
-  lh_info->MANA_REAL16 = MPI_REAL16;
-  lh_info->MANA_DOUBLE_PRECISION = MPI_DOUBLE_PRECISION;
-  lh_info->MANA_COMPLEX = MPI_COMPLEX;
-  lh_info->MANA_COMPLEX8 = MPI_COMPLEX8;
-  lh_info->MANA_COMPLEX16 = MPI_COMPLEX16;
-  lh_info->MANA_COMPLEX32 = MPI_COMPLEX32;
-  lh_info->MANA_DOUBLE_COMPLEX = MPI_DOUBLE_COMPLEX;
-  lh_info->MANA_2REAL = MPI_2REAL;
-  lh_info->MANA_2DOUBLE_PRECISION = MPI_2DOUBLE_PRECISION;
-  lh_info->MANA_2INTEGER = MPI_2INTEGER;
-  lh_info->MANA_INT8_T = MPI_INT8_T;
-  lh_info->MANA_UINT8_T = MPI_UINT8_T;
-  lh_info->MANA_INT16_T = MPI_INT16_T;
-  lh_info->MANA_UINT16_T = MPI_UINT16_T;
-  lh_info->MANA_INT32_T = MPI_INT32_T;
-  lh_info->MANA_UINT32_T = MPI_UINT32_T;
-  lh_info->MANA_INT64_T = MPI_INT64_T;
-  lh_info->MANA_UINT64_T = MPI_UINT64_T;
-  lh_info->MANA_AINT = MPI_AINT;
-  lh_info->MANA_OFFSET = MPI_OFFSET;
-  lh_info->MANA_C_BOOL = MPI_C_BOOL;
-  lh_info->MANA_C_COMPLEX = MPI_C_COMPLEX;
-  lh_info->MANA_C_FLOAT_COMPLEX = MPI_C_FLOAT_COMPLEX;
-  lh_info->MANA_C_DOUBLE_COMPLEX = MPI_C_DOUBLE_COMPLEX;
-  lh_info->MANA_C_LONG_DOUBLE_COMPLEX = MPI_C_LONG_DOUBLE_COMPLEX;
-  lh_info->MANA_CXX_BOOL = MPI_CXX_BOOL;
-  lh_info->MANA_CXX_FLOAT_COMPLEX = MPI_CXX_FLOAT_COMPLEX;
-  lh_info->MANA_CXX_DOUBLE_COMPLEX = MPI_CXX_DOUBLE_COMPLEX;
-  lh_info->MANA_CXX_LONG_DOUBLE_COMPLEX = MPI_CXX_LONG_DOUBLE_COMPLEX;
-  lh_info->MANA_COUNT = MPI_COUNT;
-  lh_info->MANA_ERRORS_ARE_FATAL = MPI_ERRORS_ARE_FATAL;
-  lh_info->MANA_ERRORS_RETURN = MPI_ERRORS_RETURN;
+  initialize_lh_mpi_info();
 }
 
 /*
@@ -1199,7 +1052,7 @@ void restore_memory_data(RestoreTarget *t, DmtcpCkptHeader &ckpt_hdr)
 }
 
 // The upper half's libc calls the vDSO at its address in the checkpointed
-// process.  MPI_Abort, not exit(): srun can leave the other ranks waiting.
+// process.
 static void
 check_vdso_address(const DmtcpCkptHeader &ckpt_hdr)
 {
@@ -1209,7 +1062,7 @@ check_vdso_address(const DmtcpCkptHeader &ckpt_hdr)
             "checkpointed process; the application would crash in "
             "clock_gettime()\n",
             (void *)vdso, (void *)ckpt_hdr.vdso.startAddr);
-    MPI_Abort(MPI_COMM_WORLD, 1);
+    abort_lower_half_job();
   }
 }
 
@@ -1461,17 +1314,19 @@ void print_usage_and_exit(char *prog_name)
  * @brief Updates the LD_LIBRARY_PATH for the upper-half application.
  *
  * Prepends the location of libmpistub.so, which defines the MPI symbols of
- *  the user's MPI application, to LD_LIBRARY_PATH for the upper half.  It
- *  also sets LD_AUDIT, so that the upper half loads libmpistub.so in place
- *  of the MPI library that the application was linked with.
+ *  the user's MPI application, to LD_LIBRARY_PATH for the upper half.  With
+ *  MPI, it also sets LD_AUDIT, so that the upper half loads libmpistub.so in
+ *  place of the MPI library that the application was linked with.
  *
  * @param argv0 the path to the executing binary. 
  */
 void update_library_path(const char *argv0)
 {
-  // argv0 is <MANA root>/bin/lower-half (mana_launch passes
-  // <MANA root>/bin/../bin/lower-half); otherwise, leave the path alone.
-  const char *remove_part = "bin/lower-half";
+  // argv0 is <MANA root>/bin/lower-half or bin/lower-half-nompi
+  // (mana_launch passes <MANA root>/bin/../bin/lower-half); otherwise, leave
+  // the path alone.
+  const char *remove_part = lh_info->mpi != NULL ? "bin/lower-half"
+                                                 : "bin/lower-half-nompi";
   size_t argv0_len = strlen(argv0);
   if (argv0_len < strlen(remove_part) ||
       strcmp(argv0 + argv0_len - strlen(remove_part), remove_part) != 0) {
@@ -1503,11 +1358,14 @@ void update_library_path(const char *argv0)
   // AT_SECURE (copy-stack.c copies the auxv), so if the lower half runs
   // set-user-ID or with file capabilities, the upper half loads the real
   // MPI library.
-  string audit = string(lib1) + "/libmpistub_audit.so";
-  if (access(audit.c_str(), R_OK) != 0) {
-    fprintf(stderr, "MANA: cannot read %s: %s\n", audit.c_str(),
-            strerror(errno));
-    exit(1);
+  string audit;
+  if (lh_info->mpi != NULL) {
+    audit = string(lib1) + "/libmpistub_audit.so";
+    if (access(audit.c_str(), R_OK) != 0) {
+      fprintf(stderr, "MANA: cannot read %s: %s\n", audit.c_str(),
+              strerror(errno));
+      exit(1);
+    }
   }
   // --cuda: the upper half loads MANA's CUDA front libraries in place of
   // libcudart and libcuda (cuda-front/cuda_audit.c).
@@ -1524,13 +1382,13 @@ void update_library_path(const char *argv0)
       perror("MANA: prepending the CUDA front to LD_LIBRARY_PATH failed");
       exit(1);
     }
-    audit = audit + ":" + cuda_audit;
+    audit = audit.empty() ? cuda_audit : audit + ":" + cuda_audit;
   }
   const char *old_audit = getenv("LD_AUDIT");
   if (old_audit != NULL && old_audit[0] != '\0') {
-    audit = audit + ":" + old_audit;
+    audit = audit.empty() ? string(old_audit) : audit + ":" + old_audit;
   }
-  if (setenv("LD_AUDIT", audit.c_str(), 1) != 0) {
+  if (!audit.empty() && setenv("LD_AUDIT", audit.c_str(), 1) != 0) {
     perror("MANA: setenv(LD_AUDIT) failed");
     exit(1);
   }
@@ -1979,8 +1837,3 @@ patchAuxv(Elf64_auxv_t *av, unsigned long phnum,
     }
   }
 }
-
-int MPI_MANA_Internal(char *dummy) {
-  return 0;
-}
-

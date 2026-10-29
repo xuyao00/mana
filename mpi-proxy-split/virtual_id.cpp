@@ -218,7 +218,7 @@ int is_predefined_id(mana_mpi_handle id) {
 }
 
 MPI_Comm new_virt_comm(MPI_Comm real_comm) {
-  if (real_comm == lh_info->MANA_COMM_NULL) {
+  if (real_comm == LH_MPI->MANA_COMM_NULL) {
     return MPI_COMM_NULL;
   }
   MPI_Group local_group;
@@ -453,7 +453,7 @@ void reconstruct_comm_desc(virt_id_entry *entry) {
   mana_comm_desc *desc = (mana_comm_desc*)entry->desc;
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
   NEXT_FUNC(Group_incl)(g_world_group, desc->size, desc->global_ranks, &group);
-  NEXT_FUNC(Comm_create_group)(lh_info->MANA_COMM_WORLD, group, 0, &comm);
+  NEXT_FUNC(Comm_create_group)(LH_MPI->MANA_COMM_WORLD, group, 0, &comm);
   NEXT_FUNC(Group_free)(&group);
   if (desc->cart_ndims >= 0) {
     MPI_Comm plain = comm;
@@ -597,7 +597,7 @@ void init_predefined_virt_ids() {
   }
   // Fill in the upper-to-lower mapping, and the Fortran handles.
 #define PREDEFINED(kind, name) \
-  set_upper_to_lower(kind, (int64_t)MPI_##name, (int64_t)lh_info->MANA_##name)
+  set_upper_to_lower(kind, (int64_t)MPI_##name, (int64_t)LH_MPI->MANA_##name)
   PREDEFINED(MANA_GROUP_KIND, GROUP_NULL);
   PREDEFINED(MANA_COMM_KIND, COMM_NULL);
   PREDEFINED(MANA_COMM_KIND, COMM_WORLD);
@@ -708,7 +708,7 @@ void init_predefined_virt_ids() {
 
   // Initialize g_world_group.
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-  NEXT_FUNC(Comm_group)(lh_info->MANA_COMM_WORLD, &g_world_group);
+  NEXT_FUNC(Comm_group)(LH_MPI->MANA_COMM_WORLD, &g_world_group);
   RETURN_TO_UPPER_HALF();
 }
 
@@ -717,7 +717,7 @@ void init_predefined_virt_ids() {
 // reconstruct_descriptors() makes it again.
 void init_world_comm() {
   JUMP_TO_LOWER_HALF(lh_info->fsaddr);
-  NEXT_FUNC(Comm_dup)(lh_info->MANA_COMM_WORLD, &g_world_comm);
+  NEXT_FUNC(Comm_dup)(LH_MPI->MANA_COMM_WORLD, &g_world_comm);
   RETURN_TO_UPPER_HALF();
   g_world_comm = new_virt_comm(g_world_comm);
 
@@ -902,7 +902,7 @@ void complete_virt_request(MPI_Request request, const MPI_Status *status) {
   __atomic_store_n(&entry->completed, true, __ATOMIC_RELEASE);
   mana_mpi_handle real_request;
   real_request._handle64 = 0;
-  real_request.request = lh_info->MANA_REQUEST_NULL;
+  real_request.request = LH_MPI->MANA_REQUEST_NULL;
   __atomic_store_n(&entry->real_id._handle64, real_request._handle64,
                    __ATOMIC_RELEASE);
 }
@@ -969,7 +969,7 @@ std::vector<MPI_Request> pending_collective_requests() {
     int handle = __atomic_load_n(&entry->virt, __ATOMIC_ACQUIRE);
     if (handle != 0 && handle >> MANA_VIRT_ID_KIND_SHIFT == MANA_REQUEST_KIND &&
         entry->collective &&
-        entry->real_id.request != lh_info->MANA_REQUEST_NULL) {
+        entry->real_id.request != LH_MPI->MANA_REQUEST_NULL) {
       requests.push_back(std::make_pair(entry->seq, (MPI_Request)handle));
     }
   }

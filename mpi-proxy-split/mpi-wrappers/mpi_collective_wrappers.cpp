@@ -917,7 +917,7 @@ int PMPI_Comm_split(MPI_Comm comm, int color, int key, MPI_Comm *newcomm)
   retval = NEXT_FUNC(Comm_split)(real_comm, color, key, newcomm);
   RETURN_TO_UPPER_HALF();
   if (retval == MPI_SUCCESS) {
-    if (*newcomm == lh_info->MANA_COMM_NULL) {
+    if (*newcomm == LH_MPI->MANA_COMM_NULL) {
       *newcomm = MPI_COMM_NULL;
     } else {
       *newcomm = new_virt_comm(*newcomm);
@@ -939,7 +939,7 @@ int PMPI_Comm_dup(MPI_Comm comm, MPI_Comm *newcomm)
   retval = NEXT_FUNC(Comm_dup)(real_comm, newcomm);
   RETURN_TO_UPPER_HALF();
   if (retval == MPI_SUCCESS) {
-    if (*newcomm == lh_info->MANA_COMM_NULL) {
+    if (*newcomm == LH_MPI->MANA_COMM_NULL) {
       *newcomm = MPI_COMM_NULL;
     } else {
       *newcomm = new_virt_comm(*newcomm);
