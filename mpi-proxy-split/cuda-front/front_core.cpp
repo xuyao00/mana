@@ -28,9 +28,12 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include "front_objs.h"
 
 void initialize_wrappers();  // libmana.so: sets lh_info
@@ -295,6 +298,76 @@ front_open_slot()
   __atomic_store_n(&front_slot_gen, front_gen, __ATOMIC_RELEASE);
 }
 
+// The checkpoint waits for the GPUs (MANA_STEP_QUIESCE).  A kernel can wait
+// for a host thread that the checkpoint has stopped at the gate, such as a
+// kernel that spins on a flag that the thread sets after a CUDA call; the
+// checkpoint would then hang without a word.  So a thread of its own says so
+// on stderr every MANA_CUDA_QUIESCE_WARN seconds (60), and ends the process
+// after MANA_CUDA_QUIESCE_TIMEOUT seconds, if set.  It never enters the lower
+// half.
+class QuiesceWatchdog {
+ public:
+  QuiesceWatchdog() : thread_(&QuiesceWatchdog::watch, this) {}
+  ~QuiesceWatchdog()
+  {
+    {
+      std::lock_guard<std::mutex> guard(lock_);
+      done_ = true;
+    }
+    done_cv_.notify_one();
+    thread_.join();
+  }
+
+ private:
+  static long seconds(const char *name, long dflt)
+  {
+    const char *value = getenv(name);
+    return value != NULL && value[0] >= '0' && value[0] <= '9' ? atol(value)
+                                                               : dflt;
+  }
+
+  void watch()
+  {
+    long warn = seconds("MANA_CUDA_QUIESCE_WARN", 60);
+    long timeout = seconds("MANA_CUDA_QUIESCE_TIMEOUT", 0);
+    auto start = std::chrono::steady_clock::now();
+    long next_warn = warn;
+    std::unique_lock<std::mutex> guard(lock_);
+    while (!done_) {
+      long next = next_warn;
+      if (timeout > 0 && (next == 0 || timeout < next)) {
+        next = timeout;
+      }
+      if (next == 0) {
+        done_cv_.wait(guard, [this] { return done_; });
+        break;
+      }
+      if (done_cv_.wait_until(guard, start + std::chrono::seconds(next),
+                              [this] { return done_; })) {
+        break;
+      }
+      if (next == timeout) {
+        fprintf(stderr, "MANA: --cuda: the GPUs have not finished their work "
+                "%ld s into the checkpoint (MANA_CUDA_QUIESCE_TIMEOUT): the "
+                "process ends.  A kernel may be waiting for a host thread, "
+                "which the checkpoint has stopped.\n", timeout);
+        fflush(stderr);
+        _exit(1);
+      }
+      fprintf(stderr, "MANA: --cuda: the checkpoint has waited %ld s for the "
+              "GPUs.  A kernel may be waiting for a host thread, which the "
+              "checkpoint has stopped; MANA_CUDA_QUIESCE_TIMEOUT=SECONDS ends "
+              "the process instead.\n", next_warn);
+      next_warn += warn;
+    }
+  }
+
+  std::mutex lock_;
+  std::condition_variable done_cv_;
+  bool done_ = false;
+  std::thread thread_;  // last: it uses the others
+};
+
 // libmana.so, the core, calls mana_cuda_event() through the function that
 // it is given here, also if the application dlopen()s a front library.
 __attribute__((constructor)) static void
@@ -317,6 +390,7 @@ mana_cuda_event(int event)
 {
   switch (event) {
     case MANA_STEP_QUIESCE: {
+      QuiesceWatchdog watchdog;
       // The application's threads are out of the lower half, so no new
       // work can start, and their context stacks stay as they are: the
       // copies learn what the MPI made current.  Then wait for the work

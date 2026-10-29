@@ -41,7 +41,8 @@ NVCC = $(if $(filter yes,${MANA_CUDA}),${CUDA_HOME}/bin/nvcc)
 E2E_CUDA_MPI = cuda_aware cuda_threads cuda_driver cuda_async cuda_ipc \
                cuda_textures cuda_static cuda_static_stripped cuda_cublas \
                cuda_cufft cuda_curand cuda_graphs
-E2E_CUDA = $(if $(NVCC),cuda_nompi $(if $(filter yes,${MANA_MPI}),${E2E_CUDA_MPI}))
+E2E_CUDA = $(if $(NVCC),cuda_nompi cuda_quiesce \
+             $(if $(filter yes,${MANA_MPI}),${E2E_CUDA_MPI}))
 
 # What MANA builds (configure's MANA_MPI and MANA_CUDA): the MPI tests with
 # the MPI layer, and the suite also runs the example of ../examples
@@ -107,6 +108,9 @@ nompi: nompi.c mana_test.h
 
 cuda_nompi: cuda_nompi.cu mana_test.h
 	$(NVCC) -g -O0 -cudart=shared -o $@ $<
+
+cuda_quiesce: cuda_quiesce.cu mana_test.h
+	$(NVCC) -g -O0 -cudart=shared -o $@ $< -lpthread
 
 # Opens the MPI library with dlopen(), so it is not linked with it.
 dlopen_mpi: dlopen_mpi.c

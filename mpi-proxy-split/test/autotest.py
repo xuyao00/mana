@@ -55,13 +55,15 @@ class Test:
                CUDA front), or the test is skipped.  By default, MPI unless
                no_mpi, and CUDA if cuda.
   env:         environment variables of the run, over the suite's.
+  ckpt_fails:  with kind "run" and restart: the checkpoint must end the job,
+               which then fails with 'expect'.
   """
 
   def __init__(self, name, ranks, args=(), kind="loop", expect=None,
                restart=False, fails=False, known_bug=None, native_args=None,
                program=None, burst=1, restart_now=False, cuda=False,
                mana_only=False, no_mpi=False, needs_mpi=None,
-               needs_cuda=None, env=None):
+               needs_cuda=None, env=None, ckpt_fails=False):
     self.name = name
     self.ranks = ranks
     self.args = list(args)
@@ -82,6 +84,7 @@ class Test:
     self.needs_mpi = not no_mpi if needs_mpi is None else needs_mpi
     self.needs_cuda = cuda if needs_cuda is None else needs_cuda
     self.env = env or {}
+    self.ckpt_fails = ckpt_fails
 
 
 TESTS = [
@@ -140,6 +143,12 @@ TESTS = [
   Test("cuda_graphs", 2, cuda=True),
   Test("cuda_static", 2, cuda=True),
   Test("cuda_nompi", 2, cuda=True, no_mpi=True),
+  # A kernel that waits for a host thread that the checkpoint stopped: the
+  # checkpoint's wait for the GPUs times out (cuda-front/front_core.cpp).
+  Test("cuda_quiesce", 2, kind="run", args=["-n", "1000"], restart=True,
+       ckpt_fails=True, fails=True, cuda=True, no_mpi=True, mana_only=True,
+       env={"MANA_CUDA_QUIESCE_WARN": "1", "MANA_CUDA_QUIESCE_TIMEOUT": "3"},
+       expect="(MANA_CUDA_QUIESCE_TIMEOUT): the process ends"),
   # An MPI library under --no-mpi, and a CUDA library without --cuda, are
   # refused (mana_audit.c).
   Test("nompi_refuses_mpi", 2, kind="run", fails=True, no_mpi=True,
@@ -440,7 +449,11 @@ class Run:
     self.start_coordinator()
     self.launch([os.path.join(self.bin, "mana_launch"), self.exe()] + t.args,
                 "launch.out")
-    if t.restart:
+    if t.restart and t.ckpt_fails:
+      self.wait_running("after launch")
+      self.command("-c")  # Not -bc: the job ends in the checkpoint.
+      report("ckpt:ENDED")
+    elif t.restart:
       self.wait_running("after launch")
       self.checkpoint()
       report("ckpt:PASSED")
