@@ -30,17 +30,24 @@
 // CU_POINTER_ATTRIBUTE_RANGE_START/SIZE, and a CUDA IPC export, cover the
 // chunk.
 //
-// At a checkpoint, the contents go into shadows in the upper half, which
-// DMTCP saves with the image, or with MANA_CUDA_DEVICE_DATA=file into
-// cuda_memory.mana in the checkpoint directory, through a pinned buffer of
-// the lower half: then no host memory holds them (Perlmutter's 4 GPUs have
-// 320 GB, its nodes 256 GB).
+// At a checkpoint, the contents go into cuda_memory.mana in the checkpoint
+// directory, through a pinned buffer of the lower half, so no host memory
+// holds them (Perlmutter's 4 GPUs have 320 GB, its nodes 256 GB); or, with
+// MANA_CUDA_DEVICE_DATA=host, into shadows in the upper half, which DMTCP
+// saves with the image.  As DMTCP does with its image, the file is written
+// as cuda_memory.mana.tmp and renamed once the image is complete, so a
+// checkpoint killed halfway leaves the last one whole.  The image holds the
+// tag of its file's header: a process that exits right after its checkpoint
+// (dmtcp_command -kc) never renames the file, and its restart takes the .tmp
+// file by the tag.
 
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <map>
 #include <mutex>
@@ -75,10 +82,12 @@ struct Chunk {
 };
 
 #define DEVICE_FILE "cuda_memory.mana"
+#define DEVICE_FILE_TMP DEVICE_FILE ".tmp"
 #define DEVICE_FILE_MAGIC 0x414455434e414d00ULL  // "\0MANCUDA"
 #define DEVICE_FILE_BUFFER (64 << 20)
 
-// One allocation's contents in the device file, after this header.
+// The device file's header is the magic, the tag and the record count.
+// One allocation's contents in the device file, after the header.
 struct FileRecord {
   uint64_t addr;
   uint64_t size;
@@ -102,6 +111,10 @@ std::map<CUdeviceptr, Chunk> chunks;           // by address; also in allocs
 size_t granularity[64];
 int rdma_capable[64];                          // 1 yes, 0 no, -1 not known
 unsigned device_ready_gen[64];                 // cudart has a context
+bool to_file = true;                           // MANA_CUDA_DEVICE_DATA
+// The tag of the device file of the last checkpoint, saved with its image;
+// 0, none.
+uint64_t file_tag;
 
 #define DRV_CHECK(call)                                                   \
   do {                                                                    \
@@ -527,11 +540,19 @@ front_vmm_free_async(void *ptr, cudaStream_t real_stream, int *result)
   return true;
 }
 
-static bool
-device_data_to_file()
+// At launch, so that a wrong value fails there, not at a checkpoint.
+void
+front_vmm_init()
 {
   const char *where = getenv("MANA_CUDA_DEVICE_DATA");
-  return where != NULL && strcmp(where, "file") == 0;
+  if (where == NULL || where[0] == '\0' || strcmp(where, "file") == 0) {
+    to_file = true;
+  } else if (strcmp(where, "host") == 0) {
+    to_file = false;
+  } else {
+    front_fatal("MANA_CUDA_DEVICE_DATA is \"%s\", not \"file\" or \"host\"\n",
+                where);
+  }
 }
 
 void
@@ -539,7 +560,6 @@ front_vmm_stash()
 {
   std::lock_guard<std::mutex> guard(vmm_lock);
   reap_locked(true);
-  bool to_file = device_data_to_file();
   size_t bytes = 0;
   for (auto &entry : allocs) {
     Alloc &a = entry.second;
@@ -629,8 +649,9 @@ free_pinned_buffer(void *buf)
   (void)rc;
 }
 
-// MANA_STEP_SAVE, with MANA_CUDA_DEVICE_DATA=file: the contents that
-// front_vmm_stash() left on the device, into the checkpoint directory.
+// MANA_STEP_SAVE: the contents that front_vmm_stash() left on the device,
+// into the checkpoint directory, as the .tmp file until DMTCP has replaced
+// the last image (front_vmm_resume()).
 void
 front_vmm_save()
 {
@@ -640,14 +661,22 @@ front_vmm_save()
     count += entry.second.in_file;
   }
   if (count == 0) {
+    file_tag = 0;
     return;
   }
-  std::string path = std::string(mana_ckpt_dir()) + "/" DEVICE_FILE;
+  std::string path = std::string(mana_ckpt_dir()) + "/" DEVICE_FILE_TMP;
   int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
   if (fd < 0) {
     front_fatal("cannot create %s: %s\n", path.c_str(), strerror(errno));
   }
-  uint64_t header[2] = { DEVICE_FILE_MAGIC, count };
+  struct timespec now;
+  clock_gettime(CLOCK_REALTIME, &now);
+  uint64_t tag = ((uint64_t)now.tv_sec * 1000000000 + now.tv_nsec) ^
+                 ((uint64_t)getpid() << 40);
+  if (tag == 0) {
+    tag = 1;
+  }
+  uint64_t header[3] = { DEVICE_FILE_MAGIC, tag, count };
   write_all(fd, header, sizeof header, path);
   void *buf = pinned_buffer();
   size_t bytes = 0;
@@ -677,7 +706,28 @@ front_vmm_save()
   if (close(fd) != 0) {
     front_fatal("writing %s: %s\n", path.c_str(), strerror(errno));
   }
+  file_tag = tag;
   front_log("saved %zu bytes of device memory in %s\n", bytes, path.c_str());
+}
+
+// MANA_STEP_RESUME: DMTCP has put the new image in place of the last, and
+// the device file follows it.  A process that exits after its checkpoint
+// does not get here; fill_from_file() renames the file then.
+void
+front_vmm_resume()
+{
+  std::lock_guard<std::mutex> guard(vmm_lock);
+  std::string dir = mana_ckpt_dir();
+  std::string done = dir + "/" DEVICE_FILE;
+  std::string tmp = dir + "/" DEVICE_FILE_TMP;
+  if (file_tag == 0) {
+    // This image needs none; the last image's goes.
+    unlink(done.c_str());
+    unlink(tmp.c_str());
+  } else if (rename(tmp.c_str(), done.c_str()) != 0) {
+    fprintf(stderr, "MANA: --cuda: renaming %s: %s; a restart takes it as "
+            "it is\n", tmp.c_str(), strerror(errno));
+  }
 }
 
 void
@@ -824,8 +874,28 @@ front_vmm_peer_access(int device, int peer, bool on)
   }
 }
 
+// 'path', if it is the device file of the image being restored.
+static int
+open_device_file(const std::string &path, uint64_t count)
+{
+  int fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0) {
+    return -1;
+  }
+  uint64_t header[3];
+  if (read(fd, header, sizeof header) != (ssize_t)sizeof header ||
+      header[0] != DEVICE_FILE_MAGIC || header[1] != file_tag ||
+      header[2] != count) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
 // The contents that front_vmm_save() wrote, from the device file next to the
-// image being restored.
+// image being restored: cuda_memory.mana, or the .tmp file if the process
+// exited before front_vmm_resume() could rename it.  The other one is of a
+// checkpoint that did not complete, or of the one before.
 static void
 fill_from_file()
 {
@@ -840,16 +910,20 @@ fill_from_file()
     front_fatal("device memory is in a file, but the lower half names no "
                 "image\n");
   }
-  std::string path = lh_info->restart_image;
-  path = path.substr(0, path.rfind('/') + 1) + DEVICE_FILE;
-  int fd = open(path.c_str(), O_RDONLY);
+  std::string dir = lh_info->restart_image;
+  size_t slash = dir.rfind('/');
+  dir = slash == std::string::npos ? "." : dir.substr(0, slash);
+  std::string done = dir + "/" DEVICE_FILE;
+  std::string tmp = dir + "/" DEVICE_FILE_TMP;
+  std::string path = done;
+  int fd = open_device_file(path, count);
   if (fd < 0) {
-    front_fatal("cannot open %s: %s\n", path.c_str(), strerror(errno));
+    path = tmp;
+    fd = open_device_file(path, count);
   }
-  uint64_t header[2];
-  read_all(fd, header, sizeof header, path);
-  if (header[0] != DEVICE_FILE_MAGIC || header[1] != count) {
-    front_fatal("%s is not this checkpoint's device memory\n", path.c_str());
+  if (fd < 0) {
+    front_fatal("%s: no device memory of this checkpoint, nor in its .tmp "
+                "file\n", done.c_str());
   }
   void *buf = pinned_buffer();
   for (uint64_t i = 0; i < count; i++) {
@@ -882,6 +956,11 @@ fill_from_file()
   }
   free_pinned_buffer(buf);
   close(fd);
+  if (path == tmp) {
+    rename(tmp.c_str(), done.c_str());
+  } else {
+    unlink(tmp.c_str());
+  }
 }
 
 // Last at restart: the contents, once cudart's contexts are back.

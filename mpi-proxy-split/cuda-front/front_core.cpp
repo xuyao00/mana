@@ -377,6 +377,7 @@ front_register()
   register_t reg = (register_t)dlsym(RTLD_DEFAULT, "mana_register_layer");
   if (reg != NULL) {
     reg(MANA_LAYER_CUDA, mana_cuda_event);
+    front_vmm_init();
   }
 }
 
@@ -429,6 +430,7 @@ mana_cuda_event(int event)
       front_vmm_save();
       break;
     case MANA_STEP_RESUME:
+      front_vmm_resume();
       front_vmm_drop_shadows();
       front_objs_drop_shadows();
       front_events_resume();

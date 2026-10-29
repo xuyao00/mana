@@ -57,14 +57,17 @@ class Test:
   env:         environment variables of the run, over the suite's.
   ckpt_fails:  with kind "run" and restart: the checkpoint must end the job,
                which then fails with 'expect'.
+  reports:     the name in the program's reports, if not the test's (a
+               test of another test's program in other settings).
   """
 
   def __init__(self, name, ranks, args=(), kind="loop", expect=None,
                restart=False, fails=False, known_bug=None, native_args=None,
                program=None, burst=1, restart_now=False, cuda=False,
                mana_only=False, no_mpi=False, needs_mpi=None,
-               needs_cuda=None, env=None, ckpt_fails=False):
+               needs_cuda=None, env=None, ckpt_fails=False, reports=None):
     self.name = name
+    self.reports = reports or name
     self.ranks = ranks
     self.args = list(args)
     self.kind = kind
@@ -142,6 +145,10 @@ TESTS = [
   Test("cuda_curand", 2, cuda=True),
   Test("cuda_graphs", 2, cuda=True),
   Test("cuda_static", 2, cuda=True),
+  # Device memory in upper-half shadows, not in the device file
+  # (cuda-front/front_vmm.cpp).
+  Test("cuda_aware_host", 2, cuda=True, program="cuda_aware",
+       reports="cuda_aware", env={"MANA_CUDA_DEVICE_DATA": "host"}),
   Test("cuda_nompi", 2, cuda=True, no_mpi=True),
   Test("cuda_pools", 2, cuda=True, no_mpi=True),
   Test("cuda_managed", 2, cuda=True, no_mpi=True),
@@ -329,7 +336,7 @@ class Run:
       text = f.read()
     seen = {}
     for m in PROGRESS.finditer(text):
-      if m.group(1).decode(errors="replace") == self.test.name:
+      if m.group(1).decode(errors="replace") == self.test.reports:
         seen.setdefault(int(m.group(2)), []).append(int(m.group(3)))
     return seen
 
@@ -363,7 +370,7 @@ class Run:
     os.rename(tmp, os.path.join(self.dir, "stop"))  # No rank reads half.
     self.wait_end()
     self.check_status()
-    self.check_output("%s: PASS (%d iterations)" % (self.test.name, stop))
+    self.check_output("%s: PASS (%d iterations)" % (self.test.reports, stop))
 
   def wait_end(self):
     try:
@@ -490,7 +497,7 @@ class Run:
       raise Failure("the job exited with status %d" % rc)
 
   def check_output(self, expect=None):
-    expect = expect or self.test.expect or (self.test.name + ": PASS")
+    expect = expect or self.test.expect or (self.test.reports + ": PASS")
     with open(self.logs[-1], errors="replace") as f:
       if expect not in f.read():
         raise Failure("'%s' not in %s" % (expect, os.path.basename(
