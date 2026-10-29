@@ -447,6 +447,7 @@ mana_cuda_event(int event)
       front_thread.fs = lh_info->fsaddr;
       front_thread.gen = front_gen;
       front_objs_restore_devices();
+      front_managed_check_restart();
       front_vmm_map();
       front_objs_restore();
       front_vmm_fill();

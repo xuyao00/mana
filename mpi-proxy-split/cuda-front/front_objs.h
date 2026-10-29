@@ -123,13 +123,17 @@ int front_destroy_event(cudaEvent_t event, bool drv) FRONT_HIDDEN;
 int front_host_alloc(void **ptr, size_t size, unsigned register_flags,
                      bool drv) FRONT_HIDDEN;
 int front_host_free(void *ptr, bool drv) FRONT_HIDDEN;
-// Managed memory (cudaMallocManaged, cuMemAllocManaged): mapped pinned memory
-// of the upper half, which a restart registers again.  front_managed_free()
-// frees it and returns true if 'ptr' is the front's managed memory.
+// Managed memory (cudaMallocManaged, cuMemAllocManaged): memory of the upper
+// half, pageable with HMM, or else mapped pinned memory, which a restart
+// registers again (front_objs.cpp).  front_managed_free() frees it and returns
+// true if 'ptr' is the front's managed memory.
 int front_managed_alloc(void **ptr, size_t size, bool drv) FRONT_HIDDEN;
 bool front_managed_free(void *ptr, int *rc, bool drv) FRONT_HIDDEN;
-// Whether [ptr, ptr + count) is in the front's managed memory.
-bool front_is_managed(const void *ptr, size_t count) FRONT_HIDDEN;
+// Whether [ptr, ptr + count) is in the front's pinned managed memory, on
+// which prefetches and advice do nothing.
+bool front_is_pinned_managed(const void *ptr, size_t count) FRONT_HIDDEN;
+// At restart: refuses a node without HMM for pageable managed memory.
+void front_managed_check_restart() FRONT_HIDDEN;
 int front_host_register(void *ptr, size_t size, unsigned flags, bool drv)
   FRONT_HIDDEN;
 int front_host_unregister(void *ptr, bool drv) FRONT_HIDDEN;

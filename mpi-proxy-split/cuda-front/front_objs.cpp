@@ -785,12 +785,44 @@ cudaFree(void *devPtr)
 // ---- Managed memory ------------------------------------------------------
 //
 // The driver places managed memory itself, so a restart could not put it
-// back at its address.  Instead it is mapped pinned memory of the upper
-// half, saved with the image and registered again at restart: the same
-// address on the host and on the devices (UVA), where a device can use host
-// pointers for registered memory.  It is not migrated to a GPU, so kernels
-// reach it over the bus: correct, but slower than managed memory.  Prefetches
-// and advice on it do nothing.
+// back at its address.  Instead it is memory of the upper half, saved with
+// the image:
+// - Where the GPUs can use pageable memory (HMM, ATS), anonymous memory: the
+//   driver migrates it to a GPU as it does managed memory, and the CPU's
+//   reads bring it back for the checkpoint.  Prefetches and advice work on it.
+// - Elsewhere, or with MANA_CUDA_MANAGED=pinned, mapped pinned memory,
+//   registered again at restart: the same address on the host and on the
+//   devices (UVA), where a device can use host pointers for registered
+//   memory.  It is not migrated, so kernels reach it over the bus: correct,
+//   but slower.  Prefetches and advice on it do nothing.
+
+namespace {
+std::map<void *, size_t> pageable_managed;  // under objs_lock
+}
+
+// The current device's attribute, through the API that the caller uses.
+static int
+current_device_attribute(cudaDeviceAttr rt_attr, CUdevice_attribute drv_attr,
+                         bool drv, int *value)
+{
+  int rc;
+  FRONT_ENTER();
+  if (drv) {
+    CUdevice device = 0;
+    FRONT_LH(rc = DRV(cuCtxGetDevice)(&device));
+    if (rc == 0) {
+      FRONT_LH(rc = DRV(cuDeviceGetAttribute)(value, drv_attr, device));
+    }
+  } else {
+    int device = 0;
+    FRONT_LH(rc = REAL(cudaGetDevice)(&device));
+    if (rc == 0) {
+      FRONT_LH(rc = REAL(cudaDeviceGetAttribute)(value, rt_attr, device));
+    }
+  }
+  FRONT_LEAVE();
+  return rc;
+}
 
 int
 front_managed_alloc(void **ptr, size_t size, bool drv)
@@ -798,38 +830,49 @@ front_managed_alloc(void **ptr, size_t size, bool drv)
   if (ptr == NULL) {
     return cudaErrorInvalidValue;
   }
-  int same = 0;
-  int rc;
-  FRONT_ENTER();
-  if (drv) {
-    CUdevice device = 0;
-    FRONT_LH(rc = DRV(cuCtxGetDevice)(&device));
-    if (rc == 0) {
-      FRONT_LH(rc = DRV(cuDeviceGetAttribute)(
-        &same, CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM,
-        device));
-    }
-  } else {
-    int device = 0;
-    FRONT_LH(rc = REAL(cudaGetDevice)(&device));
-    if (rc == 0) {
-      FRONT_LH(rc = REAL(cudaDeviceGetAttribute)(
-        &same, cudaDevAttrCanUseHostPointerForRegisteredMem, device));
+  if (size == 0) {
+    *ptr = NULL;
+    return 0;
+  }
+  const char *kind = getenv("MANA_CUDA_MANAGED");
+  int pageable = 0;
+  int rc = 0;
+  if (kind == NULL || strcmp(kind, "pinned") != 0) {
+    rc = current_device_attribute(cudaDevAttrPageableMemoryAccess,
+                                  CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS,
+                                  drv, &pageable);
+    if (rc != 0) {
+      return rc;
     }
   }
-  FRONT_LEAVE();
+  if (pageable) {
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+      return cudaErrorMemoryAllocation;
+    }
+    std::lock_guard<std::mutex> guard(objs_lock);
+    pageable_managed[p] = size;
+    *ptr = p;
+    return 0;
+  }
+  int same = 0;
+  rc = current_device_attribute(
+    cudaDevAttrCanUseHostPointerForRegisteredMem,
+    CU_DEVICE_ATTRIBUTE_CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM, drv, &same);
   if (rc != 0) {
     return rc;
   }
   if (!same) {
-    front_unsupported("managed memory on a device that cannot use host "
-                      "pointers for registered memory");
+    front_unsupported("managed memory on a device without pageable memory "
+                      "access that cannot use host pointers for registered "
+                      "memory");
   }
   static std::once_flag notice;
   std::call_once(notice, [] {
     fprintf(stderr, "MANA: --cuda: managed memory is mapped host memory "
-            "under MANA, which a restart can make again; kernels reach it "
-            "over the bus, more slowly than managed memory.\n");
+            "under MANA (no HMM), which a restart can make again; kernels "
+            "reach it over the bus, more slowly than managed memory.\n");
   });
   rc = front_host_alloc(ptr, size,
                         cudaHostRegisterMapped | cudaHostRegisterPortable, drv);
@@ -843,19 +886,37 @@ front_managed_alloc(void **ptr, size_t size, bool drv)
 bool
 front_managed_free(void *ptr, int *rc, bool drv)
 {
+  if (ptr == NULL) {
+    return false;
+  }
+  size_t pageable_size = 0;
   {
     std::lock_guard<std::mutex> guard(objs_lock);
-    auto it = pinned.find(ptr);
-    if (ptr == NULL || it == pinned.end() || !it->second.managed) {
-      return false;
+    auto pageable = pageable_managed.find(ptr);
+    if (pageable != pageable_managed.end()) {
+      pageable_size = pageable->second;
+      pageable_managed.erase(pageable);
+    } else {
+      auto it = pinned.find(ptr);
+      if (it == pinned.end() || !it->second.managed) {
+        return false;
+      }
     }
+  }
+  if (pageable_size != 0) {
+    // The GPUs may still use it: wait for them, as cudaFree does.
+    FRONT_ENTER();
+    FRONT_LH(*rc = REAL(cudaDeviceSynchronize)());
+    FRONT_LEAVE();
+    munmap(ptr, pageable_size);
+    return true;
   }
   *rc = front_host_free(ptr, drv);
   return true;
 }
 
 bool
-front_is_managed(const void *ptr, size_t count)
+front_is_pinned_managed(const void *ptr, size_t count)
 {
   std::lock_guard<std::mutex> guard(objs_lock);
   auto it = pinned.upper_bound((void *)ptr);
@@ -866,6 +927,31 @@ front_is_managed(const void *ptr, size_t count)
   const char *base = (const char *)it->first;
   return it->second.managed && (const char *)ptr >= base &&
          (const char *)ptr + count <= base + it->second.size;
+}
+
+void
+front_managed_check_restart()
+{
+  {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    if (pageable_managed.empty()) {
+      return;
+    }
+  }
+  for (int device = 0; device < 64; device++) {
+    if (!(front_devices_used & (1ULL << device))) {
+      continue;
+    }
+    int pageable = 0;
+    cudaError_t rc;
+    FRONT_LH(rc = REAL(cudaDeviceGetAttribute)(
+      &pageable, cudaDevAttrPageableMemoryAccess, device));
+    if (rc != cudaSuccess || !pageable) {
+      front_fatal("managed memory was pageable memory (HMM) at the "
+                  "checkpoint, but device %d here cannot access pageable "
+                  "memory\n", device);
+    }
+  }
 }
 
 extern "C" cudaError_t
@@ -882,7 +968,7 @@ cudaMemPrefetchAsync(const void *devPtr, size_t count,
                      struct cudaMemLocation location, unsigned int flags,
                      cudaStream_t stream)
 {
-  if (front_is_managed(devPtr, count)) {
+  if (front_is_pinned_managed(devPtr, count)) {
     return cudaSuccess;
   }
   FRONT_ENTER();
@@ -898,7 +984,7 @@ cudaMemPrefetchAsync_ptsz(const void *devPtr, size_t count,
                           struct cudaMemLocation location, unsigned int flags,
                           cudaStream_t stream)
 {
-  if (front_is_managed(devPtr, count)) {
+  if (front_is_pinned_managed(devPtr, count)) {
     return cudaSuccess;
   }
   FRONT_ENTER();
@@ -914,7 +1000,7 @@ extern "C" cudaError_t
 cudaMemAdvise(const void *devPtr, size_t count, enum cudaMemoryAdvise advice,
               struct cudaMemLocation location)
 {
-  if (front_is_managed(devPtr, count)) {
+  if (front_is_pinned_managed(devPtr, count)) {
     return cudaSuccess;
   }
   FRONT_ENTER();
