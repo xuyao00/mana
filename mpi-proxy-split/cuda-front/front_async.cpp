@@ -262,18 +262,22 @@ launch_host_fn(void *fn, void *user_data, cudaStream_t stream, Launch call)
                  });
 }
 
-// The device's default pool: the allocator's memory is VMM memory of its
-// own, so a pool keeps only the attributes that the application sets.
+// A device's default pool, or one of cudaMemPoolCreate: the allocator's
+// memory is VMM memory of its own, so a pool keeps only the attributes and
+// the access that the application sets, and a restart has nothing to make.
 struct Pool {
   uint32_t magic;
   int device;
+  bool created;                  // by cudaMemPoolCreate, not a default pool
   std::map<int, uint64_t> attrs;
+  std::map<int, int> access;     // by device: cudaMemAccessFlags
 };
 
 #define POOL_MAGIC 0x706f6f6cu  // "pool"
 
 std::mutex pools_lock;
 Pool *default_pools[64];
+Pool *current_pools[64];         // cudaDeviceSetMemPool; NULL: the default
 
 Pool *
 default_pool(int device)
@@ -295,9 +299,131 @@ pool_of(void *pool)
 {
   Pool *p = (Pool *)pool;
   if (p == NULL || p->magic != POOL_MAGIC) {
-    front_unsupported("memory pools other than a device's default pool");
+    front_unsupported("a memory pool that the front did not make (imported, "
+                      "or destroyed)");
   }
   return p;
+}
+
+// cudaMemPoolCreate, cuMemPoolCreate: pinned device memory without IPC
+// handles; the driver's and cudart's enums have the same values.
+int
+pool_create(void **pool, int alloc_type, int handle_types, int location_type,
+            int device)
+{
+  if (pool == NULL) {
+    return cudaErrorInvalidValue;
+  }
+  if (alloc_type != cudaMemAllocationTypePinned ||
+      location_type != cudaMemLocationTypeDevice) {
+    front_unsupported("a memory pool of other than pinned device memory");
+  }
+  if (handle_types != cudaMemHandleTypeNone) {
+    front_unsupported("a memory pool for CUDA IPC (handleTypes)");
+  }
+  if (device < 0 || device >= 64) {
+    return cudaErrorInvalidDevice;
+  }
+  Pool *p = new Pool();
+  p->magic = POOL_MAGIC;
+  p->device = device;
+  p->created = true;
+  *pool = p;
+  return 0;
+}
+
+int
+pool_destroy(void *pool)
+{
+  Pool *p = pool_of(pool);
+  if (!p->created) {
+    return cudaErrorInvalidValue;
+  }
+  std::lock_guard<std::mutex> guard(pools_lock);
+  if (current_pools[p->device] == p) {
+    current_pools[p->device] = NULL;
+  }
+  p->magic = 0;  // kept: a later use is refused, not undefined
+  return 0;
+}
+
+int
+set_current_pool(int device, void *pool)
+{
+  Pool *p = pool_of(pool);
+  if (device < 0 || device >= 64 || p->device != device) {
+    return cudaErrorInvalidValue;
+  }
+  std::lock_guard<std::mutex> guard(pools_lock);
+  current_pools[device] = p->created ? p : NULL;
+  return 0;
+}
+
+Pool *
+current_pool(int device)
+{
+  if (device < 0 || device >= 64) {
+    return NULL;
+  }
+  {
+    std::lock_guard<std::mutex> guard(pools_lock);
+    if (current_pools[device] != NULL) {
+      return current_pools[device];
+    }
+  }
+  return default_pool(device);
+}
+
+// cudaMemPoolSetAccess, cuMemPoolSetAccess (cudaMemAccessDesc and
+// CUmemAccessDesc are the same).  Access to the pool's device is the
+// allocator's peer access to all of that device's memory, as
+// cuCtxEnablePeerAccess gives; it only grows, since taking it back would take
+// back that of cuCtxEnablePeerAccess too.
+int
+pool_set_access(void *pool, const cudaMemAccessDesc *descs, size_t count)
+{
+  Pool *p = pool_of(pool);
+  if (descs == NULL && count > 0) {
+    return cudaErrorInvalidValue;
+  }
+  for (size_t i = 0; i < count; i++) {
+    if (descs[i].location.type != cudaMemLocationTypeDevice ||
+        descs[i].location.id < 0 || descs[i].location.id >= 64) {
+      return cudaErrorInvalidValue;
+    }
+  }
+  for (size_t i = 0; i < count; i++) {
+    int device = descs[i].location.id;
+    if (device == p->device) {
+      continue;
+    }
+    {
+      std::lock_guard<std::mutex> guard(pools_lock);
+      p->access[device] = descs[i].flags;
+    }
+    if (descs[i].flags != cudaMemAccessFlagsProtNone) {
+      front_vmm_peer_access(device, p->device, true);
+    }
+  }
+  return 0;
+}
+
+int
+pool_get_access(int *flags, void *pool, const cudaMemLocation *location)
+{
+  Pool *p = pool_of(pool);
+  if (flags == NULL || location == NULL ||
+      location->type != cudaMemLocationTypeDevice) {
+    return cudaErrorInvalidValue;
+  }
+  if (location->id == p->device) {
+    *flags = cudaMemAccessFlagsProtReadWrite;
+    return 0;
+  }
+  std::lock_guard<std::mutex> guard(pools_lock);
+  auto it = p->access.find(location->id);
+  *flags = it != p->access.end() ? it->second : cudaMemAccessFlagsProtNone;
+  return 0;
 }
 
 // cudaMemPoolAttr and CUmemPool_attribute have the same values: 1 to 3 are
@@ -354,12 +480,13 @@ check_not_capturing(cudaStream_t stream)
   }
 }
 
+// On 'device', a pool's, or on the current device if it is -1.
 int
-malloc_async(void **ptr, size_t size, cudaStream_t stream)
+malloc_async(void **ptr, size_t size, cudaStream_t stream, int device = -1)
 {
   FRONT_ENTER();
   check_not_capturing(stream);
-  int rc = front_vmm_alloc(ptr, size);
+  int rc = front_vmm_alloc_on(ptr, size, device);
   FRONT_LEAVE();
   return rc;
 }
@@ -717,16 +844,16 @@ extern "C" cudaError_t
 cudaMallocFromPoolAsync(void **ptr, size_t size, cudaMemPool_t memPool,
                         cudaStream_t stream)
 {
-  pool_of(memPool);
-  return (cudaError_t)malloc_async(ptr, size, stream);
+  return (cudaError_t)malloc_async(ptr, size, stream,
+                                   pool_of(memPool)->device);
 }
 
 extern "C" cudaError_t
 cudaMallocFromPoolAsync_ptsz(void **ptr, size_t size, cudaMemPool_t memPool,
                              cudaStream_t stream)
 {
-  pool_of(memPool);
-  return (cudaError_t)malloc_async(ptr, size, stream);
+  return (cudaError_t)malloc_async(ptr, size, stream,
+                                   pool_of(memPool)->device);
 }
 
 extern "C" cudaError_t
@@ -757,16 +884,16 @@ extern "C" CUresult
 cuMemAllocFromPoolAsync(CUdeviceptr *dptr, size_t bytesize, CUmemoryPool pool,
                         CUstream stream)
 {
-  pool_of(pool);
-  return (CUresult)malloc_async((void **)dptr, bytesize, stream);
+  return (CUresult)malloc_async((void **)dptr, bytesize, stream,
+                                pool_of(pool)->device);
 }
 
 extern "C" CUresult
 cuMemAllocFromPoolAsync_ptsz(CUdeviceptr *dptr, size_t bytesize,
                              CUmemoryPool pool, CUstream stream)
 {
-  pool_of(pool);
-  return (CUresult)malloc_async((void **)dptr, bytesize, stream);
+  return (CUresult)malloc_async((void **)dptr, bytesize, stream,
+                                pool_of(pool)->device);
 }
 
 extern "C" CUresult
@@ -795,12 +922,55 @@ cudaDeviceGetDefaultMemPool(cudaMemPool_t *memPool, int device)
   return cudaSuccess;
 }
 
-// The current pool is the default one: cudaDeviceSetMemPool is not
-// supported.
 extern "C" cudaError_t
 cudaDeviceGetMemPool(cudaMemPool_t *memPool, int device)
 {
-  return cudaDeviceGetDefaultMemPool(memPool, device);
+  if (memPool == NULL) {
+    return cudaErrorInvalidValue;
+  }
+  Pool *p = current_pool(device);
+  if (p == NULL) {
+    return cudaErrorInvalidDevice;
+  }
+  *memPool = (cudaMemPool_t)p;
+  return cudaSuccess;
+}
+
+extern "C" cudaError_t
+cudaDeviceSetMemPool(int device, cudaMemPool_t memPool)
+{
+  return (cudaError_t)set_current_pool(device, memPool);
+}
+
+extern "C" cudaError_t
+cudaMemPoolCreate(cudaMemPool_t *memPool, const struct cudaMemPoolProps *props)
+{
+  if (props == NULL) {
+    return cudaErrorInvalidValue;
+  }
+  return (cudaError_t)pool_create((void **)memPool, props->allocType,
+                                  props->handleTypes, props->location.type,
+                                  props->location.id);
+}
+
+extern "C" cudaError_t
+cudaMemPoolDestroy(cudaMemPool_t memPool)
+{
+  return (cudaError_t)pool_destroy(memPool);
+}
+
+extern "C" cudaError_t
+cudaMemPoolSetAccess(cudaMemPool_t memPool,
+                     const struct cudaMemAccessDesc *descList, size_t count)
+{
+  return (cudaError_t)pool_set_access(memPool, descList, count);
+}
+
+extern "C" cudaError_t
+cudaMemPoolGetAccess(enum cudaMemAccessFlags *flags, cudaMemPool_t memPool,
+                     struct cudaMemLocation *location)
+{
+  return (cudaError_t)pool_get_access((int *)flags, memPool, location);
 }
 
 extern "C" cudaError_t
@@ -834,7 +1004,52 @@ cuDeviceGetDefaultMemPool(CUmemoryPool *pool_out, CUdevice dev)
 extern "C" CUresult
 cuDeviceGetMemPool(CUmemoryPool *pool, CUdevice dev)
 {
-  return cuDeviceGetDefaultMemPool(pool, dev);
+  return cudaDeviceGetMemPool((cudaMemPool_t *)pool, dev) == cudaSuccess
+         ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+extern "C" CUresult
+cuDeviceSetMemPool(CUdevice dev, CUmemoryPool pool)
+{
+  return set_current_pool(dev, pool) == 0 ? CUDA_SUCCESS
+                                          : CUDA_ERROR_INVALID_VALUE;
+}
+
+extern "C" CUresult
+cuMemPoolCreate(CUmemoryPool *pool, const CUmemPoolProps *poolProps)
+{
+  if (poolProps == NULL) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int rc = pool_create((void **)pool, poolProps->allocType,
+                       poolProps->handleTypes, poolProps->location.type,
+                       poolProps->location.id);
+  return rc == 0 ? CUDA_SUCCESS : rc == cudaErrorInvalidDevice
+                                    ? CUDA_ERROR_INVALID_DEVICE
+                                    : CUDA_ERROR_INVALID_VALUE;
+}
+
+extern "C" CUresult
+cuMemPoolDestroy(CUmemoryPool pool)
+{
+  return pool_destroy(pool) == 0 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+extern "C" CUresult
+cuMemPoolSetAccess(CUmemoryPool pool, const CUmemAccessDesc *map,
+                   size_t count)
+{
+  return pool_set_access(pool, (const cudaMemAccessDesc *)map, count) == 0
+         ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+extern "C" CUresult
+cuMemPoolGetAccess(CUmemAccess_flags *flags, CUmemoryPool memPool,
+                   CUmemLocation *location)
+{
+  return pool_get_access((int *)flags, memPool,
+                         (const cudaMemLocation *)location) == 0
+         ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 
 extern "C" CUresult

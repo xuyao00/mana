@@ -262,6 +262,12 @@ static void reap_locked(bool all);
 cudaError_t
 front_vmm_alloc(void **ptr, size_t size)
 {
+  return front_vmm_alloc_on(ptr, size, -1);
+}
+
+cudaError_t
+front_vmm_alloc_on(void **ptr, size_t size, int device)
+{
   if (ptr == NULL) {
     return cudaErrorInvalidValue;
   }
@@ -269,14 +275,28 @@ front_vmm_alloc(void **ptr, size_t size)
     *ptr = NULL;
     return cudaSuccess;
   }
-  int device = 0;
+  int current = 0;
   cudaError_t rc;
-  FRONT_LH(rc = REAL(cudaGetDevice)(&device));
+  FRONT_LH(rc = REAL(cudaGetDevice)(&current));
   if (rc != cudaSuccess) {
     return rc;
   }
-  if (device < 0 || device >= 64) {
+  if (device < 0) {
+    device = current;
+  }
+  if (device >= 64) {
     return cudaErrorInvalidDevice;
+  }
+  if (device != current) {
+    // ready_device() works on the current device.
+    FRONT_LH(rc = REAL(cudaSetDevice)(device));
+    if (rc != cudaSuccess) {
+      return rc;
+    }
+    rc = front_vmm_alloc_on(ptr, size, device);
+    cudaError_t back;
+    FRONT_LH(back = REAL(cudaSetDevice)(current));
+    return rc != cudaSuccess ? rc : back;
   }
   std::lock_guard<std::mutex> guard(vmm_lock);
   init_range();

@@ -70,6 +70,11 @@ cuDeviceGetMemPool
 cuMemPoolSetAttribute
 cuMemPoolGetAttribute
 cuMemPoolTrimTo
+cuMemPoolCreate
+cuMemPoolDestroy
+cuDeviceSetMemPool
+cuMemPoolSetAccess
+cuMemPoolGetAccess
 cuEventRecord
 cuEventRecord_ptsz
 cuEventRecordWithFlags

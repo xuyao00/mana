@@ -232,6 +232,9 @@ front_real_obj(const void *handle, int kind)
 
 // The VMM allocator (front_vmm.cpp).
 cudaError_t front_vmm_alloc(void **ptr, size_t size) FRONT_HIDDEN;
+// The same on 'device' (a pool's), or on the current device if it is -1.
+cudaError_t front_vmm_alloc_on(void **ptr, size_t size, int device)
+  FRONT_HIDDEN;
 cudaError_t front_vmm_alloc_pitch(void **ptr, size_t *pitch, size_t width,
                                   size_t height) FRONT_HIDDEN;
 // Returns false if 'ptr' is not the allocator's.

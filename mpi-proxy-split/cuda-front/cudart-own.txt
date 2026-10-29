@@ -55,6 +55,11 @@ cudaDeviceGetMemPool
 cudaMemPoolSetAttribute
 cudaMemPoolGetAttribute
 cudaMemPoolTrimTo
+cudaMemPoolCreate
+cudaMemPoolDestroy
+cudaDeviceSetMemPool
+cudaMemPoolSetAccess
+cudaMemPoolGetAccess
 cudaEventRecord
 cudaEventRecord_ptsz
 cudaEventRecordWithFlags
