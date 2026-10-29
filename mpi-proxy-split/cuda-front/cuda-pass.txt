@@ -114,3 +114,18 @@ cuFlushGPUDirectRDMAWrites
 cuThreadExchangeStreamCaptureMode
 cuProfilerStart
 cuProfilerStop
+# Graphs and stream capture: no handles but records.
+cuGraphNodeGetType
+cuGraphUpload
+cuGraphUpload_ptsz
+cuStreamIsCapturing
+cuStreamIsCapturing_ptsz
+cuThreadExchangeStreamCaptureMode
+cuGraphKernelNodeGetAttribute
+cuGraphKernelNodeCopyAttributes
+cuGraphDebugDotPrint
+cuGraphMemsetNodeGetParams
+cuGraphMemsetNodeSetParams
+cuGraphEventRecordNodeSetEvent
+cuGraphEventWaitNodeSetEvent
+cuGraphExecGetFlags

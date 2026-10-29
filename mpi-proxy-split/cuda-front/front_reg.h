@@ -71,6 +71,26 @@ CUresult cuMemFreeAsync_ptsz(CUdeviceptr dptr, CUstream hStream);
 CUresult cuMemAllocFromPoolAsync_ptsz(CUdeviceptr *dptr, size_t bytesize,
                                       CUmemoryPool pool, CUstream hStream);
 CUresult cuEventRecord_ptsz(CUevent hEvent, CUstream hStream);
+CUresult cuGraphInstantiateWithParams_ptsz(
+  CUgraphExec *phGraphExec, CUgraph hGraph,
+  CUDA_GRAPH_INSTANTIATE_PARAMS *instantiateParams);
+CUresult cuGraphLaunch_ptsz(CUgraphExec hGraphExec, CUstream hStream);
+CUresult cuStreamBeginCapture_v2_ptsz(CUstream hStream,
+                                      CUstreamCaptureMode mode);
+CUresult cuStreamBeginCaptureToGraph_ptsz(
+  CUstream hStream, CUgraph hGraph, const CUgraphNode *dependencies,
+  const CUgraphEdgeData *dependencyData, size_t numDependencies,
+  CUstreamCaptureMode mode);
+CUresult cuStreamEndCapture_ptsz(CUstream hStream, CUgraph *phGraph);
+CUresult cuStreamGetCaptureInfo_v3_ptsz(
+  CUstream hStream, CUstreamCaptureStatus *captureStatus_out,
+  cuuint64_t *id_out, CUgraph *graph_out,
+  const CUgraphNode **dependencies_out, const CUgraphEdgeData **edgeData_out,
+  size_t *numDependencies_out);
+CUresult cuStreamUpdateCaptureDependencies_v2_ptsz(
+  CUstream hStream, CUgraphNode *dependencies,
+  const CUgraphEdgeData *dependencyData, size_t numDependencies,
+  unsigned int flags);
 CUresult cuEventRecordWithFlags_ptsz(CUevent hEvent, CUstream hStream,
                                      unsigned int flags);
 cudaError_t cudaLaunchHostFunc_ptsz(cudaStream_t stream, cudaHostFn_t fn,

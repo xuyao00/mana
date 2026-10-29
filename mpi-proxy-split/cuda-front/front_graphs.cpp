@@ -19,7 +19,8 @@
  ****************************************************************************/
 
 // CUDA graphs and stream capture (cuda/DESIGN-lower-half-cuda.md, Phase 3),
-// in the runtime API.  Graphs, their nodes and executable graphs are
+// in the runtime API, and in the driver API on the same records (at the
+// end).  Graphs, their nodes and executable graphs are
 // records; a node gets one when the application first sees it.
 //
 //  * A graph is rebuilt from what it is at the checkpoint: the front reads
@@ -46,8 +47,7 @@
 // semaphore nodes, user objects, device launch and device-updatable kernel
 // nodes (handles inside kernels), kernel nodes with events in their
 // attributes, the generic cudaGraphAddNode and cudaGraph*NodeSetParams,
-// kernels of the libraries (cuBLAS, ...) in graphs, and the driver API's
-// graph functions.
+// and kernels of the libraries (cuBLAS, ...) in graphs.
 
 #include <string.h>
 #include <algorithm>
@@ -792,6 +792,24 @@ apply_override(cudaGraphExec_t real, cudaGraphNode_t node, NodeSnap &s)
       std::vector<void *> params;
       for (size_t offset : s.offsets) {
         params.push_back(&s.args[offset]);
+      }
+      if (s.driver) {
+        CUDA_KERNEL_NODE_PARAMS p = CUDA_KERNEL_NODE_PARAMS();
+        p.func = (CUfunction)((FrontObj *)s.func)->real;
+        p.gridDimX = s.grid.x;
+        p.gridDimY = s.grid.y;
+        p.gridDimZ = s.grid.z;
+        p.blockDimX = s.block.x;
+        p.blockDimY = s.block.y;
+        p.blockDimZ = s.block.z;
+        p.sharedMemBytes = s.shared;
+        p.kernelParams = params.empty() ? NULL : params.data();
+        p.ctx = s.ctx != NULL ? (CUcontext)s.ctx->real : NULL;
+        CUresult drc;
+        FRONT_LH(drc = DRV(cuGraphExecKernelNodeSetParams_v2)(
+                   (CUgraphExec)real, (CUgraphNode)node, &p));
+        rc = (cudaError_t)drc;
+        break;
       }
       cudaKernelNodeParams p = cudaKernelNodeParams();
       p.func = s.func;
@@ -2383,4 +2401,601 @@ cudaGraphNodeGetEnabled(cudaGraphExec_t hGraphExec, cudaGraphNode_t hNode,
   }
   FRONT_LEAVE();
   return rc;
+}
+
+// ---- The driver API --------------------------------------------------------
+//
+// The same records as the runtime's: CUgraph, CUgraphNode and CUgraphExec are
+// cudaGraph_t, cudaGraphNode_t and cudaGraphExec_t, and most functions are
+// the runtime's above, whose structures have the same layout.  A kernel node
+// runs a function of cuModuleGetFunction; a copy node set in an executable
+// graph copies linear memory.  These are the functions that cuda.h names; the
+// older ABIs that it no longer names (cuGraphAddKernelNode, ...) are
+// unsupported.
+
+namespace {
+
+CUresult
+drv(cudaError_t rc)
+{
+  return (CUresult)rc;
+}
+
+// A kernel node's parameters, with the real function and context.
+CUDA_KERNEL_NODE_PARAMS
+real_kernel_params(const CUDA_KERNEL_NODE_PARAMS *p)
+{
+  if (p->kern != NULL) {
+    front_unsupported("a graph kernel node of a CUkernel");
+  }
+  CUDA_KERNEL_NODE_PARAMS real = *p;
+  real.func = (CUfunction)front_real_obj(p->func, FRONT_FUNCTION);
+  real.ctx = (CUcontext)front_real_obj(p->ctx, FRONT_CTX);
+  return real;
+}
+
+// A kernel node's parameters as an executable graph keeps them.
+void
+drv_kernel_override(const CUDA_KERNEL_NODE_PARAMS *p, NodeSnap *s)
+{
+  CUDA_KERNEL_NODE_PARAMS real = real_kernel_params(p);
+  s->type = cudaGraphNodeTypeKernel;
+  s->driver = true;
+  s->func = p->func;
+  s->ctx = (Ctx *)p->ctx;
+  s->grid = dim3(p->gridDimX, p->gridDimY, p->gridDimZ);
+  s->block = dim3(p->blockDimX, p->blockDimY, p->blockDimZ);
+  s->shared = p->sharedMemBytes;
+  copy_args(real.func, p->kernelParams, p->extra, s);
+}
+
+// A copy of linear memory, as a cudaMemcpy3DParms.
+cudaMemcpy3DParms
+linear_copy(const CUDA_MEMCPY3D *p)
+{
+  if (p->srcMemoryType == CU_MEMORYTYPE_ARRAY ||
+      p->dstMemoryType == CU_MEMORYTYPE_ARRAY) {
+    front_unsupported("an executable graph's copy node set to a copy of a "
+                      "CUDA array in the driver API");
+  }
+  cudaMemcpy3DParms q = cudaMemcpy3DParms();
+  void *src = p->srcMemoryType == CU_MEMORYTYPE_HOST ? (void *)p->srcHost
+                                                     : (void *)p->srcDevice;
+  void *dst = p->dstMemoryType == CU_MEMORYTYPE_HOST ? p->dstHost
+                                                     : (void *)p->dstDevice;
+  q.srcPtr = { src, p->srcPitch, p->WidthInBytes, p->srcHeight };
+  q.dstPtr = { dst, p->dstPitch, p->WidthInBytes, p->dstHeight };
+  q.srcPos = { p->srcXInBytes, p->srcY, p->srcZ };
+  q.dstPos = { p->dstXInBytes, p->dstY, p->dstZ };
+  q.extent = { p->WidthInBytes, p->Height, p->Depth };
+  q.kind = cudaMemcpyDefault;
+  return q;
+}
+
+}  // namespace
+
+extern "C" CUresult
+cuGraphCreate(CUgraph *phGraph, unsigned int flags)
+{
+  return drv(cudaGraphCreate(phGraph, flags));
+}
+
+extern "C" CUresult
+cuGraphDestroy(CUgraph hGraph)
+{
+  return drv(cudaGraphDestroy(hGraph));
+}
+
+extern "C" CUresult
+cuGraphClone(CUgraph *phGraphClone, CUgraph originalGraph)
+{
+  return drv(cudaGraphClone(phGraphClone, originalGraph));
+}
+
+extern "C" CUresult
+cuGraphAddKernelNode_v2(CUgraphNode *phGraphNode, CUgraph hGraph,
+                        const CUgraphNode *dependencies,
+                        size_t numDependencies,
+                        const CUDA_KERNEL_NODE_PARAMS *nodeParams)
+{
+  if (nodeParams == NULL) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  CUDA_KERNEL_NODE_PARAMS real = real_kernel_params(nodeParams);
+  return drv(add_node(phGraphNode, hGraph, dependencies, numDependencies,
+                      [&](cudaGraphNode_t *n, cudaGraph_t g,
+                          const cudaGraphNode_t *d, size_t nd) {
+                        CUresult rc;
+                        FRONT_LH(rc = DRV(cuGraphAddKernelNode_v2)(
+                                   n, g, d, nd, &real));
+                        return (cudaError_t)rc;
+                      }));
+}
+
+extern "C" CUresult
+cuGraphAddMemcpyNode(CUgraphNode *phGraphNode, CUgraph hGraph,
+                     const CUgraphNode *dependencies, size_t numDependencies,
+                     const CUDA_MEMCPY3D *copyParams, CUcontext ctx)
+{
+  if (copyParams == NULL) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  CUDA_MEMCPY3D real = *copyParams;
+  real.srcArray = (CUarray)front_real_obj(real.srcArray, FRONT_ARRAY);
+  real.dstArray = (CUarray)front_real_obj(real.dstArray, FRONT_ARRAY);
+  CUcontext real_ctx = (CUcontext)front_real_obj(ctx, FRONT_CTX);
+  return drv(add_node(phGraphNode, hGraph, dependencies, numDependencies,
+                      [&](cudaGraphNode_t *n, cudaGraph_t g,
+                          const cudaGraphNode_t *d, size_t nd) {
+                        CUresult rc;
+                        FRONT_LH(rc = DRV(cuGraphAddMemcpyNode)(
+                                   n, g, d, nd, &real, real_ctx));
+                        return (cudaError_t)rc;
+                      }));
+}
+
+extern "C" CUresult
+cuGraphAddMemsetNode(CUgraphNode *phGraphNode, CUgraph hGraph,
+                     const CUgraphNode *dependencies, size_t numDependencies,
+                     const CUDA_MEMSET_NODE_PARAMS *memsetParams,
+                     CUcontext ctx)
+{
+  if (memsetParams == NULL) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  CUcontext real_ctx = (CUcontext)front_real_obj(ctx, FRONT_CTX);
+  return drv(add_node(phGraphNode, hGraph, dependencies, numDependencies,
+                      [&](cudaGraphNode_t *n, cudaGraph_t g,
+                          const cudaGraphNode_t *d, size_t nd) {
+                        CUresult rc;
+                        FRONT_LH(rc = DRV(cuGraphAddMemsetNode)(
+                                   n, g, d, nd, memsetParams, real_ctx));
+                        return (cudaError_t)rc;
+                      }));
+}
+
+extern "C" CUresult
+cuGraphAddHostNode(CUgraphNode *phGraphNode, CUgraph hGraph,
+                   const CUgraphNode *dependencies, size_t numDependencies,
+                   const CUDA_HOST_NODE_PARAMS *nodeParams)
+{
+  return drv(cudaGraphAddHostNode(phGraphNode, hGraph, dependencies,
+                                  numDependencies,
+                                  (const cudaHostNodeParams *)nodeParams));
+}
+
+extern "C" CUresult
+cuGraphAddEmptyNode(CUgraphNode *phGraphNode, CUgraph hGraph,
+                    const CUgraphNode *dependencies, size_t numDependencies)
+{
+  return drv(cudaGraphAddEmptyNode(phGraphNode, hGraph, dependencies,
+                                   numDependencies));
+}
+
+extern "C" CUresult
+cuGraphAddChildGraphNode(CUgraphNode *phGraphNode, CUgraph hGraph,
+                         const CUgraphNode *dependencies,
+                         size_t numDependencies, CUgraph childGraph)
+{
+  return drv(cudaGraphAddChildGraphNode(phGraphNode, hGraph, dependencies,
+                                        numDependencies, childGraph));
+}
+
+extern "C" CUresult
+cuGraphAddEventRecordNode(CUgraphNode *phGraphNode, CUgraph hGraph,
+                          const CUgraphNode *dependencies,
+                          size_t numDependencies, CUevent event)
+{
+  return drv(cudaGraphAddEventRecordNode(phGraphNode, hGraph, dependencies,
+                                         numDependencies, event));
+}
+
+extern "C" CUresult
+cuGraphAddEventWaitNode(CUgraphNode *phGraphNode, CUgraph hGraph,
+                        const CUgraphNode *dependencies,
+                        size_t numDependencies, CUevent event)
+{
+  return drv(cudaGraphAddEventWaitNode(phGraphNode, hGraph, dependencies,
+                                       numDependencies, event));
+}
+
+extern "C" CUresult
+cuGraphGetNodes(CUgraph hGraph, CUgraphNode *nodes, size_t *numNodes)
+{
+  return drv(cudaGraphGetNodes(hGraph, nodes, numNodes));
+}
+
+extern "C" CUresult
+cuGraphGetRootNodes(CUgraph hGraph, CUgraphNode *rootNodes,
+                    size_t *numRootNodes)
+{
+  return drv(cudaGraphGetRootNodes(hGraph, rootNodes, numRootNodes));
+}
+
+extern "C" CUresult
+cuGraphGetEdges_v2(CUgraph hGraph, CUgraphNode *from, CUgraphNode *to,
+                   CUgraphEdgeData *edgeData, size_t *numEdges)
+{
+  return drv(cudaGraphGetEdges(hGraph, from, to,
+                               (cudaGraphEdgeData *)edgeData, numEdges));
+}
+
+extern "C" CUresult
+cuGraphNodeGetDependencies_v2(CUgraphNode hNode, CUgraphNode *dependencies,
+                              CUgraphEdgeData *edgeData,
+                              size_t *numDependencies)
+{
+  return drv(cudaGraphNodeGetDependencies(hNode, dependencies,
+                                          (cudaGraphEdgeData *)edgeData,
+                                          numDependencies));
+}
+
+extern "C" CUresult
+cuGraphNodeGetDependentNodes_v2(CUgraphNode hNode, CUgraphNode *dependentNodes,
+                                CUgraphEdgeData *edgeData,
+                                size_t *numDependentNodes)
+{
+  return drv(cudaGraphNodeGetDependentNodes(hNode, dependentNodes,
+                                            (cudaGraphEdgeData *)edgeData,
+                                            numDependentNodes));
+}
+
+extern "C" CUresult
+cuGraphAddDependencies_v2(CUgraph hGraph, const CUgraphNode *from,
+                          const CUgraphNode *to,
+                          const CUgraphEdgeData *edgeData,
+                          size_t numDependencies)
+{
+  return drv(cudaGraphAddDependencies(hGraph, from, to,
+                                      (const cudaGraphEdgeData *)edgeData,
+                                      numDependencies));
+}
+
+extern "C" CUresult
+cuGraphRemoveDependencies_v2(CUgraph hGraph, const CUgraphNode *from,
+                             const CUgraphNode *to,
+                             const CUgraphEdgeData *edgeData,
+                             size_t numDependencies)
+{
+  return drv(cudaGraphRemoveDependencies(hGraph, from, to,
+                                         (const cudaGraphEdgeData *)edgeData,
+                                         numDependencies));
+}
+
+extern "C" CUresult
+cuGraphDestroyNode(CUgraphNode hNode)
+{
+  return drv(cudaGraphDestroyNode(hNode));
+}
+
+extern "C" CUresult
+cuGraphNodeFindInClone(CUgraphNode *phNode, CUgraphNode hOriginalNode,
+                       CUgraph hClonedGraph)
+{
+  return drv(cudaGraphNodeFindInClone(phNode, hOriginalNode, hClonedGraph));
+}
+
+extern "C" CUresult
+cuGraphNodeGetContainingGraph(CUgraphNode hNode, CUgraph *phGraph)
+{
+  return drv(cudaGraphNodeGetContainingGraph(hNode, phGraph));
+}
+
+extern "C" CUresult
+cuGraphChildGraphNodeGetGraph(CUgraphNode hNode, CUgraph *phGraph)
+{
+  return drv(cudaGraphChildGraphNodeGetGraph(hNode, phGraph));
+}
+
+extern "C" CUresult
+cuGraphHostNodeGetParams(CUgraphNode hNode, CUDA_HOST_NODE_PARAMS *nodeParams)
+{
+  return drv(cudaGraphHostNodeGetParams(hNode,
+                                        (cudaHostNodeParams *)nodeParams));
+}
+
+extern "C" CUresult
+cuGraphHostNodeSetParams(CUgraphNode hNode,
+                         const CUDA_HOST_NODE_PARAMS *nodeParams)
+{
+  return drv(cudaGraphHostNodeSetParams(
+               hNode, (const cudaHostNodeParams *)nodeParams));
+}
+
+extern "C" CUresult
+cuGraphEventRecordNodeGetEvent(CUgraphNode hNode, CUevent *event_out)
+{
+  return drv(cudaGraphEventRecordNodeGetEvent(hNode, event_out));
+}
+
+extern "C" CUresult
+cuGraphEventWaitNodeGetEvent(CUgraphNode hNode, CUevent *event_out)
+{
+  return drv(cudaGraphEventWaitNodeGetEvent(hNode, event_out));
+}
+
+extern "C" CUresult
+cuGraphKernelNodeSetAttribute(CUgraphNode hNode, CUkernelNodeAttrID attr,
+                              const CUkernelNodeAttrValue *value)
+{
+  return drv(cudaGraphKernelNodeSetAttribute(
+               hNode, (cudaLaunchAttributeID)attr,
+               (const cudaLaunchAttributeValue *)value));
+}
+
+extern "C" CUresult
+cuGraphKernelNodeGetParams_v2(CUgraphNode hNode,
+                              CUDA_KERNEL_NODE_PARAMS *nodeParams)
+{
+  if (hNode == NULL || nodeParams == NULL) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  FRONT_ENTER();
+  CUresult rc;
+  FRONT_LH(rc = DRV(cuGraphKernelNodeGetParams_v2)(real_node(hNode),
+                                                   nodeParams));
+  if (rc == CUDA_SUCCESS) {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    FrontObj *f = record_of(FRONT_FUNCTION, nodeParams->func);
+    if (f == NULL) {
+      front_unsupported("cuGraphKernelNodeGetParams on a kernel that the "
+                        "application did not get from cuModuleGetFunction");
+    }
+    nodeParams->func = (CUfunction)f;
+    nodeParams->ctx = (CUcontext)record_of(FRONT_CTX, nodeParams->ctx);
+  }
+  FRONT_LEAVE();
+  return rc;
+}
+
+extern "C" CUresult
+cuGraphKernelNodeSetParams_v2(CUgraphNode hNode,
+                              const CUDA_KERNEL_NODE_PARAMS *nodeParams)
+{
+  if (hNode == NULL || nodeParams == NULL) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  CUDA_KERNEL_NODE_PARAMS real = real_kernel_params(nodeParams);
+  FRONT_ENTER();
+  CUresult rc;
+  FRONT_LH(rc = DRV(cuGraphKernelNodeSetParams_v2)(real_node(hNode), &real));
+  FRONT_LEAVE();
+  return rc;
+}
+
+extern "C" CUresult
+cuGraphInstantiateWithFlags(CUgraphExec *phGraphExec, CUgraph hGraph,
+                            unsigned long long flags)
+{
+  return drv(cudaGraphInstantiateWithFlags(phGraphExec, hGraph, flags));
+}
+
+extern "C" CUresult
+cuGraphInstantiateWithParams(CUgraphExec *phGraphExec, CUgraph hGraph,
+                             CUDA_GRAPH_INSTANTIATE_PARAMS *instantiateParams)
+{
+  return drv(cudaGraphInstantiateWithParams(
+               phGraphExec, hGraph,
+               (cudaGraphInstantiateParams *)instantiateParams));
+}
+
+extern "C" CUresult
+cuGraphInstantiateWithParams_ptsz(
+  CUgraphExec *phGraphExec, CUgraph hGraph,
+  CUDA_GRAPH_INSTANTIATE_PARAMS *instantiateParams)
+{
+  return drv(cudaGraphInstantiateWithParams_ptsz(
+               phGraphExec, hGraph,
+               (cudaGraphInstantiateParams *)instantiateParams));
+}
+
+extern "C" CUresult
+cuGraphLaunch(CUgraphExec hGraphExec, CUstream hStream)
+{
+  return drv(cudaGraphLaunch(hGraphExec, hStream));
+}
+
+extern "C" CUresult
+cuGraphLaunch_ptsz(CUgraphExec hGraphExec, CUstream hStream)
+{
+  return drv(cudaGraphLaunch_ptsz(hGraphExec, hStream));
+}
+
+extern "C" CUresult
+cuGraphExecDestroy(CUgraphExec hGraphExec)
+{
+  return drv(cudaGraphExecDestroy(hGraphExec));
+}
+
+extern "C" CUresult
+cuGraphExecUpdate_v2(CUgraphExec hGraphExec, CUgraph hGraph,
+                     CUgraphExecUpdateResultInfo *resultInfo)
+{
+  return drv(cudaGraphExecUpdate(hGraphExec, hGraph,
+                                 (cudaGraphExecUpdateResultInfo *)resultInfo));
+}
+
+extern "C" CUresult
+cuGraphExecKernelNodeSetParams_v2(CUgraphExec hGraphExec, CUgraphNode hNode,
+                                  const CUDA_KERNEL_NODE_PARAMS *nodeParams)
+{
+  if (nodeParams == NULL) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  FRONT_ENTER();
+  NodeSnap s = NodeSnap();
+  drv_kernel_override(nodeParams, &s);
+  cudaError_t rc = exec_set(hGraphExec, hNode, std::move(s));
+  FRONT_LEAVE();
+  return drv(rc);
+}
+
+// The node's context: the one that the executable graph runs it in.
+extern "C" CUresult
+cuGraphExecMemsetNodeSetParams(CUgraphExec hGraphExec, CUgraphNode hNode,
+                               const CUDA_MEMSET_NODE_PARAMS *memsetParams,
+                               CUcontext)
+{
+  return drv(cudaGraphExecMemsetNodeSetParams(
+               hGraphExec, hNode, (const cudaMemsetParams *)memsetParams));
+}
+
+extern "C" CUresult
+cuGraphExecMemcpyNodeSetParams(CUgraphExec hGraphExec, CUgraphNode hNode,
+                               const CUDA_MEMCPY3D *copyParams, CUcontext)
+{
+  if (copyParams == NULL) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  cudaMemcpy3DParms p = linear_copy(copyParams);
+  return drv(cudaGraphExecMemcpyNodeSetParams(hGraphExec, hNode, &p));
+}
+
+extern "C" CUresult
+cuGraphExecHostNodeSetParams(CUgraphExec hGraphExec, CUgraphNode hNode,
+                             const CUDA_HOST_NODE_PARAMS *nodeParams)
+{
+  return drv(cudaGraphExecHostNodeSetParams(
+               hGraphExec, hNode, (const cudaHostNodeParams *)nodeParams));
+}
+
+extern "C" CUresult
+cuGraphExecChildGraphNodeSetParams(CUgraphExec hGraphExec, CUgraphNode hNode,
+                                   CUgraph childGraph)
+{
+  return drv(cudaGraphExecChildGraphNodeSetParams(hGraphExec, hNode,
+                                                  childGraph));
+}
+
+extern "C" CUresult
+cuGraphExecEventRecordNodeSetEvent(CUgraphExec hGraphExec, CUgraphNode hNode,
+                                   CUevent event)
+{
+  return drv(cudaGraphExecEventRecordNodeSetEvent(hGraphExec, hNode, event));
+}
+
+extern "C" CUresult
+cuGraphExecEventWaitNodeSetEvent(CUgraphExec hGraphExec, CUgraphNode hNode,
+                                 CUevent event)
+{
+  return drv(cudaGraphExecEventWaitNodeSetEvent(hGraphExec, hNode, event));
+}
+
+extern "C" CUresult
+cuGraphNodeSetEnabled(CUgraphExec hGraphExec, CUgraphNode hNode,
+                      unsigned int isEnabled)
+{
+  return drv(cudaGraphNodeSetEnabled(hGraphExec, hNode, isEnabled));
+}
+
+extern "C" CUresult
+cuGraphNodeGetEnabled(CUgraphExec hGraphExec, CUgraphNode hNode,
+                      unsigned int *isEnabled)
+{
+  return drv(cudaGraphNodeGetEnabled(hGraphExec, hNode, isEnabled));
+}
+
+extern "C" CUresult
+cuStreamBeginCapture_v2(CUstream hStream, CUstreamCaptureMode mode)
+{
+  return drv(cudaStreamBeginCapture(hStream, (cudaStreamCaptureMode)mode));
+}
+
+extern "C" CUresult
+cuStreamBeginCapture_v2_ptsz(CUstream hStream, CUstreamCaptureMode mode)
+{
+  return drv(cudaStreamBeginCapture_ptsz(hStream,
+                                         (cudaStreamCaptureMode)mode));
+}
+
+extern "C" CUresult
+cuStreamBeginCaptureToGraph(CUstream hStream, CUgraph hGraph,
+                            const CUgraphNode *dependencies,
+                            const CUgraphEdgeData *dependencyData,
+                            size_t numDependencies, CUstreamCaptureMode mode)
+{
+  return drv(cudaStreamBeginCaptureToGraph(
+               hStream, hGraph, dependencies,
+               (const cudaGraphEdgeData *)dependencyData, numDependencies,
+               (cudaStreamCaptureMode)mode));
+}
+
+extern "C" CUresult
+cuStreamBeginCaptureToGraph_ptsz(CUstream hStream, CUgraph hGraph,
+                                 const CUgraphNode *dependencies,
+                                 const CUgraphEdgeData *dependencyData,
+                                 size_t numDependencies,
+                                 CUstreamCaptureMode mode)
+{
+  return drv(cudaStreamBeginCaptureToGraph_ptsz(
+               hStream, hGraph, dependencies,
+               (const cudaGraphEdgeData *)dependencyData, numDependencies,
+               (cudaStreamCaptureMode)mode));
+}
+
+extern "C" CUresult
+cuStreamEndCapture(CUstream hStream, CUgraph *phGraph)
+{
+  return drv(cudaStreamEndCapture(hStream, phGraph));
+}
+
+extern "C" CUresult
+cuStreamEndCapture_ptsz(CUstream hStream, CUgraph *phGraph)
+{
+  return drv(cudaStreamEndCapture_ptsz(hStream, phGraph));
+}
+
+extern "C" CUresult
+cuStreamGetCaptureInfo_v3(CUstream hStream,
+                          CUstreamCaptureStatus *captureStatus_out,
+                          cuuint64_t *id_out, CUgraph *graph_out,
+                          const CUgraphNode **dependencies_out,
+                          const CUgraphEdgeData **edgeData_out,
+                          size_t *numDependencies_out)
+{
+  return drv(cudaStreamGetCaptureInfo(
+               hStream, (cudaStreamCaptureStatus *)captureStatus_out,
+               (unsigned long long *)id_out, graph_out, dependencies_out,
+               (const cudaGraphEdgeData **)edgeData_out,
+               numDependencies_out));
+}
+
+extern "C" CUresult
+cuStreamGetCaptureInfo_v3_ptsz(CUstream hStream,
+                               CUstreamCaptureStatus *captureStatus_out,
+                               cuuint64_t *id_out, CUgraph *graph_out,
+                               const CUgraphNode **dependencies_out,
+                               const CUgraphEdgeData **edgeData_out,
+                               size_t *numDependencies_out)
+{
+  return drv(cudaStreamGetCaptureInfo_ptsz(
+               hStream, (cudaStreamCaptureStatus *)captureStatus_out,
+               (unsigned long long *)id_out, graph_out, dependencies_out,
+               (const cudaGraphEdgeData **)edgeData_out,
+               numDependencies_out));
+}
+
+extern "C" CUresult
+cuStreamUpdateCaptureDependencies_v2(CUstream hStream,
+                                     CUgraphNode *dependencies,
+                                     const CUgraphEdgeData *dependencyData,
+                                     size_t numDependencies,
+                                     unsigned int flags)
+{
+  return drv(cudaStreamUpdateCaptureDependencies(
+               hStream, dependencies,
+               (const cudaGraphEdgeData *)dependencyData, numDependencies,
+               flags));
+}
+
+extern "C" CUresult
+cuStreamUpdateCaptureDependencies_v2_ptsz(
+  CUstream hStream, CUgraphNode *dependencies,
+  const CUgraphEdgeData *dependencyData, size_t numDependencies,
+  unsigned int flags)
+{
+  return drv(cudaStreamUpdateCaptureDependencies_ptsz(
+               hStream, dependencies,
+               (const cudaGraphEdgeData *)dependencyData, numDependencies,
+               flags));
 }

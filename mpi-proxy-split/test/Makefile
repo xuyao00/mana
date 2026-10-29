@@ -42,6 +42,7 @@ E2E_CUDA_MPI = cuda_aware cuda_threads cuda_driver cuda_async cuda_ipc \
                cuda_textures cuda_static cuda_static_stripped cuda_cublas \
                cuda_cufft cuda_curand cuda_graphs
 E2E_CUDA = $(if $(NVCC),cuda_nompi cuda_quiesce cuda_pools cuda_managed \
+             cuda_drvgraphs \
              $(if $(filter yes,${MANA_MPI}),${E2E_CUDA_MPI}))
 
 # What MANA builds (configure's MANA_MPI and MANA_CUDA): the MPI tests with
@@ -108,6 +109,10 @@ nompi: nompi.c mana_test.h
 
 cuda_nompi: cuda_nompi.cu mana_test.h
 	$(NVCC) -g -O0 -cudart=shared -o $@ $<
+
+# The driver API only, without MPI.
+cuda_drvgraphs: cuda_drvgraphs.c cuda_driver_kernels.h mana_test.h
+	$(CC) -g -O0 -I$(CUDA_HOME)/include -o $@ $< -L$(CUDA_HOME)/lib64 -lcuda
 
 cuda_managed: cuda_managed.cu mana_test.h
 	$(NVCC) -g -O0 -cudart=shared -o $@ $<
