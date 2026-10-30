@@ -44,8 +44,9 @@ E2E_CUDA_MPI = cuda_aware cuda_threads cuda_driver cuda_async cuda_ipc \
 E2E_CUDA = $(if $(NVCC),cuda_nompi cuda_quiesce cuda_pools cuda_managed \
              cuda_drvgraphs \
              $(if $(filter yes,${MANA_MPI}),${E2E_CUDA_MPI}))
-# NCCL, with NCCL's front (configure's MANA_NCCL, NCCL_LIB and NCCL_INCLUDE).
-E2E_NCCL = $(if $(NVCC),$(if $(filter yes,${MANA_NCCL}),$(if \
+# NCCL, with NCCL's front (configure's MANA_NCCL, NCCL_LIB and NCCL_INCLUDE);
+# nccl_nompi without MPI.
+E2E_NCCL = $(if $(NVCC),$(if $(filter yes,${MANA_NCCL}),nccl_nompi $(if \
              $(filter yes,${MANA_MPI}),nccl)))
 
 # What MANA builds (configure's MANA_MPI and MANA_CUDA): the MPI tests with
@@ -139,10 +140,16 @@ cuda_quiesce: cuda_quiesce.cu mana_test.h
 
 # NCCL_LIB by its file name, and its directory as the run path, as a program
 # may find it.
+NCCL_FLAGS = -I$(NCCL_INCLUDE) -L$(dir $(NCCL_LIB)) -l:$(notdir $(NCCL_LIB)) \
+             -Xlinker -rpath -Xlinker $(dir $(NCCL_LIB))
+
 nccl: nccl.cu mana_test.h
 	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $< \
-	  -I$(NCCL_INCLUDE) -L$(dir $(NCCL_LIB)) -l:$(notdir $(NCCL_LIB)) \
-	  -Xlinker -rpath -Xlinker $(dir $(NCCL_LIB))
+	  $(NCCL_FLAGS)
+
+nccl_nompi: nccl.cu mana_test.h
+	$(NVCC) -g -O0 -cudart=shared -DMT_NO_MPI -DTEST_NAME='"nccl_nompi"' \
+	  -o $@ $< $(NCCL_FLAGS)
 
 # Opens the MPI library with dlopen(), so it is not linked with it.
 dlopen_mpi: dlopen_mpi.c
@@ -182,6 +189,7 @@ tidy:
 
 clean: tidy
 	rm -f *.pyc *.so
-	rm -f ${E2E_TESTS} ${E2E_FORTRAN} ${BENCH_FILES} ${E2E_CUDA} nccl
+	rm -f ${E2E_TESTS} ${E2E_FORTRAN} ${BENCH_FILES} ${E2E_CUDA} nccl \
+	  nccl_nompi
 	rm -f cuda_driver_kernels.h cuda_driver_kernels.ptx \
 	  cuda_driver_kernels.fatbin

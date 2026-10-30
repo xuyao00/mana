@@ -181,6 +181,7 @@ TESTS = [
   # NCCL's drain at each checkpoint and its communicators made again at each
   # restart (cuda-front/front_nccl.cpp).
   Test("nccl", 2, nccl=True),
+  Test("nccl_nompi", 2, nccl=True, no_mpi=True),
   Test("fortran_nonblocking", 2),
   Test("fortran_handles", 2),
   Test("fortran_attributes", 2),

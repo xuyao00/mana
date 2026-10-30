@@ -1,6 +1,8 @@
 // NCCL (run with MANA's --cuda; cuda/PLAN-nccl-front.md): communicators that
 // each checkpoint drains and each restart makes again.  MPI gives the unique
-// ids.  The communicators: 'world', of every rank; 'reversed', a split of it
+// ids.  nccl_nompi is this test without MPI (MT_NO_MPI, run with --no-mpi):
+// the first unique id goes through a file, the others by ncclBroadcast on
+// world.  The communicators: 'world', of every rank; 'reversed', a split of it
 // with the ranks in reverse order; 'evens', a split that gives the odd ranks
 // none (NCCL_SPLIT_NOCOLOR).  Each iteration: an all-reduce on world, a
 // broadcast on reversed from a root that moves, a send/recv ring in a group
@@ -14,6 +16,10 @@
 #include <nccl.h>
 
 #include "mana_test.h"
+
+#ifndef TEST_NAME
+#define TEST_NAME "nccl"
+#endif
 
 #define N 1024
 
@@ -58,14 +64,67 @@ to_host(unsigned *host, const unsigned *dev, size_t count)
                         cudaMemcpyDeviceToHost));
 }
 
+#ifdef MT_NO_MPI
+// Rank 0 writes the unique id to MT_CONTROL/nccl_id (or ./nccl_id), by a
+// rename so that no rank reads half of it; the others wait for it.
+static void
+share_by_file(ncclUniqueId *id)
+{
+  const char *dir = getenv("MT_CONTROL");
+  char path[4096], tmp[4096];
+  snprintf(path, sizeof path, "%s/nccl_id", dir != NULL ? dir : ".");
+  if (mt_rank == 0) {
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    MT_CHECK(f != NULL && fwrite(id, sizeof *id, 1, f) == 1, "writing %s",
+             tmp);
+    fclose(f);
+    MT_CHECK(rename(tmp, path) == 0, "renaming %s", tmp);
+    return;
+  }
+  for (int tries = 0;; tries++) {
+    FILE *f = fopen(path, "r");
+    if (f != NULL) {
+      size_t n = fread(id, sizeof *id, 1, f);
+      fclose(f);
+      if (n == 1) {
+        return;
+      }
+    }
+    MT_CHECK(tries < 60000, "no %s after 60 s", path);
+    usleep(1000);
+  }
+}
+#endif
+
+// A communicator of every rank, by a new unique id from rank 0: with MPI,
+// by MPI_Bcast; without, the first through a file, the others by
+// ncclBroadcast on 'world'.
 static ncclComm_t
-new_comm(int rank, int size)
+new_comm(int rank, int size, ncclComm_t world, cudaStream_t s)
 {
   ncclUniqueId id;
   if (rank == 0) {
     NCCL_CHECK(ncclGetUniqueId(&id));
   }
+#ifndef MT_NO_MPI
   MT_MPI(MPI_Bcast(&id, sizeof id, MPI_BYTE, 0, MPI_COMM_WORLD));
+#else
+  if (world == NULL) {
+    share_by_file(&id);
+  } else {
+    static void *dev_id;
+    if (dev_id == NULL) {
+      CUDA_CHECK(cudaMalloc(&dev_id, sizeof id));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(dev_id, &id, sizeof id, cudaMemcpyHostToDevice,
+                               s));
+    NCCL_CHECK(ncclBroadcast(dev_id, dev_id, sizeof id, ncclUint8, 0, world,
+                             s));
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    CUDA_CHECK(cudaMemcpy(&id, dev_id, sizeof id, cudaMemcpyDeviceToHost));
+  }
+#endif
   ncclComm_t comm;
   NCCL_CHECK(ncclCommInitRank(&comm, size, id, rank));
   return comm;
@@ -74,7 +133,7 @@ new_comm(int rank, int size)
 int
 main(int argc, char **argv)
 {
-  mt_init(&argc, &argv, "nccl");
+  mt_init(&argc, &argv, TEST_NAME);
   int rank = mt_rank, size = mt_size;
   int ndev;
   CUDA_CHECK(cudaGetDeviceCount(&ndev));
@@ -82,7 +141,7 @@ main(int argc, char **argv)
   cudaStream_t s;
   CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
 
-  ncclComm_t world = new_comm(rank, size);
+  ncclComm_t world = new_comm(rank, size, NULL, s);
   ncclComm_t evens, reversed;
   NCCL_CHECK(ncclCommSplit(world, rank % 2 == 0 ? 0 : NCCL_SPLIT_NOCOLOR,
                            rank, &evens, NULL));
@@ -162,7 +221,7 @@ main(int argc, char **argv)
     }
 
     if (it % 50 == 0) {
-      ncclComm_t once = new_comm(rank, size);
+      ncclComm_t once = new_comm(rank, size, world, s);
       unsigned mine = rank + 1 + (unsigned)it;
       CUDA_CHECK(cudaMemcpy(sum, &mine, sizeof mine, cudaMemcpyHostToDevice));
       NCCL_CHECK(ncclAllReduce(sum, sum, 1, ncclUint32, ncclSum, once, s));
