@@ -391,6 +391,13 @@ mana_cuda_event(int event)
 {
   switch (event) {
     case MANA_STEP_QUIESCE: {
+      // NCCL's kernels wait for every member of their communicator, so the
+      // GPUs quiesce only after a drain, which is to come
+      // (cuda/PLAN-nccl-front.md, step 3).
+      if (front_nccl_live != NULL && front_nccl_live() > 0) {
+        front_fatal("a checkpoint with %d NCCL communicator(s): not "
+                    "supported yet\n", front_nccl_live());
+      }
       QuiesceWatchdog watchdog;
       // The application's threads are out of the lower half, so no new
       // work can start, and their context stacks stay as they are: the

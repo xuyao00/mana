@@ -2,7 +2,8 @@
 # (cuda/DESIGN-lower-half-cuda.md): MANA's libcudart.so.<N> and libcuda.so.1,
 # generated from the real libraries that bin/lower-half uses
 # (gen-cuda-front.py), the same for cuBLAS, cuBLASLt, cuFFT and cuRAND if
-# the toolkit has them, and libmana_cuda.so, which they all jump into.  All are
+# the toolkit has them and for NCCL if NCCL_HOME has it, and libmana_cuda.so,
+# which they all jump into.  All are
 # installed in lib/dmtcp/cuda-front/.
 
 include ../Makefile_config
@@ -65,6 +66,15 @@ ifneq (${REAL_LIBCURAND},)
   CURAND_SONAME := $(call soname,${REAL_LIBCURAND})
 endif
 
+# NCCL (cuda/PLAN-nccl-front.md), from NCCL_HOME, as NERSC's nccl module sets
+# it.  configure's --with-nccl is to come.
+REAL_LIBNCCL ?= $(if ${NCCL_HOME},$(firstword \
+                  $(wildcard ${NCCL_HOME}/lib/libnccl.so.[0-9]*)))
+ifneq (${REAL_LIBNCCL},)
+  NCCL_SONAME := $(call soname,${REAL_LIBNCCL})
+  NCCL_INCLUDE := $(realpath $(dir ${REAL_LIBNCCL})/../include)
+endif
+
 INSTALL_DIR = ${MANA_ROOT}/lib/dmtcp/cuda-front
 STUB_INSTALL_DIR = ${MANA_ROOT}/lib/dmtcp/cuda-stub
 
@@ -72,8 +82,9 @@ STUB_INSTALL_DIR = ${MANA_ROOT}/lib/dmtcp/cuda-stub
 FRONT_CXXFLAGS = -std=c++17 -fPIC -fno-stack-protector -g3 -O2 -Wall -I. \
                  -I.. -I../lower-half -I${DMTCP_ROOT}/include \
                  -I${DMTCP_ROOT}/jalib -I${CUDA_HOME}/include \
-                 $(addprefix -I,${CUDA_MATH_INCLUDE})
-GEN_CFLAGS = -I${CUDA_HOME}/include $(addprefix -I,${CUDA_MATH_INCLUDE})
+                 $(addprefix -I,${CUDA_MATH_INCLUDE} ${NCCL_INCLUDE})
+GEN_CFLAGS = -I${CUDA_HOME}/include \
+             $(addprefix -I,${CUDA_MATH_INCLUDE} ${NCCL_INCLUDE})
 
 FRONT_OBJS = front_core.o front_vmm.o front_objs.o front_drv.o \
              front_async.o front_memops.o front_ipc.o front_static.o \
@@ -82,9 +93,11 @@ FRONT_OBJS = front_core.o front_vmm.o front_objs.o front_drv.o \
              $(if ${CUBLAS_SONAME},front_blas.o gen/cublas-gen.o \
                gen/cublasLt-gen.o) \
              $(if ${CUFFT_SONAME},front_fft.o gen/cufft-gen.o) \
-             $(if ${CURAND_SONAME},front_rand.o gen/curand-gen.o)
+             $(if ${CURAND_SONAME},front_rand.o gen/curand-gen.o) \
+             $(if ${NCCL_SONAME},front_nccl.o gen/nccl-gen.o)
 FRONT_LIBS = ${CUDART_SONAME} libcuda.so.1 ${CUBLAS_SONAME} \
-             ${CUBLASLT_SONAME} ${CUFFT_SONAME} ${CURAND_SONAME}
+             ${CUBLASLT_SONAME} ${CUFFT_SONAME} ${CURAND_SONAME} \
+             ${NCCL_SONAME}
 # Without --cuda, the upper half loads stubs in place of libcudart and
 # libcuda (../mana_audit.c): each function aborts with its name.
 STUB_LIBS = stub/${CUDART_SONAME} stub/libcuda.so.1
@@ -149,10 +162,19 @@ gen/curand-gen.cpp gen/curand-tramp.S gen/curand.map gen/curand-index.h: \
 	  --out-dir=gen --header=curand.h --cxx=g++ --cflags="${GEN_CFLAGS}" \
 	  --own=curand-own.txt --pass=curand-pass.txt
 
+# NCCL: front_nccl.h translates communicators; the rest of NCCL is own or
+# not forwarded yet.
+gen/nccl-gen.cpp gen/nccl-tramp.S gen/nccl.map gen/nccl-index.h: \
+    gen-cuda-front.py nccl-own.txt nccl-pass.txt ${REAL_LIBNCCL}
+	python3 gen-cuda-front.py --real=${REAL_LIBNCCL} --prefix=nccl \
+	  --out-dir=gen --header=nccl.h --cxx=g++ --cflags="${GEN_CFLAGS}" \
+	  --own=nccl-own.txt --pass=nccl-pass.txt --include=front_nccl.h
+
 front_blas.o gen/cublas-gen.o gen/cublasLt-gen.o: front_blas.h \
     gen/cublas-index.h gen/cublasLt-index.h
 front_fft.o: gen/cufft-index.h
 front_rand.o: gen/curand-index.h
+front_nccl.o gen/nccl-gen.o: front_nccl.h gen/nccl-index.h
 
 %.o: %.cpp ${FRONT_HEADERS}
 	${CXX} ${FRONT_CXXFLAGS} -c -o $@ $<
@@ -198,6 +220,11 @@ ${CURAND_SONAME}: gen/curand-tramp.o gen/curand.map libmana_cuda.so
 	  -Wl,-soname,${CURAND_SONAME} -Wl,--version-script=gen/curand.map \
 	  -Wl,-rpath,'$$ORIGIN' -Wl,-z,now
 
+${NCCL_SONAME}: gen/nccl-tramp.o gen/nccl.map libmana_cuda.so
+	${CXX} -shared -o $@ gen/nccl-tramp.o libmana_cuda.so \
+	  -Wl,-soname,${NCCL_SONAME} -Wl,--version-script=gen/nccl.map \
+	  -Wl,-rpath,'$$ORIGIN' -Wl,-z,now
+
 gen-stub/cudart-stub.S gen-stub/cudart.map: gen-cuda-front.py \
     ${REAL_LIBCUDART}
 	python3 gen-cuda-front.py --real=${REAL_LIBCUDART} --prefix=cudart \
@@ -239,6 +266,7 @@ install: default
 	$(if ${CUFFT_SONAME},ln -sf ${CUFFT_SONAME} ${INSTALL_DIR}/libcufft.so)
 	$(if ${CURAND_SONAME},ln -sf ${CURAND_SONAME} \
 	  ${INSTALL_DIR}/libcurand.so)
+	$(if ${NCCL_SONAME},ln -sf ${NCCL_SONAME} ${INSTALL_DIR}/libnccl.so)
 	cp -f libmana_cuda_audit.so ${MANA_ROOT}/lib/dmtcp/
 	mkdir -p ${STUB_INSTALL_DIR}
 	cp -f ${STUB_LIBS} ${STUB_INSTALL_DIR}/
@@ -248,6 +276,6 @@ install: default
 clean:
 	rm -rf gen gen-stub stub *.o libmana_cuda.so libcudart.so.* libcuda.so.1 \
 	  libcublas.so.* libcublasLt.so.* libcufft.so.* libcurand.so.* \
-	  libmana_cuda_audit.so
+	  libnccl.so.* libmana_cuda_audit.so
 
 .PHONY: default check-real install clean

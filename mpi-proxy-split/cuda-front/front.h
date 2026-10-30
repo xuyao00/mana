@@ -180,6 +180,7 @@ enum FrontKind {
   FRONT_GRAPH,           // a CUDA graph
   FRONT_GNODE,           // a node of a graph
   FRONT_GEXEC,           // an executable graph
+  FRONT_NCCL,            // an NCCL communicator
   FRONT_N_KINDS
 };
 
@@ -283,6 +284,10 @@ void front_note_cudart(int device) FRONT_HIDDEN;
 // A library (cuBLAS, cuFFT) is about to make a handle or plan on the current
 // device: cudart starts there first, with the application's modules.
 void front_before_library() FRONT_HIDDEN;
+
+// The NCCL communicators that exist (front_nccl.cpp, if MANA was built
+// with NCCL).
+int front_nccl_live() FRONT_HIDDEN __attribute__((weak));
 
 // Records of objects (front_objs.cpp).
 void front_objs_stash() FRONT_HIDDEN;

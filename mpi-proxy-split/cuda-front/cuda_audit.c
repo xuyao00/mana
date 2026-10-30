@@ -62,7 +62,8 @@ is_front_library(const char *base)
 {
   static const char *const libs[] = { "libcudart.so", "libcuda.so",
                                       "libcublas.so", "libcublasLt.so",
-                                      "libcufft.so", "libcurand.so" };
+                                      "libcufft.so", "libcurand.so",
+                                      "libnccl.so" };
   for (unsigned i = 0; i < sizeof libs / sizeof libs[0]; i++) {
     if (starts_with(base, libs[i])) {
       const char *rest = base;

@@ -1,0 +1,13 @@
+# NCCL functions forwarded as they are, with communicators translated
+# (front_nccl.h); every other one aborts with its name for now
+# (cuda/PLAN-nccl-front.md).  See gen-cuda-front.py.
+ncclGetVersion
+ncclGetUniqueId
+ncclGetErrorString
+ncclGetLastError
+ncclGroupStart
+ncclGroupEnd
+ncclCommCount
+ncclCommCuDevice
+ncclCommUserRank
+ncclCommGetAsyncError

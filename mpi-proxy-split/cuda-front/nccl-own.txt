@@ -1,0 +1,25 @@
+# NCCL functions that the front defines by hand (front_nccl.cpp): the
+# communicators' lifecycle, which their records follow; the operations,
+# which translate the stream and count for the drain; and ncclMemAlloc and
+# ncclMemFree, through the front's allocator.  See gen-cuda-front.py and
+# cuda/PLAN-nccl-front.md.
+ncclCommInitRank
+ncclCommInitRankConfig
+ncclCommInitAll
+ncclCommSplit
+ncclCommFinalize
+ncclCommDestroy
+ncclCommAbort
+ncclAllReduce
+ncclBroadcast
+ncclBcast
+ncclReduce
+ncclAllGather
+ncclReduceScatter
+ncclAlltoAll?
+ncclGather?
+ncclScatter?
+ncclSend
+ncclRecv
+ncclMemAlloc
+ncclMemFree
