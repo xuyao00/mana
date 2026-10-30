@@ -328,10 +328,10 @@ class Run:
   def log_size(self):
     return os.path.getsize(self.logs[-1])
 
-  def progress(self, start=0):
-    """Returns {rank: [iteration, ...]} as reported in the current log after
-    byte 'start'."""
-    with open(self.logs[-1], "rb") as f:
+  def progress(self, start=0, log=None):
+    """Returns {rank: [iteration, ...]} as reported in the current log (or
+    'log') after byte 'start'."""
+    with open(log or self.logs[-1], "rb") as f:
       f.seek(start)
       text = f.read()
     seen = {}
@@ -361,8 +361,13 @@ class Run:
     exit with status 0 and print that it passed that many iterations."""
     seen = self.progress()
     latest = max(its[-1] for its in seen.values())
-    # Reports are 0.1 s or more apart, so this is 1 s or more ahead.
-    step = max(b - a for its in seen.values() for a, b in zip(its, its[1:]))
+    # Reports are 0.1 s or more apart, so this is 1 s or more ahead.  The
+    # step is the largest of all the logs: right after a restart, the first
+    # iterations can be slow enough for a report each, and the ranks would
+    # pass a stop taken from those before they read it.
+    step = max(b - a for log in self.logs
+               for its in self.progress(log=log).values()
+               for a, b in zip(its, its[1:]))
     stop = latest + 10 * step
     tmp = os.path.join(self.dir, "stop.tmp")
     with open(tmp, "w") as f:
