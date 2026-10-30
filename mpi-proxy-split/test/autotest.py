@@ -159,14 +159,16 @@ TESTS = [
        ckpt_fails=True, fails=True, cuda=True, no_mpi=True, mana_only=True,
        env={"MANA_CUDA_QUIESCE_WARN": "1", "MANA_CUDA_QUIESCE_TIMEOUT": "3"},
        expect="(MANA_CUDA_QUIESCE_TIMEOUT): the process ends"),
-  # An MPI library under --no-mpi, and a CUDA library without --cuda, are
-  # refused (mana_audit.c).
+  # An MPI library under --no-mpi is refused (mana_audit.c).  Without
+  # --cuda, libcudart and libcuda are stubs (cuda-front/cuda_stub.c): a
+  # program that links them runs, and a CUDA call stops it.
   Test("nompi_refuses_mpi", 2, kind="run", fails=True, no_mpi=True,
        needs_mpi=True, mana_only=True, program="p2p_blocking",
        expect="an MPI library, refused under mana_launch --no-mpi"),
+  Test("cuda_linked", 4, needs_cuda=True, reports="p2p_ring"),
   Test("refuses_cuda", 2, kind="run", fails=True, needs_cuda=True,
        mana_only=True, program="cuda_aware", env={"MANA_CUDA": "0"},
-       expect="a CUDA library, refused without mana_launch --cuda"),
+       expect="a CUDA call, but MANA was launched without --cuda"),
   Test("cuda_static_stripped", 2, cuda=True, kind="run", fails=True,
        expect="static CUDA runtime but no symbol table", mana_only=True),
   Test("fortran_nonblocking", 2),

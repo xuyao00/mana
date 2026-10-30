@@ -25,7 +25,13 @@
 // - an MPI library under --no-mpi: nothing would drain or rebuild it, and
 //   its constructors (UCX's) make state that DMTCP cannot restore;
 // - libcuda or libcudart without --cuda: nothing would save the GPU, and
-//   with a CUDA-aware MPI the process would have two CUDA drivers.
+//   with a CUDA-aware MPI the process would have two CUDA drivers.  In their
+//   place, the CUDA front's stubs (cuda-front/cuda_stub.c), from
+//   lib/dmtcp/cuda-stub, which the lower half puts first on LD_LIBRARY_PATH:
+//   a program that links libcuda.so.1 without calling CUDA (any program
+//   built with NERSC's cudatoolkit module) runs, and a CUDA call aborts with
+//   the function's name.  A library without a stub (another major of
+//   libcudart, or MANA built without CUDA) is refused.
 // A run has a layer if its library is preloaded (mana_launch): libmana_mpi.so
 // or libmana_cuda.so.  ld.so opens the preloaded libraries before it looks
 // for the program's.
@@ -75,6 +81,22 @@ static int
 is_cuda_library(const char *base)
 {
   return is_library(base, "libcuda.so") || is_library(base, "libcudart.so");
+}
+
+static int
+in_stub_dir(const char *path)
+{
+  const char *dir = "/cuda-stub/";
+  const char *p;
+  for (p = path; *p != '\0'; p++) {
+    size_t i;
+    for (i = 0; dir[i] != '\0' && p[i] == dir[i]; i++) {
+    }
+    if (dir[i] == '\0') {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 static void
@@ -136,15 +158,30 @@ char *
 la_objsearch(const char *name, uintptr_t *cookie, unsigned int flag)
 {
   (void)cookie;
+  if (!has_cuda_layer && is_cuda_library(base_name(name))) {
+    // The stub, by name, so that LD_LIBRARY_PATH finds it first; no other
+    // directory.  Once the search is past LD_LIBRARY_PATH (in ld.so's cache
+    // or the default directories), there is no stub of this library: say
+    // so, once.  (An RPATH comes before LD_LIBRARY_PATH.)
+    static int refused;
+    if (flag == LA_SER_ORIG) {
+      return (char *)base_name(name);
+    }
+    if (in_stub_dir(name)) {
+      return (char *)name;
+    }
+    if (!refused && (flag == LA_SER_CONFIG || flag == LA_SER_DEFAULT)) {
+      refused = 1;
+      refuse(base_name(name),
+             ": a CUDA library, refused without mana_launch --cuda\n");
+    }
+    return NULL;
+  }
   if (flag != LA_SER_ORIG) {
     return (char *)name;
   }
   if (!has_mpi_layer && is_mpi_library(name)) {
     refuse(name, ": an MPI library, refused under mana_launch --no-mpi\n");
-    return NULL;
-  }
-  if (!has_cuda_layer && is_cuda_library(base_name(name))) {
-    refuse(name, ": a CUDA library, refused without mana_launch --cuda\n");
     return NULL;
   }
   return (char *)name;

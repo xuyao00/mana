@@ -1,4 +1,6 @@
 gen/
+gen-stub/
+stub/
 *.o
 libcudart.so*
 libcuda.so*

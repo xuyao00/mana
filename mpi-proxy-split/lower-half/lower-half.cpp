@@ -1340,7 +1340,8 @@ void print_usage_and_exit(char *prog_name)
  *  the user's MPI application, to LD_LIBRARY_PATH for the upper half.  It
  *  also sets LD_AUDIT: the core's module, then with MPI the one that makes the
  *  upper half load libmpistub.so in place of the MPI library that the
- *  application was linked with, and with --cuda the CUDA front's.
+ *  application was linked with, and with --cuda the CUDA front's.  Without
+ *  --cuda, it prepends the CUDA stubs' directory instead.
  *
  * @param argv0 the path to the executing binary. 
  */
@@ -1414,6 +1415,16 @@ void update_library_path(const char *argv0)
       exit(1);
     }
     audit = audit + ":" + cuda_audit;
+  } else {
+    // Without --cuda: stubs of libcudart and libcuda, which abort when
+    // called, for a program that links them but makes no CUDA call
+    // (mana_audit.c).  None if MANA was built without CUDA.
+    string stub = string(lib1) + "/cuda-stub";
+    if (access((stub + "/libcuda.so.1").c_str(), R_OK) == 0 &&
+        prepend_to_library_path(stub.c_str()) != 0) {
+      perror("MANA: prepending the CUDA stubs to LD_LIBRARY_PATH failed");
+      exit(1);
+    }
   }
   const char *old_audit = getenv("LD_AUDIT");
   if (old_audit != NULL && old_audit[0] != '\0') {

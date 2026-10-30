@@ -66,6 +66,7 @@ ifneq (${REAL_LIBCURAND},)
 endif
 
 INSTALL_DIR = ${MANA_ROOT}/lib/dmtcp/cuda-front
+STUB_INSTALL_DIR = ${MANA_ROOT}/lib/dmtcp/cuda-stub
 
 # -fno-stack-protector: the front switches the FS register (see front.h).
 FRONT_CXXFLAGS = -std=c++17 -fPIC -fno-stack-protector -g3 -O2 -Wall -I. \
@@ -84,11 +85,15 @@ FRONT_OBJS = front_core.o front_vmm.o front_objs.o front_drv.o \
              $(if ${CURAND_SONAME},front_rand.o gen/curand-gen.o)
 FRONT_LIBS = ${CUDART_SONAME} libcuda.so.1 ${CUBLAS_SONAME} \
              ${CUBLASLT_SONAME} ${CUFFT_SONAME} ${CURAND_SONAME}
+# Without --cuda, the upper half loads stubs in place of libcudart and
+# libcuda (../mana_audit.c): each function aborts with its name.
+STUB_LIBS = stub/${CUDART_SONAME} stub/libcuda.so.1
 FRONT_HEADERS = front.h front_auto.h front_objs.h front_reg.h ../mana_core.h \
                 gen/cudart-index.h gen/cuda-index.h \
                 ../lower-half/lower-half-api.h
 
-default: check-real libmana_cuda.so ${FRONT_LIBS} libmana_cuda_audit.so
+default: check-real libmana_cuda.so ${FRONT_LIBS} libmana_cuda_audit.so \
+         ${STUB_LIBS}
 
 check-real:
 	@test -n "${REAL_LIBCUDART}" -a -n "${REAL_LIBCUDA}" || \
@@ -193,6 +198,31 @@ ${CURAND_SONAME}: gen/curand-tramp.o gen/curand.map libmana_cuda.so
 	  -Wl,-soname,${CURAND_SONAME} -Wl,--version-script=gen/curand.map \
 	  -Wl,-rpath,'$$ORIGIN' -Wl,-z,now
 
+gen-stub/cudart-stub.S gen-stub/cudart.map: gen-cuda-front.py \
+    ${REAL_LIBCUDART}
+	python3 gen-cuda-front.py --real=${REAL_LIBCUDART} --prefix=cudart \
+	  --out-dir=gen-stub --stub=1
+
+gen-stub/cuda-stub.S gen-stub/cuda.map: gen-cuda-front.py ${REAL_LIBCUDA}
+	python3 gen-cuda-front.py --real=${REAL_LIBCUDA} --prefix=cuda \
+	  --out-dir=gen-stub --stub=1
+
+gen-stub/%.o: gen-stub/%.S
+	${CC} -c -o $@ $<
+
+cuda_stub.o: cuda_stub.c
+	${CC} -O2 -fPIC -fno-stack-protector -c -o $@ $<
+
+stub/${CUDART_SONAME}: gen-stub/cudart-stub.o gen-stub/cudart.map cuda_stub.o
+	@mkdir -p stub
+	${CC} -shared -o $@ gen-stub/cudart-stub.o cuda_stub.o \
+	  -Wl,-soname,${CUDART_SONAME} -Wl,--version-script=gen-stub/cudart.map
+
+stub/libcuda.so.1: gen-stub/cuda-stub.o gen-stub/cuda.map cuda_stub.o
+	@mkdir -p stub
+	${CC} -shared -o $@ gen-stub/cuda-stub.o cuda_stub.o \
+	  -Wl,-soname,libcuda.so.1 -Wl,--version-script=gen-stub/cuda.map
+
 # An LD_AUDIT module for the upper half; it must not need libc.
 libmana_cuda_audit.so: cuda_audit.c
 	${CC} -O2 -fPIC -shared -nostdlib -fno-stack-protector \
@@ -210,9 +240,13 @@ install: default
 	$(if ${CURAND_SONAME},ln -sf ${CURAND_SONAME} \
 	  ${INSTALL_DIR}/libcurand.so)
 	cp -f libmana_cuda_audit.so ${MANA_ROOT}/lib/dmtcp/
+	mkdir -p ${STUB_INSTALL_DIR}
+	cp -f ${STUB_LIBS} ${STUB_INSTALL_DIR}/
+	ln -sf ${CUDART_SONAME} ${STUB_INSTALL_DIR}/libcudart.so
+	ln -sf libcuda.so.1 ${STUB_INSTALL_DIR}/libcuda.so
 
 clean:
-	rm -rf gen *.o libmana_cuda.so libcudart.so.* libcuda.so.1 \
+	rm -rf gen gen-stub stub *.o libmana_cuda.so libcudart.so.* libcuda.so.1 \
 	  libcublas.so.* libcublasLt.so.* libcufft.so.* libcurand.so.* \
 	  libmana_cuda_audit.so
 

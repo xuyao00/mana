@@ -40,7 +40,7 @@ E2E_NOMPI = nompi
 NVCC = $(if $(filter yes,${MANA_CUDA}),${CUDA_HOME}/bin/nvcc)
 E2E_CUDA_MPI = cuda_aware cuda_threads cuda_driver cuda_async cuda_ipc \
                cuda_textures cuda_static cuda_static_stripped cuda_cublas \
-               cuda_cufft cuda_curand cuda_graphs
+               cuda_cufft cuda_curand cuda_graphs cuda_linked
 E2E_CUDA = $(if $(NVCC),cuda_nompi cuda_quiesce cuda_pools cuda_managed \
              cuda_drvgraphs \
              $(if $(filter yes,${MANA_MPI}),${E2E_CUDA_MPI}))
@@ -58,6 +58,13 @@ ${E2E_TESTS}: %: %.c mana_test.h
 	$(MPICC) -g3 -O0 -o $@ $< $(MPI_CFLAGS) ${MPI_LDFLAGS}
 
 mmap_threads: MPI_LDFLAGS += -pthread
+
+# p2p_ring linked with libcuda, as every program built with NERSC's
+# cudatoolkit module is: without --cuda, it runs on the CUDA stubs
+# (../mana_audit.c).
+cuda_linked: p2p_ring.c mana_test.h
+	$(MPICC) -g3 -O0 -o $@ $< $(MPI_CFLAGS) ${MPI_LDFLAGS} \
+	  -Wl,--no-as-needed -lcuda
 
 # With the shared CUDA runtime: the front stands for it under --cuda.
 cuda_aware cuda_async cuda_textures: %: %.cu mana_test.h
