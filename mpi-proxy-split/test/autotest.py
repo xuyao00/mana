@@ -363,12 +363,16 @@ class Run:
   def finish(self):
     """Tells the ranks at which iteration to stop; the program must then
     exit with status 0 and print that it passed that many iterations."""
+    # Reports are 0.1 s or more apart, so this is 1 s or more ahead.  The
+    # step is the largest of all the logs, after a third report of every
+    # rank: right after a start or a restart, the first iterations can be
+    # slow enough for a report each, and the ranks would pass a stop taken
+    # from those before they read it.
+    self.wait_for(lambda: len(self.progress()) >= self.test.ranks and
+                  all(len(its) >= 3 for its in self.progress().values()),
+                  "a third report")
     seen = self.progress()
     latest = max(its[-1] for its in seen.values())
-    # Reports are 0.1 s or more apart, so this is 1 s or more ahead.  The
-    # step is the largest of all the logs: right after a restart, the first
-    # iterations can be slow enough for a report each, and the ranks would
-    # pass a stop taken from those before they read it.
     step = max(b - a for log in self.logs
                for its in self.progress(log=log).values()
                for a, b in zip(its, its[1:]))
