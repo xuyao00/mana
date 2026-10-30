@@ -47,13 +47,16 @@ class Test:
                progress.
   cuda:        a CUDA-aware MPI test: runs with MANA_CUDA=1 (mana_launch
                --cuda).  test/Makefile builds it if it finds nvcc.
+  nccl:        an NCCL test (and a CUDA one).  test/Makefile builds it if
+               NCCL_HOME names an NCCL; skipped unless the CUDA front has
+               NCCL.  It needs a GPU per rank on a node.
   mana_only:   checks something that only MANA does (e.g. a refusal):
                --native skips it.
   no_mpi:      a program without MPI: runs with MANA_NO_MPI=1 (mana_launch
                --no-mpi), in bin/lower-half-nompi.
   needs_mpi, needs_cuda: what MANA must be built with (configure's MPI layer,
                CUDA front), or the test is skipped.  By default, MPI unless
-               no_mpi, and CUDA if cuda.
+               no_mpi, and CUDA if cuda or nccl.
   env:         environment variables of the run, over the suite's.
   ckpt_fails:  with kind "run" and restart: the checkpoint must end the job,
                which then fails with 'expect'.
@@ -65,7 +68,8 @@ class Test:
                restart=False, fails=False, known_bug=None, native_args=None,
                program=None, burst=1, restart_now=False, cuda=False,
                mana_only=False, no_mpi=False, needs_mpi=None,
-               needs_cuda=None, env=None, ckpt_fails=False, reports=None):
+               needs_cuda=None, env=None, ckpt_fails=False, reports=None,
+               nccl=False):
     self.name = name
     self.reports = reports or name
     self.ranks = ranks
@@ -81,11 +85,12 @@ class Test:
     self.native_args = native_args if native_args is not None else self.args
     self.burst = burst
     self.restart_now = restart_now
-    self.cuda = cuda
+    self.cuda = cuda or nccl
+    self.nccl = nccl
     self.mana_only = mana_only
     self.no_mpi = no_mpi
     self.needs_mpi = not no_mpi if needs_mpi is None else needs_mpi
-    self.needs_cuda = cuda if needs_cuda is None else needs_cuda
+    self.needs_cuda = self.cuda if needs_cuda is None else needs_cuda
     self.env = env or {}
     self.ckpt_fails = ckpt_fails
 
@@ -173,6 +178,9 @@ TESTS = [
        expect="a CUDA call, but MANA was launched without --cuda"),
   Test("cuda_static_stripped", 2, cuda=True, kind="run", fails=True,
        expect="static CUDA runtime but no symbol table", mana_only=True),
+  # NCCL's drain at each checkpoint and its communicators made again at each
+  # restart (cuda-front/front_nccl.cpp).
+  Test("nccl", 2, nccl=True),
   Test("fortran_nonblocking", 2),
   Test("fortran_handles", 2),
   Test("fortran_attributes", 2),
@@ -546,7 +554,8 @@ def mpi_library():
 
 
 def built_layers(mana_root):
-  """The layers that MANA was built with (configure): "MPI", "CUDA"."""
+  """The layers that MANA was built with (configure): "MPI", "CUDA", and
+  "NCCL" if the CUDA front has NCCL's front library."""
   layers = set()
   if (os.path.exists(os.path.join(mana_root, "lib/dmtcp/libmana_mpi.so")) and
       os.path.exists(os.path.join(mana_root, "bin/lower-half"))):
@@ -554,6 +563,8 @@ def built_layers(mana_root):
   if os.path.exists(os.path.join(mana_root,
                                  "lib/dmtcp/cuda-front/libmana_cuda.so")):
     layers.add("CUDA")
+    if glob.glob(os.path.join(mana_root, "lib/dmtcp/cuda-front/libnccl.so*")):
+      layers.add("NCCL")
   return layers
 
 
@@ -624,7 +635,8 @@ def main():
     sys.stdout.write("%-26s " % test.name)
     sys.stdout.flush()
     missing = [layer for layer, needed in (("MPI", test.needs_mpi),
-                                           ("CUDA", test.needs_cuda))
+                                           ("CUDA", test.needs_cuda),
+                                           ("NCCL", test.nccl))
                if needed and layer not in layers]
     if missing:
       skipped.append(test.name)
