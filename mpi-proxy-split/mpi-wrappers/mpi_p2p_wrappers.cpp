@@ -38,23 +38,39 @@ extern "C" {
 
 static int
 MPI_Irecv_internal(void *buf, int count, MPI_Datatype datatype,
-                   int source, int tag, MPI_Comm comm, MPI_Request *request);
+                   int source, int tag, MPI_Comm comm, MPI_Request *request,
+                   int *done = NULL, MPI_Status *done_status = NULL);
+static int
+MPI_Isend_internal(const void *buf, int count, MPI_Datatype datatype,
+                   int dest, int tag, MPI_Comm comm, MPI_Request *request,
+                   bool synchronous = false, int *done = NULL);
 
-// MPI_Send with MANA_P2P_WAIT=polling (see g_p2p_wait): MPI_Isend, then
-// MANA's MPI_Wait.
+// MPI_Send with MANA_P2P_WAIT=polling (see g_p2p_wait): MPI_Isend and
+// MPI_Test in one visit to the lower half (see P2P_SPIN_TESTS).  A send that
+// completes there, as an eager message does, needs no virtual request;
+// otherwise, MANA's MPI_Wait completes it.
 static int
 send_by_polling(const void *buf, int count, MPI_Datatype datatype, int dest,
                 int tag, MPI_Comm comm)
 {
+  // As in MPI_Isend: don't start a send while the P2P drain runs.
+  while (mana_state == CKPT_P2P) {
+    usleep(100);
+  }
   MPI_Request request;
-  int retval = PMPI_Isend(buf, count, datatype, dest, tag, comm, &request);
-  if (retval != MPI_SUCCESS) {
+  int done = 0;
+  LOWER_HALF_DISABLE_CKPT();
+  int retval = MPI_Isend_internal(buf, count, datatype, dest, tag, comm,
+                                  &request, false, &done);
+  LOWER_HALF_ENABLE_CKPT();
+  if (retval != MPI_SUCCESS || done) {
     return retval;
   }
   return PMPI_Wait(&request, MPI_STATUS_IGNORE);
 }
 
-// MPI_Recv with MANA_P2P_WAIT=polling: MPI_Irecv, then MANA's MPI_Wait.  A
+// MPI_Recv with MANA_P2P_WAIT=polling: MPI_Irecv and MPI_Test, as in
+// send_by_polling(), then MANA's MPI_Wait if the message has not come.  A
 // message in MANA's buffer completes the request at once.
 static int
 recv_by_polling(void *buf, int count, MPI_Datatype datatype, int source,
@@ -65,11 +81,19 @@ recv_by_polling(void *buf, int count, MPI_Datatype datatype, int source,
     usleep(100);
   }
   MPI_Request request;
+  int done = 0;
+  MPI_Status local_status;
   LOWER_HALF_DISABLE_CKPT();
   int retval = MPI_Irecv_internal(buf, count, datatype, source, tag, comm,
-                                  &request);
+                                  &request, &done, &local_status);
   LOWER_HALF_ENABLE_CKPT();
   if (retval != MPI_SUCCESS) {
+    return retval;
+  }
+  if (done) {
+    if (status != MPI_STATUS_IGNORE && status != FORTRAN_MPI_STATUS_IGNORE) {
+      *status = local_status;
+    }
     return retval;
   }
   return PMPI_Wait(&request, status);
@@ -114,11 +138,13 @@ int PMPI_Send(const void *buf, int count, MPI_Datatype datatype,
 
 // The body of MPI_Isend, or of MPI_Issend if synchronous.  The caller has
 // waited out the P2P drain (see MPI_Isend) and called
-// LOWER_HALF_DISABLE_CKPT().
+// LOWER_HALF_DISABLE_CKPT().  With 'done' (send_by_polling()), the request
+// is tested at once; if it completed, *done is set and *request is not a
+// virtual request.
 static int
 MPI_Isend_internal(const void *buf, int count, MPI_Datatype datatype,
                    int dest, int tag, MPI_Comm comm, MPI_Request *request,
-                   bool synchronous = false)
+                   bool synchronous, int *done)
 {
   int retval;
   if (dest != MPI_PROC_NULL) {
@@ -146,6 +172,13 @@ MPI_Isend_internal(const void *buf, int count, MPI_Datatype datatype,
     printf("rank %d sends %d bytes to rank %d\n", g_world_rank, count * size, worldRank);
     fflush(stdout);
 #endif
+    if (done != NULL) {
+      MPI_Status status;
+      retval = test_lower_half_request(request, done, &status, P2P_SPIN_TESTS);
+      if (retval != MPI_SUCCESS || *done) {
+        return retval;
+      }
+    }
     // Virtualize request.  An MPI_Issend to MPI_PROC_NULL needs no ack.
     *request = new_virt_request(*request);
     mpi_req_t type = synchronous && dest != MPI_PROC_NULL ? ISSEND_REQUEST
@@ -399,9 +432,13 @@ retry:
 }
 
 // The body of MPI_Irecv.  The caller has called LOWER_HALF_DISABLE_CKPT().
+// With 'done' and 'done_status' (recv_by_polling()), the request is tested
+// at once; if it completed, *done is set, the message counted, and
+// *done_status holds its status.
 static int
 MPI_Irecv_internal(void *buf, int count, MPI_Datatype datatype,
-                   int source, int tag, MPI_Comm comm, MPI_Request *request)
+                   int source, int tag, MPI_Comm comm, MPI_Request *request,
+                   int *done, MPI_Status *done_status)
 {
   int retval;
   int flag = 0;
@@ -452,6 +489,20 @@ MPI_Irecv_internal(void *buf, int count, MPI_Datatype datatype,
   retval = NEXT_FUNC(Irecv)(buf, count, realType,
                             source, tag, realComm, request);
   RETURN_TO_UPPER_HALF();
+  if (retval == MPI_SUCCESS && done != NULL) {
+    retval = test_lower_half_request(request, done, done_status,
+                                     P2P_SPIN_TESTS);
+    if (retval != MPI_SUCCESS) {
+      return retval;
+    }
+    if (*done) {
+      // As MPI_Wait counts a completed MPI_Irecv (is_counted_irecv()).
+      if (source != MPI_PROC_NULL) {
+        count_received_message();
+      }
+      return retval;
+    }
+  }
   if (retval == MPI_SUCCESS) {
     *request = new_virt_request(*request);
     addPendingRequestToLog(IRECV_REQUEST, NULL, buf, count,

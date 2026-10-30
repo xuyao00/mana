@@ -47,21 +47,39 @@ status_or_null(MPI_Status *status)
 }
 
 // A completed MPI_Irecv counts as a received message, unless it was from
-// MPI_PROC_NULL.
+// MPI_PROC_NULL.  The callers hold the checkpoint gate, so the P2P drain does
+// not change the request's call meanwhile: no pending lock, no copy of the
+// call (getPendingCall()), for each message.
 static bool
 is_counted_irecv(MPI_Request request)
 {
-  mpi_nonblocking_call_t call;
-  return getPendingCall(request, &call) && call.type == IRECV_REQUEST &&
-         call.remote_node != MPI_PROC_NULL;
+  virt_id_entry *entry =
+    lookup_virt_id_entry((mana_mpi_handle){.request = request});
+  return entry != NULL &&
+         __atomic_load_n(&entry->call.type, __ATOMIC_RELAXED) ==
+           IRECV_REQUEST &&
+         entry->call.remote_node != MPI_PROC_NULL;
 }
 
-extern "C" {
-
-int MPI_Test_internal(MPI_Request *request, int *flag, MPI_Status *status,
-                      bool isRealRequest)
+int
+test_lower_half_request(MPI_Request *real_request, int *flag,
+                        MPI_Status *status, int tests)
 {
   int retval;
+  __typeof__(&MPI_Test) test = NEXT_FUNC(Test);
+  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
+  do {
+    retval = test(real_request, flag, status);
+  } while (retval == MPI_SUCCESS && !*flag && --tests > 0);
+  RETURN_TO_UPPER_HALF();
+  return retval;
+}
+
+// MPI_Test_internal(), with up to 'tests' calls of MPI_Test.
+static int
+test_internal(MPI_Request *request, int *flag, MPI_Status *status,
+              bool isRealRequest, int tests)
+{
   MPI_Request real_request;
   if (isRealRequest) {
     real_request = *request;
@@ -75,12 +93,16 @@ int MPI_Test_internal(MPI_Request *request, int *flag, MPI_Status *status,
       return MPI_SUCCESS;
     }
   }
-  JUMP_TO_LOWER_HALF(lh_info->fsaddr);
   // MPI_Test can change the *request argument
-  retval = NEXT_FUNC(Test)(&real_request, flag, status);
+  return test_lower_half_request(&real_request, flag, status, tests);
+}
 
-  RETURN_TO_UPPER_HALF();
-  return retval;
+extern "C" {
+
+int MPI_Test_internal(MPI_Request *request, int *flag, MPI_Status *status,
+                      bool isRealRequest)
+{
+  return test_internal(request, flag, status, isRealRequest, 1);
 }
 
 #pragma weak MPI_Test = PMPI_Test
@@ -374,7 +396,7 @@ int PMPI_Wait(MPI_Request *request, MPI_Status *status)
   // or a restart can change the real request while we poll.
   while (!flag) {
     LOWER_HALF_DISABLE_CKPT();
-    retval = MPI_Test_internal(request, &flag, statusPtr, false);
+    retval = test_internal(request, &flag, statusPtr, false, P2P_SPIN_TESTS);
     // Updating global counter of recv bytes
     // FIXME: This if statement should be merged into
     // clearPendingRequestFromLog()

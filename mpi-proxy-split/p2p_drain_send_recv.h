@@ -118,6 +118,18 @@ extern volatile bool p2p_dummy_phase;
 enum p2p_wait_t { P2P_WAIT_BLOCKING, P2P_WAIT_POLLING };
 extern p2p_wait_t g_p2p_wait;
 
+// In polling mode, MANA's MPI_Wait, MPI_Send and MPI_Recv call MPI_Test up to
+// P2P_SPIN_TESTS times per visit to the lower half, inside one section of
+// LOWER_HALF_DISABLE_CKPT(): a visit switches the FS register twice (27 ns
+// on Perlmutter's AMD CPUs).  A checkpoint waits for the section to end,
+// some tens of microseconds.
+#define P2P_SPIN_TESTS 128
+
+// MPI_Test on a real request, until it completes or 'tests' times, in one
+// visit to the lower half.  'status' is not MPI_STATUS_IGNORE.
+int test_lower_half_request(MPI_Request *real_request, int *flag,
+                            MPI_Status *status, int tests);
+
 void initialize_drain_send_recv();
 void registerLocalSendsAndRecvs();
 
