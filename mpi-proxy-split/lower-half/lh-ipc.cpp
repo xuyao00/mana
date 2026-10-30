@@ -76,6 +76,9 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int enabled;
 static int verbose;
+// The real pid, for the handles: GTL asks for a handle per message, and a
+// syscall costs 0.4 us on Perlmutter.
+static int my_pid;
 
 // libcuda's functions: the next definitions after this executable's.
 static struct {
@@ -84,7 +87,6 @@ static struct {
   decltype(&cuIpcCloseMemHandle) ipc_close;
   decltype(&cuPointerGetAttribute) attr;
   decltype(&cuPointerGetAttributes) attrs;
-  decltype(&cuMemGetAddressRange_v2) range;
   decltype(&cuMemRetainAllocationHandle) retain;
   decltype(&cuMemExportToShareableHandle) export_fd;
   decltype(&cuMemImportFromShareableHandle) import_fd;
@@ -130,6 +132,7 @@ lh_ipc_init()
 {
   const char *v = getenv("MANA_CUDA_VERBOSE");
   verbose = v != NULL && v[0] != '\0' && v[0] != '0';
+  my_pid = (int)syscall(SYS_getpid);
 #define REAL(field, name) \
   real.field = (decltype(real.field))dlsym(RTLD_NEXT, #name)
   REAL(ipc_get, cuIpcGetMemHandle);
@@ -137,7 +140,6 @@ lh_ipc_init()
   REAL(ipc_close, cuIpcCloseMemHandle);
   REAL(attr, cuPointerGetAttribute);
   REAL(attrs, cuPointerGetAttributes);
-  REAL(range, cuMemGetAddressRange_v2);
   REAL(retain, cuMemRetainAllocationHandle);
   REAL(export_fd, cuMemExportToShareableHandle);
   REAL(import_fd, cuMemImportFromShareableHandle);
@@ -171,17 +173,6 @@ next(void **fn, const char *name)
 #define NEXT(field, name) \
   ((decltype(real.field))next((void **)&real.field, #name))
 
-// The buffer id of the allocation that contains 'p', or 0.
-static unsigned long long
-buffer_id(CUdeviceptr p)
-{
-  unsigned long long id = 0;
-  if (real.attr(&id, CU_POINTER_ATTRIBUTE_BUFFER_ID, p) != CUDA_SUCCESS) {
-    return 0;
-  }
-  return id;
-}
-
 // Whether 'p' is VMM memory that can be exported as a POSIX fd.
 static int
 vmm_posix_fd_memory(CUdeviceptr p)
@@ -212,19 +203,29 @@ cuIpcGetMemHandle(CUipcMemHandle *pHandle, CUdeviceptr dptr)
   if (!enabled || pHandle == NULL) {
     return NEXT(ipc_get, cuIpcGetMemHandle)(pHandle, dptr);
   }
-  CUdeviceptr base;
-  size_t size;
-  CUresult rc = real.range(&base, &size, dptr);
+  // GTL asks for a handle per message: one driver call.  For VMM memory, the
+  // MAPPING attributes give the allocation's range, as cuMemGetAddressRange
+  // does; the RANGE attributes give the whole reservation.  For a pointer
+  // that the driver does not know, the call succeeds with zeros.
+  CUpointer_attribute which[4] = { CU_POINTER_ATTRIBUTE_MAPPING_BASE_ADDR,
+                                   CU_POINTER_ATTRIBUTE_MAPPING_SIZE,
+                                   CU_POINTER_ATTRIBUTE_BUFFER_ID,
+                                   CU_POINTER_ATTRIBUTE_ALLOWED_HANDLE_TYPES };
+  CUdeviceptr base = 0;
+  size_t size = 0;
+  unsigned long long id = 0;
+  unsigned long long types = 0;
+  void *data[4] = { &base, &size, &id, &types };
+  CUresult rc = real.attrs(4, which, data, dptr);
   if (rc != CUDA_SUCCESS) {
     return rc;
   }
-  if (!vmm_posix_fd_memory(base)) {
+  if (size == 0 || !(types & CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR)) {
     return real.ipc_get(pHandle, dptr);
   }
   pthread_mutex_lock(&lock);
   // The application may have freed the memory of an export, and the front
-  // may have given its address to another allocation.
-  unsigned long long id = buffer_id(base);
+  // may have given its address to another allocation: the buffer id differs.
   Export *e = NULL;
   for (int i = 0; i < n_exports && e == NULL; i++) {
     if (exports[i].on && exports[i].base == base) {
@@ -254,8 +255,7 @@ cuIpcGetMemHandle(CUipcMemHandle *pHandle, CUdeviceptr dptr)
     vlog("export %#llx (%zu bytes) as fd %d\n", (unsigned long long)base, size,
          fd);
   }
-  VirtIpcHandle v = { VIPC_MAGIC, (int)syscall(SYS_getpid), e->fd, e->size,
-                      e->id };
+  VirtIpcHandle v = { VIPC_MAGIC, my_pid, e->fd, e->size, e->id };
   pthread_mutex_unlock(&lock);
   memset(pHandle, 0, sizeof *pHandle);
   memcpy(pHandle, &v, sizeof v);
