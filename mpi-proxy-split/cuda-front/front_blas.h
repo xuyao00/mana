@@ -42,9 +42,14 @@ front_translate(cublasHandle_t handle)
   return (cublasHandle_t)front_real_obj(handle, FRONT_BLAS);
 }
 
+// A cuBLAS handle is a cuBLASLt handle too, cast (PyTorch passes one so).
 static inline cublasLtHandle_t
 front_translate(cublasLtHandle_t handle)
 {
+  const FrontObj *obj = (const FrontObj *)handle;
+  if (obj != NULL && obj->magic == FRONT_MAGIC && obj->kind == FRONT_BLAS) {
+    return (cublasLtHandle_t)obj->real;
+  }
   return (cublasLtHandle_t)front_real_obj(handle, FRONT_BLASLT);
 }
 
