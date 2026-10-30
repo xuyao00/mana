@@ -1161,10 +1161,17 @@ static int restoreMemoryArea(int fd, DmtcpCkptHeader *ckptHdr)
   if ((area.properties & DMTCP_ZERO_PAGE) != 0) {
     TRACE("restoring zero-paged anonymous area, {} bytes at {}", area.size,
           (void*)area.addr);
-    // No need to mmap since the region has already been mmapped by the parent
-    // header.
-    // Just restore write-protection if needed.
-    if (!(area.prot & PROT_WRITE)) {
+    if ((area.properties & DMTCP_ZERO_PAGE_CHILD_HEADER) == 0) {
+      // A zero area of its own, without a parent header: DMTCP saves the
+      // nscd mappings so, and the upper half's libc may use one again.
+      // reserve_memory_areas() mapped it, but release_reserved_memory()
+      // unmapped it.
+      mmappedat = restore_mmap(area.addr, area.size, area.prot,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+      ASSERT(mmappedat == area.addr, "mmappedat={} addr={}", mmappedat,
+             (void*)area.addr);
+    } else if (!(area.prot & PROT_WRITE)) {
+      // The parent header mapped it: just restore write-protection if needed.
       ASSERT_ERRNO(mprotect(area.addr, area.size, area.prot) == 0,
                    "addr={} size={}", (void*)area.addr, area.size);
     }
