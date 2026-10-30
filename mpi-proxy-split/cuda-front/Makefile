@@ -2,7 +2,8 @@
 # (cuda/DESIGN-lower-half-cuda.md): MANA's libcudart.so.<N> and libcuda.so.1,
 # generated from the real libraries that bin/lower-half uses
 # (gen-cuda-front.py), the same for cuBLAS, cuBLASLt, cuFFT and cuRAND if
-# the toolkit has them and for NCCL if configure found it, and libmana_cuda.so,
+# the toolkit has them, for NCCL if configure found it, and for the driver's
+# NVML, and libmana_cuda.so,
 # which they all jump into.  All are
 # installed in lib/dmtcp/cuda-front/.
 
@@ -73,6 +74,13 @@ ifneq (${REAL_LIBNCCL},)
   NCCL_SONAME := $(call soname,${REAL_LIBNCCL})
 endif
 
+# NVML (front_nvml.h), the driver's, which ldconfig finds.
+REAL_LIBNVML ?= $(shell /sbin/ldconfig -p 2>/dev/null | \
+                  awk '/libnvidia-ml\.so\.1 / {print $$NF; exit}')
+ifneq (${REAL_LIBNVML},)
+  NVML_SONAME := $(call soname,${REAL_LIBNVML})
+endif
+
 INSTALL_DIR = ${MANA_ROOT}/lib/dmtcp/cuda-front
 STUB_INSTALL_DIR = ${MANA_ROOT}/lib/dmtcp/cuda-stub
 
@@ -92,10 +100,11 @@ FRONT_OBJS = front_core.o front_vmm.o front_objs.o front_drv.o \
                gen/cublasLt-gen.o) \
              $(if ${CUFFT_SONAME},front_fft.o gen/cufft-gen.o) \
              $(if ${CURAND_SONAME},front_rand.o gen/curand-gen.o) \
-             $(if ${NCCL_SONAME},front_nccl.o gen/nccl-gen.o)
+             $(if ${NCCL_SONAME},front_nccl.o gen/nccl-gen.o) \
+             $(if ${NVML_SONAME},gen/nvml-gen.o)
 FRONT_LIBS = ${CUDART_SONAME} libcuda.so.1 ${CUBLAS_SONAME} \
              ${CUBLASLT_SONAME} ${CUFFT_SONAME} ${CURAND_SONAME} \
-             ${NCCL_SONAME}
+             ${NCCL_SONAME} ${NVML_SONAME}
 # Without --cuda, the upper half loads stubs in place of libcudart and
 # libcuda (../mana_audit.c): each function aborts with its name.
 STUB_LIBS = stub/${CUDART_SONAME} stub/libcuda.so.1
@@ -168,11 +177,20 @@ gen/nccl-gen.cpp gen/nccl-tramp.S gen/nccl.map gen/nccl-index.h: \
 	  --out-dir=gen --header=nccl.h --cxx=g++ --cflags="${GEN_CFLAGS}" \
 	  --own=nccl-own.txt --pass=nccl-pass.txt --include=front_nccl.h
 
+# NVML: every function that nvml.h declares is forwarded (front_nvml.h).
+gen/nvml-gen.cpp gen/nvml-tramp.S gen/nvml.map gen/nvml-index.h: \
+    gen-cuda-front.py front_nvml.h ${REAL_LIBNVML}
+	python3 gen-cuda-front.py --real=${REAL_LIBNVML} --prefix=nvml \
+	  --out-dir=gen --header=front_nvml.h --cxx=g++ \
+	  --cflags="${GEN_CFLAGS} -I. -I.. -I../lower-half -I${DMTCP_ROOT}/include" \
+	  --include=front_nvml.h
+
 front_blas.o gen/cublas-gen.o gen/cublasLt-gen.o: front_blas.h \
     gen/cublas-index.h gen/cublasLt-index.h
 front_fft.o: gen/cufft-index.h
 front_rand.o: gen/curand-index.h
 front_nccl.o gen/nccl-gen.o: front_nccl.h gen/nccl-index.h
+gen/nvml-gen.o: front_nvml.h gen/nvml-index.h
 
 %.o: %.cpp ${FRONT_HEADERS}
 	${CXX} ${FRONT_CXXFLAGS} -c -o $@ $<
@@ -223,6 +241,11 @@ ${NCCL_SONAME}: gen/nccl-tramp.o gen/nccl.map libmana_cuda.so
 	  -Wl,-soname,${NCCL_SONAME} -Wl,--version-script=gen/nccl.map \
 	  -Wl,-rpath,'$$ORIGIN' -Wl,-z,now
 
+${NVML_SONAME}: gen/nvml-tramp.o gen/nvml.map libmana_cuda.so
+	${CXX} -shared -o $@ gen/nvml-tramp.o libmana_cuda.so \
+	  -Wl,-soname,${NVML_SONAME} -Wl,--version-script=gen/nvml.map \
+	  -Wl,-rpath,'$$ORIGIN' -Wl,-z,now
+
 gen-stub/cudart-stub.S gen-stub/cudart.map: gen-cuda-front.py \
     ${REAL_LIBCUDART}
 	python3 gen-cuda-front.py --real=${REAL_LIBCUDART} --prefix=cudart \
@@ -268,6 +291,7 @@ install: default
 	  ${INSTALL_DIR}/libcurand.so)
 	$(if ${NCCL_SONAME},ln -sf ${NCCL_SONAME} ${INSTALL_DIR}/libnccl.so,\
 	  rm -f ${INSTALL_DIR}/libnccl.so*)
+	$(if ${NVML_SONAME},ln -sf ${NVML_SONAME} ${INSTALL_DIR}/libnvidia-ml.so)
 	cp -f libmana_cuda_audit.so ${MANA_ROOT}/lib/dmtcp/
 	mkdir -p ${STUB_INSTALL_DIR}
 	cp -f ${STUB_LIBS} ${STUB_INSTALL_DIR}/
@@ -277,6 +301,6 @@ install: default
 clean:
 	rm -rf gen gen-stub stub *.o libmana_cuda.so libcudart.so.* libcuda.so.1 \
 	  libcublas.so.* libcublasLt.so.* libcufft.so.* libcurand.so.* \
-	  libnccl.so.* libmana_cuda_audit.so
+	  libnccl.so.* libnvidia-ml.so.* libmana_cuda_audit.so
 
 .PHONY: default check-real install clean

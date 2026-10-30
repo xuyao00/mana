@@ -72,6 +72,14 @@ FRONT_TRANSLATED(cudaGraph_t);
 FRONT_TRANSLATED(cudaGraphNode_t);
 FRONT_TRANSLATED(cudaGraphExec_t);
 
+// The handle types of a library whose objects are all in the lower half and
+// which the front passes as they are, results too (NVML's: front_nvml.h).
+template <typename T>
+struct front_passed : std::false_type {};
+#define FRONT_PASSED(type) \
+  template <>              \
+  struct front_passed<type> : std::true_type {}
+
 // Whether the front can forward a parameter of type T as it is (after
 // translating the handles above).  Not: other handles, pointers to handles
 // (results), and callbacks, which run on the lower half's threads.
@@ -80,13 +88,14 @@ constexpr bool
 front_arg_ok()
 {
   using U = std::remove_cv_t<T>;
-  if constexpr (front_translated<U>::value) {
+  if constexpr (front_translated<U>::value || front_passed<U>::value) {
     return true;
   } else if constexpr (front_is_handle<U>()) {
     return false;
   } else if constexpr (std::is_pointer_v<U>) {
     using P = std::remove_cv_t<std::remove_pointer_t<U>>;
-    return !std::is_function_v<P> && !front_is_handle<P>();
+    return !std::is_function_v<P> &&
+           (!front_is_handle<P>() || front_passed<P>::value);
   }
   return true;
 }

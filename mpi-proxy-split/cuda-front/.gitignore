@@ -11,3 +11,4 @@ libcublasLt.so*
 libcufft.so*
 libcurand.so*
 libnccl.so*
+libnvidia-ml.so*
