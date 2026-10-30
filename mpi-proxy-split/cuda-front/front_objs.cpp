@@ -609,6 +609,38 @@ cudaSetDevice(int device)
   return rc;
 }
 
+// A reset of 'device': its init record and cudart_noted go, so that the
+// next call on it starts cudart and loads the application's modules again,
+// at its place in the creation order (front_note_cudart()).  Symbols may
+// then be elsewhere, and its peer access went with its context.
+void
+front_cudart_forget(int device)
+{
+  if (device < 0 || device >= 64) {
+    return;
+  }
+  std::lock_guard<std::mutex> guard(objs_lock);
+  for (FrontObj *o = obj_heads[FRONT_DEVICE], *next; o != NULL; o = next) {
+    next = o->next;
+    if (((DeviceInit *)o)->device == device) {
+      obj_unlink(o);
+    }
+  }
+  __atomic_store_n(&cudart_noted[device], false, __ATOMIC_RELEASE);
+  for (auto it = symbol_addresses.begin(); it != symbol_addresses.end();) {
+    it = it->first.first == device ? symbol_addresses.erase(it) : std::next(it);
+  }
+  for (auto it = peer_access.begin(); it != peer_access.end();) {
+    it = it->first.first == device ? peer_access.erase(it) : std::next(it);
+  }
+}
+
+extern "C" cudaError_t
+cudaDeviceReset(void)
+{
+  return (cudaError_t)front_reset_primary(current_device(), true);
+}
+
 extern "C" cudaError_t
 cudaSetDeviceFlags(unsigned int flags)
 {
@@ -1323,13 +1355,15 @@ cudaFuncSetCacheConfig(const void *func, enum cudaFuncCache cacheConfig)
 void
 front_objs_stash()
 {
-  {
-    std::lock_guard<std::mutex> guard(objs_lock);
-    for (int device = 0; device < 64; device++) {
-      if (!(front_devices_used & (1ULL << device))) {
-        continue;
-      }
-      front_use_device(device);
+  for (int device = 0; device < 64; device++) {
+    if (!(front_devices_used & (1ULL << device))) {
+      continue;
+    }
+    // Before the lock: front_note_cudart() takes it, for a device whose
+    // cudart has not started since a reset (or ever: a driver context's).
+    front_use_device(device);
+    {
+      std::lock_guard<std::mutex> guard(objs_lock);
       for (FrontObj *o = obj_heads[FRONT_FATBIN]; o != NULL; o = o->next) {
         for (Registration &r : ((Fatbin *)o)->regs) {
           if (!r.is_var || r.size == 0) {

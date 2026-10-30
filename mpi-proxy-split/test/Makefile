@@ -40,7 +40,7 @@ E2E_NOMPI = nompi
 NVCC = $(if $(filter yes,${MANA_CUDA}),${CUDA_HOME}/bin/nvcc)
 E2E_CUDA_MPI = cuda_aware cuda_threads cuda_driver cuda_async cuda_ipc \
                cuda_textures cuda_static cuda_static_stripped cuda_cublas \
-               cuda_cufft cuda_curand cuda_graphs cuda_linked
+               cuda_cufft cuda_curand cuda_graphs cuda_linked cuda_reset
 E2E_CUDA = $(if $(NVCC),cuda_nompi cuda_quiesce cuda_pools cuda_managed \
              cuda_drvgraphs \
              $(if $(filter yes,${MANA_MPI}),${E2E_CUDA_MPI}))
@@ -67,7 +67,7 @@ cuda_linked: p2p_ring.c mana_test.h
 	  -Wl,--no-as-needed -lcuda
 
 # With the shared CUDA runtime: the front stands for it under --cuda.
-cuda_aware cuda_async cuda_textures: %: %.cu mana_test.h
+cuda_aware cuda_async cuda_textures cuda_reset: %: %.cu mana_test.h
 	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $<
 
 # The libraries: their front libraries stand for them too.  configure's

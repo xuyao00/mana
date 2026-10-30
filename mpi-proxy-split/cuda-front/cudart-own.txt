@@ -3,6 +3,7 @@
 # gen-cuda-front.py.
 cudaSetDevice
 cudaSetDeviceFlags
+cudaDeviceReset
 cudaDeviceSetLimit
 cudaDeviceSetCacheConfig
 cudaGetErrorString

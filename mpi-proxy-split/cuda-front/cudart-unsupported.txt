@@ -3,8 +3,7 @@
 # Functions with other handles, handle results or callbacks in their types
 # abort without being listed here (front_auto.h).
 
-# They reset or tear down the device, or share it with other processes.
-cudaDeviceReset
+# They tear down the device, or share it with other processes.
 cudaThreadExit
 cudaIpcGetEventHandle
 cudaIpcOpenEventHandle

@@ -95,6 +95,11 @@ void front_peer_access(int device, int peer, unsigned flags, bool on)
 //
 // The record of a device's primary context, made on first use.
 Ctx *front_ctx_primary(int device) FRONT_HIDDEN;
+// cudaDeviceReset (runtime) or cuDevicePrimaryCtxReset: a cudaError_t or a
+// CUresult.
+int front_reset_primary(int device, bool runtime) FRONT_HIDDEN;
+// A reset of 'device': cudart starts on it again.  Not with objs_lock held.
+void front_cudart_forget(int device) FRONT_HIDDEN;
 // The record of a real context, or NULL (not with objs_lock held).
 Ctx *front_ctx_of_real(CUcontext real) FRONT_HIDDEN;
 // The calling thread's current context, or NULL.

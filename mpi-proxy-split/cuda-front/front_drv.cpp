@@ -861,6 +861,81 @@ cuDevicePrimaryCtxRetain(CUcontext *pctx, CUdevice dev)
   return rc;
 }
 
+// cudaDeviceReset, cuDevicePrimaryCtxReset: the device's primary context
+// loses all its objects.  In the lower half the MPI shares that context, as
+// it does natively, so a program resets only once it is done with MPI on
+// the device (OSU: after MPI_Finalize).  The front forgets the context's
+// objects as cuCtxDestroy does, and cudart starts on the device again at the
+// next call.  The front's own retain keeps the record; a reset does not
+// release retains, but the context may come back with another handle.
+int
+front_reset_primary(int device, bool runtime)
+{
+  if (device < 0 || device >= 64) {
+    return runtime ? (int)cudaErrorInvalidDevice
+                   : (int)CUDA_ERROR_INVALID_DEVICE;
+  }
+  FRONT_ENTER();
+  Ctx *ctx;
+  {
+    std::lock_guard<std::mutex> guard(objs_lock);
+    ctx = primaries[device];
+  }
+  CUcontext real = ctx != NULL ? (CUcontext)ctx->real : NULL;
+  CUresult drc;
+  if (real != NULL) {
+    // Its work first: the frees that wait for it, the memops' events.
+    CUcontext prev = NULL;
+    DRV_CALL(drc, DRV(cuCtxPushCurrent_v2)(real));
+    if (drc == CUDA_SUCCESS) {
+      DRV_CALL(drc, DRV(cuCtxSynchronize)());
+      DRV_CALL(drc, DRV(cuCtxPopCurrent_v2)(&prev));
+    }
+  }
+  front_vmm_reset(device);
+  int rc;
+  if (runtime) {
+    cudaError_t rrc;
+    FRONT_LH(rrc = REAL(cudaDeviceReset)());
+    rc = (int)rrc;
+  } else {
+    DRV_CALL(drc, DRV(cuDevicePrimaryCtxReset_v2)(device));
+    rc = (int)drc;
+  }
+  if (rc == 0) {
+    front_cudart_forget(device);
+    if (real != NULL) {
+      front_memops_forget(real);
+    }
+    if (ctx != NULL) {
+      std::lock_guard<std::mutex> guard(objs_lock);
+      drop_objects_of(ctx);
+      ctx->limits.clear();
+    }
+    if (real != NULL) {
+      CUcontext now = NULL;
+      DRV_CALL(drc, DRV(cuDevicePrimaryCtxRetain)(&now, device));
+      if (drc == CUDA_SUCCESS) {
+        DRV_CALL(drc, DRV(cuDevicePrimaryCtxRelease_v2)(device));
+        std::lock_guard<std::mutex> guard(objs_lock);
+        if (now != real) {
+          ctx_by_real.erase(real);
+          ctx->real = now;
+          ctx_by_real[now] = ctx;
+        }
+      }
+    }
+  }
+  FRONT_LEAVE();
+  return rc;
+}
+
+extern "C" CUresult
+cuDevicePrimaryCtxReset_v2(CUdevice dev)
+{
+  return (CUresult)front_reset_primary(dev, false);
+}
+
 extern "C" CUresult
 cuDevicePrimaryCtxRelease_v2(CUdevice dev)
 {

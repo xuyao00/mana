@@ -540,6 +540,31 @@ front_vmm_free_async(void *ptr, cudaStream_t real_stream, int *result)
   return true;
 }
 
+// A reset of 'device', after its work: the frees that wait for an event of
+// its context go now, as the events go with the context, and cudart starts
+// on the device again before the next allocation.  The allocations stay
+// mapped and live: the application may not use cudaMalloc's after a reset,
+// natively, and the allocator cannot tell them from cudaMallocAsync's,
+// which survive it.
+void
+front_vmm_reset(int device)
+{
+  std::lock_guard<std::mutex> guard(vmm_lock);
+  for (auto it = pending_frees.begin(); it != pending_frees.end();) {
+    auto a = allocs.upper_bound(it->ptr);
+    if (a == allocs.begin() || (--a)->second.device != device) {
+      ++it;
+      continue;
+    }
+    FRONT_LH(DRV(cuEventDestroy_v2)(it->event));
+    release_locked(it->ptr);
+    it = pending_frees.erase(it);
+  }
+  if (device >= 0 && device < 64) {
+    device_ready_gen[device] = 0;
+  }
+}
+
 // At launch, so that a wrong value fails there, not at a checkpoint.
 void
 front_vmm_init()

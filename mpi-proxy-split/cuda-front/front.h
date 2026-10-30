@@ -242,6 +242,8 @@ bool front_vmm_free(void *ptr, cudaError_t *result) FRONT_HIDDEN;
 // cudaFreeAsync, cuMemFreeAsync: free once 'real_stream' gets there.
 bool front_vmm_free_async(void *ptr, cudaStream_t real_stream, int *result)
   FRONT_HIDDEN;
+// A reset of 'device' (front_reset_primary()), after its work.
+void front_vmm_reset(int device) FRONT_HIDDEN;
 // At launch: reads MANA_CUDA_DEVICE_DATA.
 void front_vmm_init() FRONT_HIDDEN;
 // At a checkpoint: the contents of the live allocations into a file of the

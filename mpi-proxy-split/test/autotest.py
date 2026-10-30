@@ -149,6 +149,8 @@ TESTS = [
   # (cuda-front/front_vmm.cpp).
   Test("cuda_aware_host", 2, cuda=True, program="cuda_aware",
        reports="cuda_aware", env={"MANA_CUDA_DEVICE_DATA": "host"}),
+  # cudaDeviceReset in the run and at its end (cuda-front/front_drv.cpp).
+  Test("cuda_reset", 2, cuda=True),
   Test("cuda_nompi", 2, cuda=True, no_mpi=True),
   Test("cuda_pools", 2, cuda=True, no_mpi=True),
   Test("cuda_managed", 2, cuda=True, no_mpi=True),

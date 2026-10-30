@@ -13,6 +13,7 @@ cuCtxSetLimit
 cuCtxSetCacheConfig
 cuDevicePrimaryCtxRetain
 cuDevicePrimaryCtxRelease_v2
+cuDevicePrimaryCtxReset_v2
 cuDevicePrimaryCtxSetFlags_v2
 cuStreamGetCtx
 cuStreamGetCtx_ptsz
