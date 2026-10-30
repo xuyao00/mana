@@ -100,6 +100,9 @@ unlock_wrappers()
   }
 }
 static char *arena_base = NULL;
+// The first mapping above the arena when it was made: the lower half's
+// region starts there.
+static char *arena_end = NULL;
 
 static void* __mmap_wrapper(void * , size_t , int , int , int , off_t);
 static void patchLibc(int , char * , char *);
@@ -243,6 +246,15 @@ void remove_overlap_blocks(MmapInfo_t new_block, vector<MmapInfo_t> &blocks) {
   std::sort(blocks.begin(), blocks.end(), mem_compare);
 }
 
+static bool overlaps_blocks(MmapInfo_t block, const vector<MmapInfo_t> &blocks) {
+  for (const MmapInfo_t &b : blocks) {
+    if (b.addr < block.addr + block.len && block.addr < b.addr + b.len) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Calls fn(start, end) per mapping in /proc/self/maps until it returns true.
 template <typename Fn>
 static void for_each_mapping(Fn fn) {
@@ -309,6 +321,7 @@ void init_mem_arena(char *base)
     return start >= base;
   });
   free_blocks.push_back({arena_base, len});
+  arena_end = arena_base + len;
   // CUDA: keep the CUDA driver's preferred UVA range out of the
   // arena, so that the upper half's CUDA reserves it as in a native process.
   // cuCheckpointProcessRestore() fails (CUDA_ERROR_OUT_OF_MEMORY) for a
@@ -527,6 +540,20 @@ static void* __mmap_wrapper(void *addr, size_t length, int prot,
   static char *libc_base_addr = NULL;
   void *ret = MAP_FAILED;
   length = ROUND_UP(length, PAGE_SIZE);
+  if (arena_end != NULL && addr != NULL && (flags & MAP_FIXED) &&
+      (char*)addr >= arena_end) {
+    // In the lower half's region: exactly there, and the upper half's
+    // memory only over its own.  At a checkpoint, DMTCP replaces the lower
+    // half's libc's nscd mappings so with zero pages, through the upper
+    // half's libc; moved into the arena, they left that libc a dangling
+    // map.
+    ret = _real_mmap(addr, length, prot, flags, fd, offset);
+    MmapInfo_t block = {(char*)addr, length};
+    if (ret != MAP_FAILED && overlaps_blocks(block, allocated_blocks)) {
+      merge_overlap_blocks(block, allocated_blocks);
+    }
+    return ret;
+  }
 #ifdef MAP_FIXED_NOREPLACE
   if (addr != NULL && (flags & MAP_FIXED_NOREPLACE) && !(flags & MAP_FIXED)) {
     // "Exactly here, or fail with EEXIST": the caller checks the address.
@@ -641,7 +668,10 @@ static int __munmap_wrapper(void *addr, size_t length) {
     MmapInfo_t new_block = {(char*)addr,
                             (size_t)(new_block_end_addr - (char*)addr)};
     remove_overlap_blocks(new_block, allocated_blocks);
-    merge_overlap_blocks(new_block, free_blocks);
+    // The lower half's region (see __mmap_wrapper()) is not the arena's.
+    if (arena_end == NULL || (char*)addr < arena_end) {
+      merge_overlap_blocks(new_block, free_blocks);
+    }
   }
   return ret;
 }
