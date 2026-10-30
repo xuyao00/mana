@@ -292,16 +292,32 @@ reserve_cuda_slot(unsigned long long above)
   // The top-down area: from the lowest mapping above 'above' to the highest
   // one below the stack.  The gap under the stack is the stack's.
   std::vector<std::pair<unsigned long, unsigned long> > areas;
+  unsigned long stack = 0;
   char line[4096];
   while (fgets(line, sizeof line, maps) != NULL) {
     unsigned long start, end;
-    if (sscanf(line, "%lx-%lx", &start, &end) == 2 && start >= above &&
-        strstr(line, "[stack]") == NULL && strstr(line, "[vvar") == NULL &&
-        strstr(line, "[vdso]") == NULL && strstr(line, "[vsyscall]") == NULL) {
+    if (sscanf(line, "%lx-%lx", &start, &end) != 2 || start < above) {
+      continue;
+    }
+    if (strstr(line, "[stack]") != NULL) {
+      stack = start;
+    } else if (strstr(line, "[vvar") == NULL && strstr(line, "[vdso]") == NULL &&
+               strstr(line, "[vsyscall]") == NULL) {
       areas.push_back(std::make_pair(start, end));
     }
   }
   fclose(maps);
+  // The stack can be several mappings, of which only one is named [stack]
+  // (on two nodes on Perlmutter, after MPI_Init, its lower part is
+  // executable and a mapping of its own).  The others next to it are the
+  // stack too, and a plug under them would stop its growth.
+  while (stack != 0 && !areas.empty() && areas.back().first >= stack) {
+    areas.pop_back();
+  }
+  while (stack != 0 && !areas.empty() && areas.back().second == stack) {
+    stack = areas.back().first;
+    areas.pop_back();
+  }
   if (areas.empty()) {
     return;
   }
