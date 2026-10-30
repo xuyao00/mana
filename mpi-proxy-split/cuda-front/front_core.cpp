@@ -235,7 +235,8 @@ front_lh_dlsym(const char *library, const char *name)
 // A library that only the application uses (cuBLAS, cuFFT, ...) loads in
 // the lower half by its soname, through the lower half's search path; else
 // from the directory of the lower half's libcudart, where a toolkit keeps
-// it.  The MPI loaded libcudart and libcuda already.
+// it; else from where the front was made from it.  The MPI loaded libcudart
+// and libcuda already.
 static const char *
 front_lib_file(FrontLib *lib)
 {
@@ -250,6 +251,11 @@ front_lib_file(FrontLib *lib)
     if (front_lh_dlsym(path.c_str(), lib->names[0]) != NULL) {
       return strdup(path.c_str());
     }
+  }
+  // Else the one that the front was made from: NCCL's, which a program may
+  // find by its RUNPATH.
+  if (lib->built != NULL && front_lh_dlsym(lib->built, lib->names[0]) != NULL) {
+    return lib->built;
   }
   front_fatal("the lower half cannot load %s: put its directory on "
               "LD_LIBRARY_PATH\n", lib->soname);

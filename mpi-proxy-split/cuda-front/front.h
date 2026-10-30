@@ -54,6 +54,7 @@ struct FrontLib {
   int n;
   unsigned bound_gen;
   const char *file;      // what the lower half loads: soname, or a path
+  const char *built;     // the library that the front was made from
 };
 
 extern FrontLib front_cudart_lib FRONT_HIDDEN;

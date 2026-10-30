@@ -226,8 +226,8 @@ with open(os.path.join(out_dir, prefix + "-gen.cpp"), "w") as f:
     f.write('  "%s",\n' % name)
   f.write("};\n")
   f.write("static void *real[%d];\n" % max(len(entries), 1))
-  f.write('FrontLib front_%s_lib = { "%s", names, real, %d, 0, NULL };\n'
-          % (prefix, soname, len(entries)))
+  f.write('FrontLib front_%s_lib = { "%s", names, real, %d, 0, NULL, "%s" };\n'
+          % (prefix, soname, len(entries), os.path.abspath(real)))
   f.write("\nextern \"C\" void *const %s[] = {\n" % table)
   for i, (name, kind, base) in enumerate(entries):
     # The type of 'base': decltype() but for overloaded names.
