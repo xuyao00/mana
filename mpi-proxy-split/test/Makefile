@@ -63,18 +63,22 @@ mmap_threads: MPI_LDFLAGS += -pthread
 cuda_aware cuda_async cuda_textures: %: %.cu mana_test.h
 	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $<
 
-# The libraries: their front libraries stand for them too.
+# The libraries: their front libraries stand for them too.  configure's
+# CUDA_MATH_LIBDIR, where the toolkit does not keep them (the HPC SDK).
+CUDA_MATH_FLAGS = $(if $(CUDA_MATH_LIBDIR),-I$(CUDA_MATH_LIBDIR)/../include \
+                    -L$(CUDA_MATH_LIBDIR))
+
 cuda_cublas: %: %.cu mana_test.h
 	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $< \
-	  -lcublas -lcublasLt
+	  $(CUDA_MATH_FLAGS) -lcublas -lcublasLt
 
 cuda_cufft: %: %.cu mana_test.h
 	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $< \
-	  -lcufft
+	  $(CUDA_MATH_FLAGS) -lcufft
 
 cuda_curand: %: %.cu mana_test.h
 	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $< \
-	  -lcurand
+	  $(CUDA_MATH_FLAGS) -lcurand
 
 # cuda_aware with nvcc's default, a static CUDA runtime; and stripped.
 cuda_static: cuda_aware.cu mana_test.h

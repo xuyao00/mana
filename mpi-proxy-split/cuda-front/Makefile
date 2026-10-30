@@ -40,10 +40,12 @@ soname = $(shell readelf -d $(1) 2>/dev/null | \
            sed -n 's/.*soname: \[\(.*\)\]/\1/p')
 CUDART_SONAME := $(call soname,${REAL_LIBCUDART})
 
-# The application's libraries that run in the lower half too (Phase 3):
-# next to the lower half's libcudart, or in CUDA_MATH_LIBDIR (at NERSC, the
-# HPC SDK's math_libs).  cuBLAS needs cuBLASLt.
-CUDA_MATH_LIBDIR ?= $(dir $(realpath ${REAL_LIBCUDART}))
+# The application's libraries that run in the lower half too (Phase 3): in
+# CUDA_MATH_LIBDIR (configure's; at NERSC, the HPC SDK's math_libs), or else
+# next to the lower half's libcudart.  cuBLAS needs cuBLASLt.
+ifeq (${CUDA_MATH_LIBDIR},)
+  CUDA_MATH_LIBDIR := $(dir $(realpath ${REAL_LIBCUDART}))
+endif
 CUDA_MATH_INCLUDE ?= $(realpath ${CUDA_MATH_LIBDIR}/../include)
 real_lib = $(firstword $(wildcard ${CUDA_MATH_LIBDIR}/$(1).so.[0-9]*))
 REAL_LIBCUBLAS ?= $(call real_lib,libcublas)

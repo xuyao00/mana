@@ -3,6 +3,9 @@
 MANA_MPI = @MANA_MPI@
 MANA_CUDA = @MANA_CUDA@
 CUDA_HOME = @CUDA_HOME@
+# cuBLAS, cuFFT and cuRAND, whose fronts the CUDA front builds if they are
+# there (at NERSC, the HPC SDK's math_libs); empty: next to libcudart.
+CUDA_MATH_LIBDIR ?= @CUDA_MATH_LIBDIR@
 
 # The plain compilers, for what must not be linked with MPI (libmana.so,
 # bin/lower-half-nompi, libmpistub.so, the LD_AUDIT modules, dlopen_mpi).

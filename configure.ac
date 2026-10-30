@@ -156,8 +156,30 @@ if test "$with_cuda" != no; then
     AC_MSG_ERROR([--with-cuda: $mana_cuda_why])
   fi
 fi
+dnl The libraries that the front covers too (cuBLAS, cuFFT, cuRAND): next to
+dnl libcudart, or, in NVIDIA's HPC SDK (cudatoolkit at NERSC), in
+dnl math_libs/VERSION/lib64 beside cuda/VERSION.
+CUDA_MATH_LIBDIR=
+if test "$mana_cuda" = yes; then
+  AC_MSG_CHECKING([for the CUDA math libraries])
+  for mana_dir in "$CUDA_HOME/lib64" \
+      "$CUDA_HOME/../../math_libs/`basename "$CUDA_HOME"`/lib64" \
+      "$CUDA_HOME/../../math_libs/lib64"; do
+    if test -n "`ls $mana_dir/libcublas.so.[[0-9]]* 2>/dev/null`"; then
+      CUDA_MATH_LIBDIR=`cd "$mana_dir" && pwd`
+      break
+    fi
+  done
+  if test -n "$CUDA_MATH_LIBDIR"; then
+    mana_cuda_why="$mana_cuda_why; cuBLAS, cuFFT, cuRAND in $CUDA_MATH_LIBDIR"
+  else
+    mana_cuda_why="$mana_cuda_why; no cuBLAS, cuFFT, cuRAND"
+  fi
+  AC_MSG_RESULT([${CUDA_MATH_LIBDIR:-no}])
+fi
 AC_SUBST([MANA_CUDA], [$mana_cuda])
 AC_SUBST([CUDA_HOME])
+AC_SUBST([CUDA_MATH_LIBDIR])
 
 AC_CONFIG_FILES([Makefile \
                  manpages/Makefile \

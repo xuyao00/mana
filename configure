@@ -614,6 +614,7 @@ LIBOBJS
 PANDOC
 FFLAGS
 DEBUG
+CUDA_MATH_LIBDIR
 CUDA_HOME
 MANA_CUDA
 MANA_MPI
@@ -5936,6 +5937,26 @@ printf "%s\n" "$mana_cuda" >&6; }
   if test "$mana_cuda" = no && test "$with_cuda" != check; then
     as_fn_error $? "--with-cuda: $mana_cuda_why" "$LINENO" 5
   fi
+fi
+CUDA_MATH_LIBDIR=
+if test "$mana_cuda" = yes; then
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for the CUDA math libraries" >&5
+printf %s "checking for the CUDA math libraries... " >&6; }
+  for mana_dir in "$CUDA_HOME/lib64" \
+      "$CUDA_HOME/../../math_libs/`basename "$CUDA_HOME"`/lib64" \
+      "$CUDA_HOME/../../math_libs/lib64"; do
+    if test -n "`ls $mana_dir/libcublas.so.[0-9]* 2>/dev/null`"; then
+      CUDA_MATH_LIBDIR=`cd "$mana_dir" && pwd`
+      break
+    fi
+  done
+  if test -n "$CUDA_MATH_LIBDIR"; then
+    mana_cuda_why="$mana_cuda_why; cuBLAS, cuFFT, cuRAND in $CUDA_MATH_LIBDIR"
+  else
+    mana_cuda_why="$mana_cuda_why; no cuBLAS, cuFFT, cuRAND"
+  fi
+  { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: ${CUDA_MATH_LIBDIR:-no}" >&5
+printf "%s\n" "${CUDA_MATH_LIBDIR:-no}" >&6; }
 fi
 MANA_CUDA=$mana_cuda
 
