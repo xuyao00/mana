@@ -36,6 +36,8 @@
 #include <unistd.h>
 #include "front_objs.h"
 
+std::mutex front_kv_lock;
+
 namespace {
 
 #define IPC_MAGIC 0x4d414e41u  // "MANA"
@@ -71,7 +73,6 @@ typedef std::pair<uint64_t, uint64_t> ImportKey;  // (vpid, chunk)
 std::mutex ipc_lock;
 std::map<ImportKey, Import> imports;
 std::map<CUdeviceptr, ImportKey> imports_by_va;
-std::mutex kv_lock;
 
 // Without DMTCP's wrappers, which would take these pids for virtual ones.
 long
@@ -131,7 +132,7 @@ look_up(uint64_t vpid, uint64_t chunk, uint64_t *host, int *pid, int *fd)
   char db[64], key[64], val[128];
   kv_db(db, sizeof db);
   kv_key(key, sizeof key, vpid, chunk);
-  std::lock_guard<std::mutex> guard(kv_lock);
+  std::lock_guard<std::mutex> guard(front_kv_lock);
   unsigned long long h;
   return mana_kv_get(db, key, val, sizeof val) == 0 &&
          sscanf(val, "%llu:%d:%d", &h, pid, fd) == 3 && (*host = h, true);
@@ -299,7 +300,7 @@ publish(const FrontExport &e)
   kv_key(key, sizeof key, (uint64_t)getpid(), e.base);
   snprintf(val, sizeof val, "%llu:%d:%d", (unsigned long long)host_id(),
            real_pid(), e.fd);
-  std::lock_guard<std::mutex> guard(kv_lock);
+  std::lock_guard<std::mutex> guard(front_kv_lock);
   if (mana_kv_set(db, key, val) != 0) {
     front_fatal("publishing the CUDA IPC export %s\n", key);
   }

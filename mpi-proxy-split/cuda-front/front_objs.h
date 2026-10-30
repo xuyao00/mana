@@ -76,6 +76,11 @@ extern std::mutex objs_lock FRONT_HIDDEN;
 extern FrontObj *obj_heads[FRONT_N_KINDS] FRONT_HIDDEN;
 extern std::map<void *, Pinned> pinned FRONT_HIDDEN;
 
+// DMTCP's key-value store (mana_core.h): the application's threads share one
+// socket to the coordinator, so the front's callers take turns, inside the
+// checkpoint gate (front_ipc.cpp, front_nccl.cpp).
+extern std::mutex front_kv_lock FRONT_HIDDEN;
+
 // The file mapped at 'addr' (/proc/self/maps).
 bool front_mapped_file(const void *addr, std::string *path) FRONT_HIDDEN;
 

@@ -285,10 +285,13 @@ void front_note_cudart(int device) FRONT_HIDDEN;
 // device: cudart starts there first, with the application's modules.
 void front_before_library() FRONT_HIDDEN;
 
-// NCCL's drain at a checkpoint, and the end of its hold at a resume
-// (front_nccl.cpp, if MANA was built with NCCL).
+// NCCL's drain at a checkpoint, and the end of its hold at a resume; at a
+// restart, its new unique ids before the global barrier, and its
+// communicators after it (front_nccl.cpp, if MANA was built with NCCL).
 void front_nccl_drain() FRONT_HIDDEN __attribute__((weak));
 void front_nccl_resume() FRONT_HIDDEN __attribute__((weak));
+void front_nccl_publish() FRONT_HIDDEN __attribute__((weak));
+void front_nccl_rebuild() FRONT_HIDDEN __attribute__((weak));
 
 // Records of objects (front_objs.cpp).
 void front_objs_stash() FRONT_HIDDEN;

@@ -2,10 +2,8 @@
 # (front_nccl.h); every other one aborts with its name for now
 # (cuda/PLAN-nccl-front.md).  See gen-cuda-front.py.
 ncclGetVersion
-ncclGetUniqueId
 ncclGetErrorString
 ncclGetLastError
 ncclCommCount
 ncclCommCuDevice
 ncclCommUserRank
-ncclCommGetAsyncError

@@ -94,7 +94,8 @@ front_bad_handle(const void *handle, int kind)
                                        "cuBLAS handle", "cuBLASLt handle",
                                        "cuFFT plan", "cuRAND generator",
                                        "graph", "graph node",
-                                       "executable graph" };
+                                       "executable graph",
+                                       "NCCL communicator" };
   front_fatal("%p is not a %s that the front made\n", handle,
               kind > 0 && kind < FRONT_N_KINDS ? kinds[kind] : "handle");
 }
@@ -479,6 +480,9 @@ mana_cuda_event(int event)
         (void)rc;
       }
       front_ipc_publish();
+      if (front_nccl_publish != NULL) {
+        front_nccl_publish();
+      }
       // This thread gets a TLS of its own at its next call.
       if (&front_thread != initial_thread) {
         front_thread.fs = NULL;
@@ -487,6 +491,9 @@ mana_cuda_event(int event)
       break;
     case MANA_STEP_RESTART_PEERS:
       front_ipc_reimport();
+      if (front_nccl_rebuild != NULL) {
+        front_nccl_rebuild();
+      }
       break;
     case MANA_STEP_THREAD_EXIT:
       front_thread_exit();

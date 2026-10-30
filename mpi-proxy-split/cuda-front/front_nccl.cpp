@@ -21,10 +21,9 @@
 // NCCL (cuda/PLAN-nccl-front.md), in the lower half with its net plugin,
 // libfabric and GDRCopy, as cuFFT is.  The application's ncclComm_t is the
 // address of the communicator's record.  A record has what a restart needs
-// to make the communicator again (step 4 of the plan): how it was made, its
-// rank, size and device, the unique id or the parent, color and key, and
-// the config; and what the drain needs: the steps posted on it, and the
-// bytes sent to and received from each peer.
+// to make the communicator again: its name, rank, size and device, and its
+// config; and what the drain needs: the steps posted on it, and the bytes
+// sent to and received from each peer.
 //
 // The drain (front_nccl_drain(), at MANA_STEP_DRAIN, before MPI's drain
 // closes the lower half).  NCCL's kernels wait for every member of their
@@ -38,14 +37,22 @@
 // gate before NCCL operation k+1 never reaches an MPI_Send that a peer
 // waits for before it posts k.
 //
-// A resume changes nothing in the lower half, so the communicators stay.
-// A restart with one is refused until the rebuild exists (step 4).
+// A resume changes nothing in the lower half, so the communicators stay.  A
+// restart makes each again by ncclCommInitRank(Config), a split too (as
+// netsplit does), with a new unique id: the old one names a bootstrap root,
+// a thread of the old lower half.  Rank 0 of each communicator makes the new
+// id and publishes it under the communicator's name before a global barrier
+// (front_nccl_publish()); after it, every member makes the communicator
+// again (front_nccl_rebuild()).  A unique id that this process made and has
+// not used is made again too, for the ranks that call ncclCommInitRank with
+// it after the restart.
 
 #include <nccl.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -78,15 +85,19 @@ struct Comm : FrontObj {
   int rank;
   int device;
   ncclUniqueId id;       // INIT_RANK
-  Comm *parent;          // SPLIT
-  int color;
+  int color;             // SPLIT
   int key;
+  ncclComm_t parent_real;  // SPLIT, until NCCL has made it (wait_made())
   int clique;            // INIT_ALL: the call's number
+  // The config, for the restart; a split without one has its parent's, as
+  // NCCL gives it.
   bool has_config;
   ncclConfig_t config;
   std::string net_name;  // the config's strings, which are the application's
   std::string comm_name;
   bool nonblocking;      // config.blocking == 0
+  // Not made again at a restart (real is NULL then): the application may
+  // only destroy it.
   bool finalized;
   // Its name in the drain, the same in every member: a digest of the unique
   // id, or of the parent's name, the split's number on the parent and the
@@ -113,12 +124,16 @@ struct Comm : FrontObj {
 std::mutex nccl_lock;
 std::condition_variable gate_cv;
 std::vector<Comm *> comms;     // in creation order
-bool draining;                 // from front_nccl_drain() to the resume
+// From front_nccl_drain() to the resume or the restart, which clear it
+// without the lock (see enter()).
+std::atomic<bool> draining;
 bool frozen;                   // settled in the drain's last round
 bool creation_pending;         // a rank had a creation in flight at the vote
 int activity;                  // threads in a call, or in a group region
 int creating;                  // creations by unique id in flight here
 int cliques;
+// The names of the unique ids that this process made and has not used.
+std::vector<uint64_t> unused_ids;
 
 // The application's thread: its depth in group regions, and the
 // communicators that NCCL makes at the region's end.
@@ -218,7 +233,12 @@ enter(int64_t *count, int64_t n, bool create)
 {
   std::unique_lock<std::mutex> lock(nccl_lock);
   if (group_depth == 0) {
-    gate_cv.wait(lock, [] { return !gate_closed_locked(); });
+    // The resume and the restart open the gate without the lock, which a
+    // thread that DMTCP suspended here may hold; so a thread may miss
+    // their notify, and looks again now and then.
+    while (gate_closed_locked()) {
+      gate_cv.wait_for(lock, std::chrono::milliseconds(50));
+    }
   }
   if (count != NULL) {
     *count += n;
@@ -267,6 +287,7 @@ link_comm(Comm *c)
     NCCL_LH(NCCL(ncclCommCuDevice)(real, &c->device));
   }
   c->ctx = front_object_ctx();
+  c->parent_real = NULL;
   c->target = -1;
   size_t n = c->nranks > 0 ? c->nranks : 0;
   c->sent.assign(n, 0);
@@ -279,6 +300,57 @@ link_comm(Comm *c)
   }
   std::lock_guard<std::mutex> guard(nccl_lock);
   comms.push_back(c);
+  if (c->made == INIT_RANK) {
+    // Its members have met at the unique id's bootstrap root.
+    unused_ids.erase(std::remove(unused_ids.begin(), unused_ids.end(),
+                                 c->ident),
+                     unused_ids.end());
+  }
+}
+
+// A non-blocking split returns ncclInProgress, and NCCL writes the new
+// communicator later, from the job that makes it.  The front waits for it,
+// and for it to be ready, since the record needs its size and rank: such a
+// split blocks.  A non-blocking ncclCommInitRankConfig does not: NCCL
+// writes its communicator at once, and the record knows the rest.  False
+// if NCCL failed to make it.
+bool
+wait_made(Comm *c)
+{
+  auto start = std::chrono::steady_clock::now();
+  for (;; usleep(100)) {
+    ncclComm_t real = (ncclComm_t)__atomic_load_n(&c->real, __ATOMIC_ACQUIRE);
+    ncclResult_t state = ncclInProgress;
+    ncclResult_t rc = ncclSuccess;
+    if (real != NULL) {
+      NCCL_LH(rc = NCCL(ncclCommGetAsyncError)(real, &state));
+      if (rc != ncclSuccess) {
+        return false;
+      }
+      if (state != ncclInProgress) {
+        return state == ncclSuccess;
+      }
+      continue;
+    }
+    if (c->parent_real != NULL) {
+      NCCL_LH(rc = NCCL(ncclCommGetAsyncError)(c->parent_real, &state));
+      if (rc != ncclSuccess ||
+          (state != ncclSuccess && state != ncclInProgress)) {
+        return false;
+      }
+    }
+    // The job is done, and has written no communicator.
+    if (state == ncclSuccess && std::chrono::steady_clock::now() - start >
+                                  std::chrono::seconds(10)) {
+      return false;
+    }
+  }
+}
+
+bool
+pending(const Comm *c, ncclResult_t rc)
+{
+  return c->real == NULL || (rc == ncclInProgress && c->made == SPLIT);
 }
 
 // A creation's record: linked now, or at the end of the group region it is
@@ -293,12 +365,15 @@ made_comm(Comm *c, ncclResult_t rc)
     group_made->push_back(c);
     return (ncclComm_t)c;
   }
-  if (posted(rc) && c->real != NULL) {
-    link_comm(c);
-    return (ncclComm_t)c;
+  if (!posted(rc)) {
+    delete c;
+    return NULL;
   }
-  delete c;
-  return NULL;
+  if (pending(c, rc) && !wait_made(c)) {
+    return NULL;  // not deleted: NCCL may write into it yet
+  }
+  link_comm(c);
+  return (ncclComm_t)c;
 }
 
 // The outermost ncclGroupEnd.  Its creations by unique id are no longer in
@@ -312,11 +387,11 @@ end_group(ncclResult_t rc)
   if (made != NULL) {
     for (Comm *c : *made) {
       unique += c->made == INIT_RANK;
-      if (posted(rc) && c->real != NULL) {
-        link_comm(c);
-      } else {
+      if (!posted(rc)) {
         delete c;
-      }
+      } else if (!pending(c, rc) || wait_made(c)) {
+        link_comm(c);
+      }  // else not deleted: NCCL may write into it yet
     }
     delete made;
   }
@@ -338,13 +413,8 @@ keep_config(Comm *c, const ncclConfig_t *config)
   c->nonblocking = config->blocking == 0;
 }
 
-void
-nccl_restore(FrontObj *obj)
-{
-  (void)obj;
-  front_fatal("restarting with an NCCL communicator: not supported yet\n");
-}
-
+// The communicators are not in the restart's replay of the records: they
+// are made again after a global barrier (front_nccl_rebuild()).
 void
 nccl_settle()
 {
@@ -356,8 +426,8 @@ nccl_forget(Ctx *ctx)
   (void)ctx;
 }
 
-const FrontLibRecords nccl_records = { nccl_restore, nccl_settle,
-                                       nccl_forget, NULL, NULL };
+const FrontLibRecords nccl_records = { NULL, nccl_settle, nccl_forget, NULL,
+                                       NULL };
 
 __attribute__((constructor)) void
 register_records()
@@ -495,7 +565,7 @@ in_progress()
   {
     std::lock_guard<std::mutex> guard(nccl_lock);
     for (Comm *c : comms) {
-      if (!c->destroyed && c->nonblocking) {
+      if (!c->destroyed && c->nonblocking && c->real != NULL) {
         reals.push_back((ncclComm_t)c->real);
       }
     }
@@ -641,6 +711,190 @@ report_owed(long seconds)
   fflush(stderr);
 }
 
+// ---- The restart ----
+
+// The unique ids made at this restart, in DMTCP's key-value store: under
+// u/<name>, a communicator's; under g/<name>, the one that replaces a unique
+// id that its maker had not used.
+void
+restart_db(char *db, size_t size)
+{
+  snprintf(db, size, "mana-nccl-%u", front_gen);
+}
+
+void
+to_hex(const ncclUniqueId &id, char *hex)
+{
+  const unsigned char *p = (const unsigned char *)&id;
+  for (size_t i = 0; i < sizeof id; i++) {
+    snprintf(hex + 2 * i, 3, "%02x", p[i]);
+  }
+}
+
+bool
+from_hex(const char *hex, ncclUniqueId *id)
+{
+  if (strlen(hex) != 2 * sizeof *id) {
+    return false;
+  }
+  unsigned char *p = (unsigned char *)id;
+  for (size_t i = 0; i < sizeof *id; i++) {
+    unsigned byte;
+    if (sscanf(hex + 2 * i, "%2x", &byte) != 1) {
+      return false;
+    }
+    p[i] = byte;
+  }
+  return true;
+}
+
+void
+publish_new_id(const char *db, char kind, uint64_t ident)
+{
+  ncclUniqueId id;
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclGetUniqueId)(&id));
+  if (rc != ncclSuccess) {
+    front_fatal("making an NCCL unique id again: error %d\n", rc);
+  }
+  char k[32], hex[2 * sizeof id + 1];
+  key(k, sizeof k, kind, ident);
+  to_hex(id, hex);
+  if (mana_kv_set(db, k, hex) != 0) {
+    front_fatal("publishing NCCL unique id %s\n", k);
+  }
+}
+
+// In ncclCommInitRank(Config), within the checkpoint gate: the unique id
+// that replaces one made before the last restart, which its maker had not
+// used then.
+void
+renewed_id(uint64_t ident, ncclUniqueId *id)
+{
+  if (front_gen == 1) {
+    return;
+  }
+  char db[32], k[32], hex[2 * sizeof *id + 1];
+  restart_db(db, sizeof db);
+  key(k, sizeof k, 'g', ident);
+  std::lock_guard<std::mutex> guard(front_kv_lock);
+  ncclUniqueId now;
+  if (mana_kv_get(db, k, hex, sizeof hex) == 0 && from_hex(hex, &now)) {
+    *id = now;
+    front_log("NCCL: unique id %016llx was made again at the restart\n",
+              (unsigned long long)ident);
+  }
+}
+
+// The config that a communicator was made with, its strings the record's.
+ncclConfig_t
+config_of(const Comm *c)
+{
+  ncclConfig_t config = c->config;
+  config.netName = c->net_name.empty() ? NULL : c->net_name.c_str();
+  config.commName = c->comm_name.empty() ? NULL : c->comm_name.c_str();
+  return config;
+}
+
+// A clique of ncclCommInitAll again, by one call: it is in this process
+// alone.  The drain brings its communicators to the same step, so all of
+// them are finalized, or none.  Returns how many it made.
+size_t
+rebuild_clique(int clique)
+{
+  std::vector<Comm *> members;
+  for (Comm *c : comms) {
+    if (!c->destroyed && c->made == INIT_ALL && c->clique == clique) {
+      members.push_back(c);
+    }
+  }
+  if (members.empty() || members[0]->finalized) {
+    return 0;
+  }
+  std::sort(members.begin(), members.end(),
+            [](Comm *a, Comm *b) { return a->rank < b->rank; });
+  int n = (int)members.size();
+  std::vector<int> devlist(n);
+  for (int i = 0; i < n; i++) {
+    if (members[i]->rank != i) {
+      front_fatal("NCCL clique %d lacks rank %d\n", clique, i);
+    }
+    devlist[i] = members[i]->device;
+  }
+  std::vector<ncclComm_t> real(n);
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclCommInitAll)(real.data(), n, devlist.data()));
+  if (rc != ncclSuccess) {
+    front_fatal("making NCCL clique %d again: error %d\n", clique, rc);
+  }
+  for (int i = 0; i < n; i++) {
+    members[i]->real = real[i];
+  }
+  return n;
+}
+
+// The communicators made by unique id or split, blocking or not, in one
+// group region: NCCL makes them together at ncclGroupEnd, so the members
+// need not agree on an order.  (NCCL refuses a region with both kinds.)
+size_t
+rebuild_group(const char *db, bool nonblocking)
+{
+  std::vector<Comm *> todo;
+  for (Comm *c : comms) {
+    if (!c->destroyed && !c->finalized && c->made != INIT_ALL &&
+        c->nonblocking == nonblocking) {
+      todo.push_back(c);
+    }
+  }
+  if (todo.empty()) {
+    return 0;
+  }
+  std::vector<ncclUniqueId> ids(todo.size());
+  std::vector<ncclConfig_t> configs(todo.size());
+  for (size_t i = 0; i < todo.size(); i++) {
+    char k[32], hex[2 * sizeof(ncclUniqueId) + 1];
+    key(k, sizeof k, 'u', todo[i]->ident);
+    if (mana_kv_get(db, k, hex, sizeof hex) != 0 ||
+        !from_hex(hex, &ids[i])) {
+      front_fatal("NCCL communicator %016llx: its rank 0 did not make it "
+                  "again\n", (unsigned long long)todo[i]->ident);
+    }
+    configs[i] = config_of(todo[i]);
+  }
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclGroupStart)());
+  for (size_t i = 0; i < todo.size() && posted(rc); i++) {
+    Comm *c = todo[i];
+    front_use_device(c->device);
+    c->real = NULL;
+    ncclComm_t *real = (ncclComm_t *)&c->real;
+    if (c->has_config) {
+      NCCL_LH(rc = NCCL(ncclCommInitRankConfig)(real, c->nranks, ids[i],
+                                                c->rank, &configs[i]));
+    } else {
+      NCCL_LH(rc = NCCL(ncclCommInitRank)(real, c->nranks, ids[i], c->rank));
+    }
+  }
+  ncclResult_t end_rc;
+  NCCL_LH(end_rc = NCCL(ncclGroupEnd)());
+  if (posted(rc)) {
+    rc = end_rc;
+  }
+  if (!posted(rc)) {
+    front_fatal("making %zu NCCL communicator(s) again: error %d\n",
+                todo.size(), rc);
+  }
+  if (nonblocking) {
+    for (Comm *c : todo) {
+      if (!wait_made(c)) {  // made in the background
+        front_fatal("making NCCL communicator %016llx again failed\n",
+                    (unsigned long long)c->ident);
+      }
+    }
+  }
+  return todo.size();
+}
+
 }  // namespace
 
 // MANA_STEP_DRAIN, before MPI's drain, with the application's threads
@@ -739,17 +993,78 @@ front_nccl_drain()
   }
 }
 
-// MANA_STEP_RESUME: the gate opens.
+// MANA_STEP_RESUME: the gate opens.  Without the lock, which a thread that
+// DMTCP suspended at the gate may hold (see enter()).
 void
 front_nccl_resume()
 {
-  {
-    std::lock_guard<std::mutex> guard(nccl_lock);
-    draining = false;
-    frozen = false;
-    creation_pending = false;
-  }
+  draining = false;
   gate_cv.notify_all();
+}
+
+// MANA_STEP_RESTART, before the global barrier: the new unique ids, which
+// this process makes for the communicators where it is rank 0, and for the
+// unique ids that it made and had not used.  Without nccl_lock, as below:
+// the application's threads are not running, and one may hold it.
+void
+front_nccl_publish()
+{
+  char db[32];
+  restart_db(db, sizeof db);
+  for (Comm *c : comms) {
+    if (!c->destroyed && !c->finalized && c->made != INIT_ALL &&
+        c->rank == 0) {
+      publish_new_id(db, 'u', c->ident);
+    }
+  }
+  for (uint64_t ident : unused_ids) {
+    publish_new_id(db, 'g', ident);
+  }
+}
+
+// MANA_STEP_RESTART_PEERS, after the barrier: the communicators again, then
+// the gate opens.
+void
+front_nccl_rebuild()
+{
+  if (!comms.empty()) {
+    auto start = std::chrono::steady_clock::now();
+    char db[32];
+    restart_db(db, sizeof db);
+    for (Comm *c : comms) {
+      if (c->finalized) {
+        c->real = NULL;  // not made again
+      }
+    }
+    size_t n = 0;
+    for (int clique = 0; clique < cliques; clique++) {
+      n += rebuild_clique(clique);
+    }
+    n += rebuild_group(db, false);
+    n += rebuild_group(db, true);
+    std::chrono::duration<double> took =
+      std::chrono::steady_clock::now() - start;
+    front_log("NCCL: %zu of %zu communicator(s) made again in %.2f s\n", n,
+              comms.size(), took.count());
+  }
+  draining = false;
+  gate_cv.notify_all();
+}
+
+// A unique id names its bootstrap root, a thread of this lower half; this
+// process makes one again at a restart until it has used it.
+extern "C" ncclResult_t
+ncclGetUniqueId(ncclUniqueId *uniqueId)
+{
+  FRONT_ENTER();
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclGetUniqueId)(uniqueId));
+  if (rc == ncclSuccess) {
+    std::lock_guard<std::mutex> guard(nccl_lock);
+    unused_ids.push_back(digest(DIGEST_START, uniqueId, sizeof *uniqueId));
+  }
+  FRONT_LEAVE();
+  return rc;
 }
 
 extern "C" ncclResult_t
@@ -766,6 +1081,8 @@ ncclCommInitRankConfig(ncclComm_t *comm, int nranks, ncclUniqueId commId,
   c->made = INIT_RANK;
   c->id = commId;
   c->ident = digest(DIGEST_START, &commId, sizeof commId);
+  ncclUniqueId id = commId;
+  renewed_id(c->ident, &id);
   c->nranks = nranks;
   c->rank = rank;
   keep_config(c, config);
@@ -779,10 +1096,10 @@ ncclCommInitRankConfig(ncclComm_t *comm, int nranks, ncclUniqueId commId,
   ncclComm_t *real = (ncclComm_t *)&c->real;
   ncclResult_t rc;
   if (config != NULL) {
-    NCCL_LH(rc = NCCL(ncclCommInitRankConfig)(real, nranks, commId, rank,
+    NCCL_LH(rc = NCCL(ncclCommInitRankConfig)(real, nranks, id, rank,
                                               config));
   } else {
-    NCCL_LH(rc = NCCL(ncclCommInitRank)(real, nranks, commId, rank));
+    NCCL_LH(rc = NCCL(ncclCommInitRank)(real, nranks, id, rank));
   }
   ncclComm_t made = made_comm(c, rc);
   if (made != NULL) {
@@ -845,6 +1162,11 @@ ncclCommSplit(ncclComm_t comm, int color, int key, ncclComm_t *newcomm,
   Comm *parent = comm_of(comm);
   enter(parent != NULL ? &parent->seq : NULL, 1, false);
   FRONT_ENTER();
+  // Every split takes a number on its parent, also one that gives this rank
+  // no communicator, so that the members' numbers agree.
+  int index = parent != NULL
+                ? __atomic_fetch_add(&parent->splits, 1, __ATOMIC_RELAXED)
+                : 0;
   ncclResult_t rc;
   if (color == NCCL_SPLIT_NOCOLOR) {
     // No communicator for this rank; in a group region NCCL writes NULL at
@@ -857,21 +1179,24 @@ ncclCommSplit(ncclComm_t comm, int color, int key, ncclComm_t *newcomm,
   }
   Comm *c = new Comm();
   c->made = SPLIT;
-  c->parent = parent;
   c->color = color;
   c->key = key;
   c->nranks = c->rank = c->device = -1;
   if (parent != NULL) {
-    int index = __atomic_fetch_add(&parent->splits, 1, __ATOMIC_RELAXED);
     c->ident = digest(DIGEST_START, &parent->ident, sizeof parent->ident);
     c->ident = digest(c->ident, &index, sizeof index);
     c->ident = digest(c->ident, &color, sizeof color);
   }
   keep_config(c, config);
   if (config == NULL && parent != NULL) {
-    c->nonblocking = parent->nonblocking;  // NCCL gives it the parent's
+    c->has_config = parent->has_config;
+    c->config = parent->config;
+    c->net_name = parent->net_name;
+    c->comm_name = parent->comm_name;
+    c->nonblocking = parent->nonblocking;
   }
-  NCCL_LH(rc = NCCL(ncclCommSplit)(front_translate(comm), color, key,
+  c->parent_real = front_translate(comm);
+  NCCL_LH(rc = NCCL(ncclCommSplit)(c->parent_real, color, key,
                                    (ncclComm_t *)&c->real, config));
   ncclComm_t made = made_comm(c, rc);
   if (made != NULL) {
@@ -908,8 +1233,10 @@ end_comm(ncclComm_t comm, bool abort)
   int64_t *step = !abort && c != NULL && !c->finalized ? &c->seq : NULL;
   enter(step, 1, false);
   FRONT_ENTER();
-  ncclResult_t rc;
-  if (abort) {
+  ncclResult_t rc = ncclSuccess;
+  if (c != NULL && c->real == NULL) {
+    // Finalized before a restart, and not made again.
+  } else if (abort) {
     NCCL_LH(rc = NCCL(ncclCommAbort)(front_translate(comm)));
   } else {
     NCCL_LH(rc = NCCL(ncclCommDestroy)(front_translate(comm)));
@@ -940,6 +1267,24 @@ extern "C" ncclResult_t
 ncclCommAbort(ncclComm_t comm)
 {
   return end_comm(comm, true);
+}
+
+// A communicator finalized before a restart is not made again: its
+// finalization is complete.
+extern "C" ncclResult_t
+ncclCommGetAsyncError(ncclComm_t comm, ncclResult_t *asyncError)
+{
+  Comm *c = comm_of(comm);
+  if (c != NULL && c->real == NULL && asyncError != NULL) {
+    *asyncError = ncclSuccess;
+    return ncclSuccess;
+  }
+  FRONT_ENTER();
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclCommGetAsyncError)(front_translate(comm),
+                                           asyncError));
+  FRONT_LEAVE();
+  return rc;
 }
 
 // A group region passes the gate at its outermost ncclGroupStart, and

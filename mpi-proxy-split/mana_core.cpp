@@ -891,8 +891,9 @@ mana_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 
       run_layers(MANA_STEP_RESTART);
       if (mana_cuda_enabled()) {
-        // The application's CUDA IPC: every rank exports again before any
-        // maps a peer's memory.
+        // The application's CUDA IPC and NCCL: every rank exports again,
+        // and makes new NCCL unique ids, before any maps a peer's memory or
+        // joins a communicator.
         dmtcp_global_barrier("MANA:cuda-ipc-exported");
         run_layers(MANA_STEP_RESTART_PEERS);
       }
