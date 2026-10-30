@@ -5,6 +5,9 @@ include Makefile_config
 ifeq (${MANA_MPI},)
   $(error Makefile_config predates --with-mpi and --with-cuda: rerun ./configure)
 endif
+ifeq (${MANA_NCCL},)
+  $(error Makefile_config predates --with-nccl: rerun ./configure)
+endif
 
 # These are needed for libmana.so, since the wrapper functions there will
 # call the lower half.  That requires temporarily changing the FS register,

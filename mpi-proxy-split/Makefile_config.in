@@ -1,11 +1,17 @@
 # What configure builds (./configure --help): yes or no.  The core is always
-# built; the MPI layer and the CUDA front if configure found what they need.
+# built; the MPI layer, the CUDA front and NCCL's front in it if configure
+# found what they need.
 MANA_MPI = @MANA_MPI@
 MANA_CUDA = @MANA_CUDA@
+MANA_NCCL = @MANA_NCCL@
 CUDA_HOME = @CUDA_HOME@
 # cuBLAS, cuFFT and cuRAND, whose fronts the CUDA front builds if they are
 # there (at NERSC, the HPC SDK's math_libs); empty: next to libcudart.
 CUDA_MATH_LIBDIR ?= @CUDA_MATH_LIBDIR@
+# NCCL, whose front the CUDA front builds with MANA_NCCL: its library
+# (libnccl.so.N) and the directory of nccl.h.
+NCCL_LIB = @NCCL_LIB@
+NCCL_INCLUDE = @NCCL_INCLUDE@
 
 # The plain compilers, for what must not be linked with MPI (libmana.so,
 # bin/lower-half-nompi, libmpistub.so, the LD_AUDIT modules, dlopen_mpi).

@@ -2,7 +2,7 @@
 # (cuda/DESIGN-lower-half-cuda.md): MANA's libcudart.so.<N> and libcuda.so.1,
 # generated from the real libraries that bin/lower-half uses
 # (gen-cuda-front.py), the same for cuBLAS, cuBLASLt, cuFFT and cuRAND if
-# the toolkit has them and for NCCL if NCCL_HOME has it, and libmana_cuda.so,
+# the toolkit has them and for NCCL if configure found it, and libmana_cuda.so,
 # which they all jump into.  All are
 # installed in lib/dmtcp/cuda-front/.
 
@@ -66,13 +66,11 @@ ifneq (${REAL_LIBCURAND},)
   CURAND_SONAME := $(call soname,${REAL_LIBCURAND})
 endif
 
-# NCCL (cuda/PLAN-nccl-front.md), from NCCL_HOME, as NERSC's nccl module sets
-# it.  configure's --with-nccl is to come.
-REAL_LIBNCCL ?= $(if ${NCCL_HOME},$(firstword \
-                  $(wildcard ${NCCL_HOME}/lib/libnccl.so.[0-9]*)))
+# NCCL (cuda/PLAN-nccl-front.md), as configure found it (--with-nccl):
+# NCCL_LIB and NCCL_INCLUDE (Makefile_config).
+REAL_LIBNCCL ?= $(if $(filter yes,${MANA_NCCL}),${NCCL_LIB})
 ifneq (${REAL_LIBNCCL},)
   NCCL_SONAME := $(call soname,${REAL_LIBNCCL})
-  NCCL_INCLUDE := $(realpath $(dir ${REAL_LIBNCCL})/../include)
 endif
 
 INSTALL_DIR = ${MANA_ROOT}/lib/dmtcp/cuda-front
@@ -255,6 +253,8 @@ libmana_cuda_audit.so: cuda_audit.c
 	${CC} -O2 -fPIC -shared -nostdlib -fno-stack-protector \
 	  -Wl,--no-undefined -o $@ $<
 
+# Without NCCL's front (configure --without-nccl), install removes that of an
+# earlier build, which ../cuda_audit.c would load.
 install: default
 	mkdir -p ${INSTALL_DIR}
 	cp -f libmana_cuda.so ${FRONT_LIBS} ${INSTALL_DIR}/
@@ -266,7 +266,8 @@ install: default
 	$(if ${CUFFT_SONAME},ln -sf ${CUFFT_SONAME} ${INSTALL_DIR}/libcufft.so)
 	$(if ${CURAND_SONAME},ln -sf ${CURAND_SONAME} \
 	  ${INSTALL_DIR}/libcurand.so)
-	$(if ${NCCL_SONAME},ln -sf ${NCCL_SONAME} ${INSTALL_DIR}/libnccl.so)
+	$(if ${NCCL_SONAME},ln -sf ${NCCL_SONAME} ${INSTALL_DIR}/libnccl.so,\
+	  rm -f ${INSTALL_DIR}/libnccl.so*)
 	cp -f libmana_cuda_audit.so ${MANA_ROOT}/lib/dmtcp/
 	mkdir -p ${STUB_INSTALL_DIR}
 	cp -f ${STUB_LIBS} ${STUB_INSTALL_DIR}/

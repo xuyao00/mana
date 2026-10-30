@@ -55,6 +55,7 @@ for mana_arg
 do
   case $mana_arg in
     --with-mpi|--with-mpi=*|--without-mpi|--with-cuda|--with-cuda=*|--without-cuda) ;;
+    --with-nccl|--with-nccl=*|--without-nccl) ;;
     *) mana_dmtcp_args="$mana_dmtcp_args '`AS_ECHO(["$mana_arg"]) | sed "s/'/'\\\\\\\\''/g"`'" ;;
   esac
 done
@@ -63,9 +64,10 @@ AC_CONFIG_SUBDIRS([dmtcp])
 
 dnl MANA's layers (cuda/PROPOSAL-code-organization.md).  The core, libmana.so
 dnl and bin/lower-half-nompi, is always built.  The MPI layer (libmana_mpi.so,
-dnl bin/lower-half) and the CUDA front (mana_launch --cuda) are built if
-dnl what they need is found, or as --with-mpi, --with-cuda and their
-dnl --without- forms say.  The summary at the end says what and why.
+dnl bin/lower-half), the CUDA front (mana_launch --cuda) and NCCL's front in
+dnl it are built if what they need is found, or as --with-mpi, --with-cuda,
+dnl --with-nccl and their --without- forms say.  The summary at the end says
+dnl what and why.
 
 dnl NERSC's Perlmutter, as mpi-proxy-split/Makefile_config.in tells it.
 case "$HOST" in
@@ -181,6 +183,74 @@ AC_SUBST([MANA_CUDA], [$mana_cuda])
 AC_SUBST([CUDA_HOME])
 AC_SUBST([CUDA_MATH_LIBDIR])
 
+dnl NCCL's front, in the CUDA front (cuda/PLAN-nccl-front.md): libnccl.so.N
+dnl in DIR/lib or DIR/lib64 and nccl.h in DIR/include; by default DIR is
+dnl NCCL_HOME (NERSC's nccl module sets it), else the library is where
+dnl ldconfig finds it.
+AC_ARG_WITH([nccl],
+  [AS_HELP_STRING([--with-nccl@<:@=DIR@:>@],
+    [build NCCL's front in the CUDA front, with NCCL in DIR (default: if the
+     CUDA front is built and NCCL is in NCCL_HOME or found by ldconfig)])],
+  [], [with_nccl=check])
+mana_nccl=no
+mana_nccl_why="--without-nccl"
+NCCL_LIB=
+NCCL_INCLUDE=
+if test "$with_nccl" != no; then
+  AC_MSG_CHECKING([for NCCL])
+  if test "$mana_cuda" != yes; then
+    mana_nccl_why="no CUDA front"
+  else
+    if test "$with_nccl" != yes && test "$with_nccl" != check; then
+      mana_nccl_dir="$with_nccl"
+    else
+      mana_nccl_dir="$NCCL_HOME"
+    fi
+    if test -n "$mana_nccl_dir"; then
+      mana_lib=`ls "$mana_nccl_dir"/lib/libnccl.so.[[0-9]]* \
+                   "$mana_nccl_dir"/lib64/libnccl.so.[[0-9]]* 2>/dev/null |
+                head -n 1`
+      if test -n "$mana_lib" && test -r "$mana_nccl_dir/include/nccl.h"; then
+        NCCL_LIB="$mana_lib"
+        NCCL_INCLUDE="$mana_nccl_dir/include"
+      fi
+    fi
+    if test -z "$NCCL_LIB" && test "$mana_nccl_dir" != "$with_nccl"; then
+      mana_lib=`/sbin/ldconfig -p 2>/dev/null |
+                awk '/libnccl\.so\.[[0-9]]+ / {print $NF; exit}'`
+      mana_dir=`dirname "$mana_lib"`
+      for mana_inc in "$mana_dir/../include" /usr/include; do
+        if test -n "$mana_lib" && test -r "$mana_inc/nccl.h"; then
+          NCCL_LIB="$mana_lib"
+          NCCL_INCLUDE="$mana_inc"
+          break
+        fi
+      done
+    fi
+    if test -n "$NCCL_LIB"; then
+      mana_dir=`dirname "$NCCL_LIB"`
+      NCCL_LIB=`cd "$mana_dir" && pwd`/`basename "$NCCL_LIB"`
+      NCCL_INCLUDE=`cd "$NCCL_INCLUDE" && pwd`
+      mana_ver=`awk '/^#define NCCL_(MAJOR|MINOR|PATCH) / {
+                       v = v (v == "" ? "" : ".") $3 } END { print v }' \
+                  "$NCCL_INCLUDE/nccl.h"`
+      mana_nccl=yes
+      mana_nccl_why="NCCL $mana_ver, $NCCL_LIB"
+    elif test "$mana_nccl_dir" = "$with_nccl"; then
+      mana_nccl_why="no lib/libnccl.so.N or include/nccl.h in $with_nccl"
+    else
+      mana_nccl_why="no NCCL in NCCL_HOME or found by ldconfig; give --with-nccl=DIR"
+    fi
+  fi
+  AC_MSG_RESULT([$mana_nccl])
+  if test "$mana_nccl" = no && test "$with_nccl" != check; then
+    AC_MSG_ERROR([--with-nccl: $mana_nccl_why])
+  fi
+fi
+AC_SUBST([MANA_NCCL], [$mana_nccl])
+AC_SUBST([NCCL_LIB])
+AC_SUBST([NCCL_INCLUDE])
+
 AC_CONFIG_FILES([Makefile \
                  manpages/Makefile \
                  mpi-proxy-split/Makefile_config])
@@ -232,5 +302,5 @@ MANA will build:
   the core (libmana.so, bin/lower-half-nompi):  yes
   the MPI layer (libmana_mpi.so, bin/lower-half):  $mana_mpi: $mana_mpi_why
   the CUDA front (mana_launch --cuda):  $mana_cuda: $mana_cuda_why
-  the NCCL front (mana_launch --nccl):  no: not written yet
+  NCCL's front, in the CUDA front:  $mana_nccl: $mana_nccl_why
 _ACEOF

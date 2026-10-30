@@ -34,11 +34,12 @@ clean` first.  For example, on Fedora, with Open MPI:
     PATH=/usr/lib64/openmpi/bin:$PATH make -j8
 
 `./configure` builds what it finds, and ends with a summary of it: MANA's
-MPI layer if it finds the MPI compilers, and the CUDA front (`mana_launch
---cuda`) if it finds the CUDA toolkit and driver.  `--with-mpi=DIR`,
-`--with-cuda=DIR`, `--without-mpi` and `--without-cuda` choose instead.  A
-program that doesn't use MPI runs with `mana_launch --no-mpi`, also where
-MANA is built without MPI.
+MPI layer if it finds the MPI compilers, the CUDA front (`mana_launch
+--cuda`) if it finds the CUDA toolkit and driver, and NCCL's front in it if
+it finds NCCL (in `NCCL_HOME`, or by `ldconfig`).  `--with-mpi=DIR`,
+`--with-cuda=DIR`, `--with-nccl=DIR` and their `--without-` forms choose
+instead.  A program that doesn't use MPI runs with `mana_launch --no-mpi`,
+also where MANA is built without MPI.
 
 In a container that runs as root, Open MPI's `mpirun` needs
 `OMPI_ALLOW_RUN_AS_ROOT=1` and `OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1`.

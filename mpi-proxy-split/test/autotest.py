@@ -48,8 +48,8 @@ class Test:
   cuda:        a CUDA-aware MPI test: runs with MANA_CUDA=1 (mana_launch
                --cuda).  test/Makefile builds it if it finds nvcc.
   nccl:        an NCCL test (and a CUDA one).  test/Makefile builds it if
-               NCCL_HOME names an NCCL; skipped unless the CUDA front has
-               NCCL.  It needs a GPU per rank on a node.
+               configure found NCCL (--with-nccl); skipped unless the CUDA
+               front has NCCL's front.  It needs a GPU per rank on a node.
   mana_only:   checks something that only MANA does (e.g. a refusal):
                --native skips it.
   no_mpi:      a program without MPI: runs with MANA_NO_MPI=1 (mana_launch

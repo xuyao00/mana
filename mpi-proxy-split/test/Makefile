@@ -44,11 +44,9 @@ E2E_CUDA_MPI = cuda_aware cuda_threads cuda_driver cuda_async cuda_ipc \
 E2E_CUDA = $(if $(NVCC),cuda_nompi cuda_quiesce cuda_pools cuda_managed \
              cuda_drvgraphs \
              $(if $(filter yes,${MANA_MPI}),${E2E_CUDA_MPI}))
-# NCCL, from NCCL_HOME as the CUDA front's Makefile finds it (NERSC's nccl
-# module sets it); configure's --with-nccl is to come.
-NCCL_LIB = $(if $(NVCC),$(if ${NCCL_HOME},$(firstword \
-             $(wildcard ${NCCL_HOME}/lib/libnccl.so.[0-9]*))))
-E2E_NCCL = $(if $(NCCL_LIB),$(if $(filter yes,${MANA_MPI}),nccl))
+# NCCL, with NCCL's front (configure's MANA_NCCL, NCCL_LIB and NCCL_INCLUDE).
+E2E_NCCL = $(if $(NVCC),$(if $(filter yes,${MANA_NCCL}),$(if \
+             $(filter yes,${MANA_MPI}),nccl)))
 
 # What MANA builds (configure's MANA_MPI and MANA_CUDA): the MPI tests with
 # the MPI layer, and the suite also runs the example of ../examples
@@ -139,9 +137,11 @@ cuda_pools: cuda_pools.cu mana_test.h
 cuda_quiesce: cuda_quiesce.cu mana_test.h
 	$(NVCC) -g -O0 -cudart=shared -o $@ $< -lpthread
 
+# NCCL_LIB by its file name, and its directory as the run path, as a program
+# may find it.
 nccl: nccl.cu mana_test.h
 	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $< \
-	  -I$(dir $(NCCL_LIB))../include -L$(dir $(NCCL_LIB)) -lnccl \
+	  -I$(NCCL_INCLUDE) -L$(dir $(NCCL_LIB)) -l:$(notdir $(NCCL_LIB)) \
 	  -Xlinker -rpath -Xlinker $(dir $(NCCL_LIB))
 
 # Opens the MPI library with dlopen(), so it is not linked with it.
