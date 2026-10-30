@@ -486,7 +486,8 @@ lower_half_fs(unsigned long lh_fs, unsigned long uh_fs)
   MACRO(Win_wait) \
   MACRO(Wtick) \
   MACRO(Wtime) \
-  MACRO(MANA_Internal)
+  MACRO(MANA_Internal) \
+  MACRO(MANA_Query_cuda_support)
 
 #define GENERATE_ENUM(ENUM) MPI_Fnc_##ENUM,
 #define GENERATE_FNC_PTR(FNC) (void*)&MPI_##FNC,

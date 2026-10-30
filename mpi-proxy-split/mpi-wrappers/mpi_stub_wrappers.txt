@@ -380,6 +380,7 @@ int MPI_Type_commit (MPI_Datatype *type);
 int MPI_Type_free (MPI_Datatype *type);
 int MPI_Init (int *argc, char ***argv);
 int MPI_Finalize (void);
+int MPIX_Query_cuda_support(void);
 int MPI_Finalized (int *flag);
 int MPI_Get_processor_name (char *name, int *resultlen);
 double MPI_Wtime (void);

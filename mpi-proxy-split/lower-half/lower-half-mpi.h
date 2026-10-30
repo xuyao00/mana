@@ -31,6 +31,7 @@
 // bin/lower-half-nompi has none (lh_info->mpi is NULL).
 
 extern "C" int MPI_MANA_Internal(char *dummy);
+extern "C" int MPI_MANA_Query_cuda_support();
 
 typedef struct _LowerHalfMpiInfo
 {
