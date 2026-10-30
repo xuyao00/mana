@@ -1,5 +1,5 @@
-# libcuda functions that the front defines by hand (front_drv.cpp).  See
-# gen-cuda-front.py.
+# libcuda functions that the front defines by hand (front_drv.cpp).  A name
+# with '?' is own if the library exports it.  See gen-cuda-front.py.
 
 # Contexts: records, and a copy of each thread's context stack.
 cuCtxCreate_v2
@@ -140,7 +140,7 @@ cuGraphAddDependencies_v2
 cuGraphRemoveDependencies_v2
 cuGraphDestroyNode
 cuGraphNodeFindInClone
-cuGraphNodeGetContainingGraph
+cuGraphNodeGetContainingGraph?
 cuGraphChildGraphNodeGetGraph
 cuGraphHostNodeGetParams
 cuGraphHostNodeSetParams

@@ -1,5 +1,6 @@
 # cudart functions that the front defines by hand (front_objs.cpp,
-# front_drv.cpp).  See gen-cuda-front.py.
+# front_drv.cpp).  A name with '?' is own if the library exports it.  See
+# gen-cuda-front.py.
 cudaSetDevice
 cudaSetDeviceFlags
 cudaDeviceSetLimit
@@ -136,7 +137,7 @@ cudaGraphGetEdges
 cudaGraphNodeGetDependencies
 cudaGraphNodeGetDependentNodes
 cudaGraphNodeFindInClone
-cudaGraphNodeGetContainingGraph
+cudaGraphNodeGetContainingGraph?
 cudaGraphChildGraphNodeGetGraph
 cudaGraphDestroyNode
 cudaGraphAddDependencies
