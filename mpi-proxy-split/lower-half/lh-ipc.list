@@ -1,0 +1,10 @@
+/* The functions of lh-ipc.cpp, exported from bin/lower-half so that the MPI's
+   references to them bind there before libcuda. */
+{
+  cuIpcGetMemHandle;
+  cuIpcOpenMemHandle;
+  cuIpcOpenMemHandle_v2;
+  cuIpcCloseMemHandle;
+  cuPointerGetAttribute;
+  cuPointerGetAttributes;
+};

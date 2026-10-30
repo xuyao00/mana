@@ -379,6 +379,9 @@ prepare_lower_half_cuda()
   mallopt(M_ARENA_MAX, 1);
 }
 
+// lh-ipc.cpp, in bin/lower-half when MANA is built with the CUDA front.
+extern "C" void lh_ipc_init() __attribute__((weak));
+
 static void
 init_lower_half_cuda()
 {
@@ -399,6 +402,9 @@ init_lower_half_cuda()
   if (rc != 0) {
     fprintf(stderr, "MANA: --cuda: cuInit failed (%d)\n", rc);
     exit(1);
+  }
+  if (lh_ipc_init != NULL) {
+    lh_ipc_init();
   }
   unsigned long long base = env_ull("MANA_CUDA_VMM_BASE", MANA_CUDA_VMM_BASE);
   unsigned long long size = env_ull("MANA_CUDA_VMM_SIZE", MANA_CUDA_VMM_SIZE);

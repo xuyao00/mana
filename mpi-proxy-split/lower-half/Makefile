@@ -44,11 +44,21 @@ default: ${LOWER_HALVES}
 .c.o:
 	${MPICXX} ${CFLAGS} -c -o $@ $<
 
+# With the CUDA front (configure's MANA_CUDA): virtual legacy CUDA IPC for
+# the MPI (lh-ipc.cpp), whose functions bin/lower-half exports.
+ifeq (${MANA_CUDA},yes)
+  LH_IPC_OBJS = lh-ipc.o
+  LH_IPC_LDFLAGS = -Wl,--dynamic-list=lh-ipc.list
+endif
+
+lh-ipc.o: lh-ipc.cpp
+	${MPICXX} ${CXXFLAGS} -I${CUDA_HOME}/include -c -o $@ $<
+
 # Normally, gcc (or clang) will automatically link with libatomic.so.
 # However, for come MPICXX it's hard to know if they cover it.
 # So this is good as a safety measure.
-lower-half: get-symbol-offset.o build-id-debug.o copy-stack.o patch-trampoline.o lh-func-ptr.o mem-wrapper.o switch-context.o lower-half.o mmap-fixed-noreplace.o lh-mpi.o ${DMTCP_DEPS}
-	${MPICXX} -g3 ${TEXTSEG_ADDR_FLAG} ${CXXFLAGS} -o $@ $^ -lpthread -ldl -latomic
+lower-half: get-symbol-offset.o build-id-debug.o copy-stack.o patch-trampoline.o lh-func-ptr.o mem-wrapper.o switch-context.o lower-half.o mmap-fixed-noreplace.o lh-mpi.o ${LH_IPC_OBJS} ${DMTCP_DEPS}
+	${MPICXX} -g3 ${TEXTSEG_ADDR_FLAG} ${CXXFLAGS} ${LH_IPC_LDFLAGS} -o $@ $^ -lpthread -ldl -latomic
 
 # bin/lower-half-nompi: the same lower half without MPI, with lh-nompi.cpp
 # in place of lh-mpi.cpp and lh-func-ptr.c.  Built with the plain compiler,
