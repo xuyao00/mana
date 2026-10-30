@@ -687,6 +687,46 @@ mana_kv_get(const char *db, const char *key, char *val, size_t size)
   return 0;
 }
 
+// "/plugin/MANA/<what>-<start>-<generation>", as ckpt_kvdb_name() in
+// seq_num.cpp names the MPI layer's databases.
+static string
+ckpt_kv_db(const char *what)
+{
+  DmtcpUniqueProcessId id = dmtcp_get_computation_id();
+  char db[64];
+  int n = snprintf(db, sizeof db, "/plugin/MANA/%s-%llx-%u", what,
+                   (unsigned long long)id._time, id._computation_generation);
+  // DMTCP silently truncates a KVDB name at 63 characters.
+  ASSERT(n > 0 && (size_t)n < sizeof db, "KVDB name too long: {}", db);
+  return db;
+}
+
+extern "C" void
+mana_ckpt_kv_update(const char *what, const char *key, int op, int64_t val)
+{
+  KVDBRequest request =
+    op == MANA_KV_MAX ? KVDBRequest::MAX : KVDBRequest::INCRBY;
+  string db = ckpt_kv_db(what);
+  ASSERT(kvdb::request64(request, db, key, val) == KVDBResponse::SUCCESS,
+         "db={} key={}", db, key);
+}
+
+extern "C" int64_t
+mana_ckpt_kv_get(const char *what, const char *key)
+{
+  int64_t val = 0;
+  if (kvdb::get64(ckpt_kv_db(what), key, &val) != KVDBResponse::SUCCESS) {
+    return 0;
+  }
+  return val;
+}
+
+extern "C" void
+mana_global_barrier(const char *id)
+{
+  dmtcp_global_barrier(id);
+}
+
 static void
 mana_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 {
@@ -786,7 +826,7 @@ mana_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
       printEventToStderr("EVENT_PRESUSPEND (finish collective op's)");
       run_layers(MANA_STEP_WAIT_FOR_INIT);
       mana_state = CKPT_COLLECTIVE;  // Not RUNNING: the checkpoint has begun.
-      run_layers(MANA_STEP_DRAIN);
+      run_layers(MANA_STEP_DRAIN, true);
       openCkptFileFds();
       // No thread may be in the lower half when DMTCP suspends the threads.
       // The MPI layer's drain has closed it already.

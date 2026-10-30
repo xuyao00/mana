@@ -382,22 +382,22 @@ front_register()
 }
 
 // The CUDA layer's steps (mana_core.h).  Called by libmana.so (mana_core.cpp)
-// on the checkpoint thread, with the lower half closed to the application's
-// threads; MANA_STEP_THREAD_EXIT, on an exiting thread;
-// MANA_STEP_DRAIN_MEMOPS, in an MPI call.  The other steps are not the
-// front's.
+// on the checkpoint thread: MANA_STEP_DRAIN while the application's threads
+// run, the others with the lower half closed to them; MANA_STEP_THREAD_EXIT,
+// on an exiting thread; MANA_STEP_DRAIN_MEMOPS, in an MPI call.  The other
+// steps are not the front's.
 extern "C" void
 mana_cuda_event(int event)
 {
   switch (event) {
-    case MANA_STEP_QUIESCE: {
-      // NCCL's kernels wait for every member of their communicator, so the
-      // GPUs quiesce only after a drain, which is to come
-      // (cuda/PLAN-nccl-front.md, step 3).
-      if (front_nccl_live != NULL && front_nccl_live() > 0) {
-        front_fatal("a checkpoint with %d NCCL communicator(s): not "
-                    "supported yet\n", front_nccl_live());
+    case MANA_STEP_DRAIN:
+      // NCCL's kernels wait for every member of their communicator: the
+      // ranks agree where to stop before the GPUs can quiesce.
+      if (front_nccl_drain != NULL) {
+        front_nccl_drain();
       }
+      break;
+    case MANA_STEP_QUIESCE: {
       QuiesceWatchdog watchdog;
       // The application's threads are out of the lower half, so no new
       // work can start, and their context stacks stay as they are: the
@@ -441,6 +441,9 @@ mana_cuda_event(int event)
       front_vmm_drop_shadows();
       front_objs_drop_shadows();
       front_events_resume();
+      if (front_nccl_resume != NULL) {
+        front_nccl_resume();
+      }
       break;
     case MANA_STEP_RESTART:
       if (lh_info == NULL || !lh_info->cuda_enabled) {

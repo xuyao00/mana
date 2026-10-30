@@ -29,6 +29,7 @@
 #define _MANA_CORE_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,8 +49,11 @@ enum ManaLayer {
 enum ManaStep {
   // DMTCP_EVENT_PRESUSPEND
   MANA_STEP_WAIT_FOR_INIT = 1,  // until the layer can drain (MPI_Init)
-  MANA_STEP_DRAIN,      // complete the communication in flight; the core
-                        // closes the lower half after it, if still open
+  MANA_STEP_DRAIN,      // in reverse order: complete the communication in
+                        // flight.  The CUDA layer's (NCCL) needs the
+                        // application's threads in the lower half, and the
+                        // MPI layer's closes it; the core closes it after
+                        // the step, if still open
   MANA_STEP_QUIESCE,    // --cuda, the lower half closed: wait for the GPUs
   MANA_STEP_STASH,      // then, after a global barrier: copy device data
   // DMTCP_EVENT_PRECHECKPOINT, with the threads suspended
@@ -87,6 +91,18 @@ const char *mana_ckpt_dir(void);
 // application's threads.
 int mana_kv_set(const char *db, const char *key, const char *val);
 int mana_kv_get(const char *db, const char *key, char *val, size_t size);
+// From the checkpoint thread during a checkpoint: 64-bit values in a
+// database of this checkpoint's own, which "what" (at most 24 characters)
+// names; the coordinator keeps its databases across checkpoints.  An update
+// adds val to the key's value (MANA_KV_ADD) or keeps the larger
+// (MANA_KV_MAX); a new key starts at 0, and mana_ckpt_kv_get() gives 0 for
+// a key not there.
+enum ManaKvOp { MANA_KV_ADD, MANA_KV_MAX };
+void mana_ckpt_kv_update(const char *what, const char *key, int op,
+                         int64_t val);
+int64_t mana_ckpt_kv_get(const char *what, const char *key);
+// A barrier of every rank's checkpoint thread.
+void mana_global_barrier(const char *id);
 
 #ifdef __cplusplus
 }
