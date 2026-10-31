@@ -4,11 +4,13 @@
 # and count for the drain, and the group regions, which the drain waits
 # for; ncclMemAlloc and ncclMemFree, through the front's allocator; and what
 # a restart makes again on a communicator: buffer registrations, windows,
-# PreMulSum operators, and its suspension.  A name that ends in '?' is in
-# newer NCCLs only.  Not supported (they abort with their name): the device
-# API (ncclDevCommCreate, the device pointers of a window), whose addresses
-# a restart cannot keep; ncclCommGrow, ncclCommGetUniqueId and
-# ncclCommRevoke.  See gen-cuda-front.py and cuda/PLAN-nccl-front.md.
+# PreMulSum operators, and its suspension; and the device API's host
+# functions, after which a checkpoint stops, since the device addresses do
+# not outlive a restart.  A name that ends in '?' is in newer NCCLs only.
+# Not supported (they abort with their name): the device API's team
+# functions, which NCCL's headers also declare for the device, and the
+# barrier requirements that take a team; ncclCommGrow, ncclCommGetUniqueId
+# and ncclCommRevoke.  See gen-cuda-front.py and cuda/PLAN-nccl-front.md.
 ncclGetUniqueId
 ncclCommInitRank
 ncclCommInitRankConfig
@@ -48,3 +50,12 @@ ncclRedOpCreatePreMulSum?
 ncclRedOpDestroy?
 ncclCommSuspend?
 ncclCommResume?
+ncclDevCommCreate?
+ncclDevCommDestroy?
+ncclGetLsaMultimemDevicePointer?
+ncclGetMultimemDevicePointer?
+ncclGetLsaDevicePointer?
+ncclGetPeerDevicePointer?
+ncclCommQueryProperties?
+ncclLLA2ACreateRequirement?
+ncclLLA2ACalcSlots?

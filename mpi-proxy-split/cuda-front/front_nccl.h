@@ -24,6 +24,14 @@
 #define _MANA_CUDA_FRONT_NCCL_H
 
 #include <nccl.h>
+#if __has_include(<nccl_device.h>)
+// The device API's host functions (NCCL 2.28+).  The header defines a static
+// function that a host compilation does not use.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#include <nccl_device.h>
+#pragma GCC diagnostic pop
+#endif
 #include "front_auto.h"
 
 extern FrontLib front_nccl_lib FRONT_HIDDEN;

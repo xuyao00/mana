@@ -123,6 +123,7 @@ struct Win {
   size_t size;
   int flags;
   void *real;
+  bool device_ptrs;      // the program took device pointers into it
 };
 
 // A PreMulSum operator.  Its value for the application is NCCL's when it was
@@ -184,6 +185,7 @@ struct Comm : FrontObj {
   std::vector<Op> ops;
   bool suspended;        // by ncclCommSuspend, with these flags
   int suspend_flags;
+  int devcomms;          // live device communicators (ncclDevCommCreate)
   // Destroyed: kept for the drain, with its last step, until a drain
   // converges, when every member has destroyed it too.
   bool destroyed;
@@ -1226,6 +1228,32 @@ live(const Comm *c)
   return !c->destroyed && c->real != NULL;
 }
 
+// At a checkpoint: NCCL's device API (see ncclDevCommCreate()).
+void
+refuse_device_api()
+{
+  int devcomms = 0;
+  int wins = 0;
+  {
+    std::lock_guard<std::mutex> guard(nccl_lock);
+    for (Comm *c : comms) {
+      if (c->destroyed) {
+        continue;
+      }
+      devcomms += c->devcomms;
+      for (Win *w : c->wins) {
+        wins += w->device_ptrs;
+      }
+    }
+  }
+  if (devcomms > 0 || wins > 0) {
+    front_fatal("a checkpoint with %d NCCL device communicator(s) and %d "
+                "window(s) whose device pointers the program took: not "
+                "supported, since their device addresses do not outlive a "
+                "restart\n", devcomms, wins);
+  }
+}
+
 // The buffer registrations, each local to its rank.  The buffers are at the
 // same addresses, unless the program freed one without deregistering it,
 // which NCCL lets pass: then the registration is gone, with a warning.
@@ -1383,6 +1411,9 @@ void
 front_nccl_drain()
 {
   int pass = mana_drain_pass();
+  if (pass == 0) {
+    refuse_device_api();
+  }
   int64_t steps0, bytes0;
   {
     std::lock_guard<std::mutex> guard(nccl_lock);
@@ -2405,4 +2436,120 @@ ncclCommResume(ncclComm_t comm)
   }
   return rc;
 }
+#endif
+
+#ifdef FRONT_IDX_nccl_ncclDevCommCreate
+// NCCL's device API: the program's own kernels reach NCCL's memory and the
+// peers' windows by device addresses that NCCL picks, and that a restart
+// cannot keep.  The front forwards it, and a checkpoint stops
+// (refuse_device_api()) while a device communicator lives, or a window
+// whose device pointers the program took.  The team functions, which NCCL's
+// headers also declare for the device, abort.
+
+// Making a device communicator is collective: a step on its communicator.
+// In a group region, NCCL writes it at ncclGroupEnd.
+extern "C" ncclResult_t
+ncclDevCommCreate(ncclComm_t comm, ncclDevCommRequirements_t const *reqs,
+                  ncclDevComm_t *outDevComm)
+{
+  Comm *c = comm_of(comm);
+  int64_t *step = c != NULL ? &c->seq : NULL;
+  enter(step, 1, false);
+  FRONT_ENTER();
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclDevCommCreate)(front_translate(comm), reqs,
+                                       outDevComm));
+  FRONT_LEAVE();
+  if (posted(rc) && c != NULL) {
+    std::lock_guard<std::mutex> guard(nccl_lock);
+    c->devcomms++;
+  }
+  leave(posted(rc), step, 1, false);
+  return rc;
+}
+
+extern "C" ncclResult_t
+ncclDevCommDestroy(ncclComm_t comm, ncclDevComm_t const *devComm)
+{
+  Comm *c = comm_of(comm);
+  FRONT_ENTER();
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclDevCommDestroy)(front_translate(comm), devComm));
+  FRONT_LEAVE();
+  if (rc == ncclSuccess && c != NULL) {
+    std::lock_guard<std::mutex> guard(nccl_lock);
+    c->devcomms = std::max(c->devcomms - 1, 0);
+  }
+  return rc;
+}
+
+// The record of a window, by the program's handle alone.
+static Win *
+any_win(const void *win)
+{
+  std::lock_guard<std::mutex> guard(nccl_lock);
+  for (Comm *c : comms) {
+    for (Win *w : c->wins) {
+      if (w == win) {
+        return w;
+      }
+    }
+  }
+  return NULL;
+}
+
+// A device pointer into a window, which then cannot be checkpointed.
+#define NCCL_WINDOW_POINTER(name, params, args)                    \
+  extern "C" ncclResult_t name params                              \
+  {                                                                \
+    Win *w = any_win(window);                                      \
+    ncclWindow_t real = w != NULL ? (ncclWindow_t)w->real : window; \
+    FRONT_ENTER();                                                 \
+    ncclResult_t rc;                                               \
+    NCCL_LH(rc = NCCL(name) args);                                 \
+    FRONT_LEAVE();                                                 \
+    if (rc == ncclSuccess && w != NULL && outPtr != NULL &&        \
+        *outPtr != NULL) {                                         \
+      std::lock_guard<std::mutex> guard(nccl_lock);                \
+      w->device_ptrs = true;                                       \
+    }                                                              \
+    return rc;                                                     \
+  }
+
+NCCL_WINDOW_POINTER(ncclGetLsaMultimemDevicePointer,
+                    (ncclWindow_t window, size_t offset, void **outPtr),
+                    (real, offset, outPtr))
+NCCL_WINDOW_POINTER(ncclGetMultimemDevicePointer,
+                    (ncclWindow_t window, size_t offset,
+                     ncclMultimemHandle multimem, void **outPtr),
+                    (real, offset, multimem, outPtr))
+NCCL_WINDOW_POINTER(ncclGetLsaDevicePointer,
+                    (ncclWindow_t window, size_t offset, int lsaRank,
+                     void **outPtr),
+                    (real, offset, lsaRank, outPtr))
+NCCL_WINDOW_POINTER(ncclGetPeerDevicePointer,
+                    (ncclWindow_t window, size_t offset, int peer,
+                     void **outPtr),
+                    (real, offset, peer, outPtr))
+
+// Queries, run in the lower half as they are.
+#define NCCL_FORWARD(type, name, params, args) \
+  extern "C" type name params                  \
+  {                                            \
+    FRONT_ENTER();                             \
+    type r;                                    \
+    NCCL_LH(r = NCCL(name) args);              \
+    FRONT_LEAVE();                             \
+    return r;                                  \
+  }
+
+NCCL_FORWARD(ncclResult_t, ncclCommQueryProperties,
+             (ncclComm_t comm, ncclCommProperties_t *props),
+             (front_translate(comm), props))
+NCCL_FORWARD(ncclResult_t, ncclLLA2ACreateRequirement,
+             (int nBlocks, int nSlots, ncclLLA2AHandle_t *outHandle,
+              ncclDevResourceRequirements_t *outReq),
+             (nBlocks, nSlots, outHandle, outReq))
+NCCL_FORWARD(int, ncclLLA2ACalcSlots, (int maxElts, int maxEltSize),
+             (maxElts, maxEltSize))
 #endif
