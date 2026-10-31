@@ -232,14 +232,25 @@ front_lh_dlsym(const char *library, const char *name)
   return fn;
 }
 
+// NCCL's front, if MANA was built with NCCL (gen/nccl-gen.cpp).
+extern FrontLib front_nccl_lib FRONT_HIDDEN __attribute__((weak));
+
 // A library that only the application uses (cuBLAS, cuFFT, ...) loads in
 // the lower half by its soname, through the lower half's search path; else
 // from the directory of the lower half's libcudart, where a toolkit keeps
 // it; else from where the front was made from it.  The MPI loaded libcudart
-// and libcuda already.
+// and libcuda already.  NCCL loads from where its front was made from
+// first: a program may bring its own NCCL, which its run path finds (as
+// PyTorch's does), where a site's module puts another on the search path;
+// the front has the functions of the NCCL it was made from, and NCCL needs
+// no other library of the toolkit's version.
 static const char *
 front_lib_file(FrontLib *lib)
 {
+  if (lib == &front_nccl_lib && lib->built != NULL &&
+      front_lh_dlsym(lib->built, lib->names[0]) != NULL) {
+    return lib->built;
+  }
   if (lib == &front_cudart_lib || lib == &front_cuda_lib || lib->n == 0 ||
       front_lh_dlsym(lib->soname, lib->names[0]) != NULL) {
     return lib->soname;
@@ -252,8 +263,7 @@ front_lib_file(FrontLib *lib)
       return strdup(path.c_str());
     }
   }
-  // Else the one that the front was made from: NCCL's, which a program may
-  // find by its RUNPATH.
+  // Else the one that the front was made from.
   if (lib->built != NULL && front_lh_dlsym(lib->built, lib->names[0]) != NULL) {
     return lib->built;
   }
