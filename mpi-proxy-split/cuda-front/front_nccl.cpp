@@ -45,7 +45,10 @@
 // (front_nccl_publish()); after it, every member makes the communicator
 // again (front_nccl_rebuild()).  A unique id that this process made and has
 // not used is made again too, for the ranks that call ncclCommInitRank with
-// it after the restart.
+// it after the restart.  Then what the program made on each: its buffer
+// registrations, windows and PreMulSum operators; and a communicator that
+// was suspended is suspended again.  The application's handles of these are
+// the front's records, and its operators keep their values.
 
 #include <nccl.h>
 #include <stdio.h>
@@ -73,9 +76,60 @@
 namespace {
 
 enum Made {
-  INIT_RANK,             // ncclCommInitRank, ncclCommInitRankConfig
+  INIT_RANK,             // ncclCommInitRank(Config, Scalable)
   INIT_ALL,              // ncclCommInitAll: one record per device
-  SPLIT                  // ncclCommSplit
+  SPLIT,                 // ncclCommSplit
+  SHRINK                 // ncclCommShrink
+};
+
+// Point-to-point traffic with each peer, in one unit: the bytes of ncclSend
+// and ncclRecv, or the signals of ncclPutSignal and ncclSignal and the
+// waits for them (ncclWaitSignal).  out[peer], what this rank has posted to
+// the peer; in[peer], from it.  The targets are what the peers have
+// published: out_target, what each has posted to take from this rank;
+// in_target, to give it.
+enum Kind { BYTES, SIGNALS, KINDS };
+
+struct Traffic {
+  std::vector<int64_t> out;
+  std::vector<int64_t> in;
+  std::vector<int64_t> out_target;
+  std::vector<int64_t> in_target;
+};
+
+struct Comm;
+
+// A buffer registration (ncclCommRegister), whose address is the
+// application's handle.  real is NULL once the communicator is not made
+// again.
+struct Reg {
+  Comm *c;
+  void *buff;
+  size_t size;
+  void *real;
+};
+
+// A window (ncclCommWindowRegister), whose address is the application's
+// ncclWindow_t; real is NCCL's (NCCL 2.27 or later).
+struct Win {
+  Comm *c;
+  void *buff;
+  size_t size;
+  int flags;
+  void *real;
+};
+
+// A PreMulSum operator.  Its value for the application is NCCL's when it was
+// made, unless another operator of the communicator has that value now:
+// NCCL's changes when a restart makes it again.  The scalar is copied if
+// NCCL reads it at once, else it is the device address, which stays.
+struct Op {
+  ncclRedOp_t value;
+  ncclRedOp_t real;
+  ncclDataType_t datatype;
+  ncclScalarResidence_t residence;
+  void *scalar;
+  uint64_t immediate;
 };
 
 struct Comm : FrontObj {
@@ -84,10 +138,12 @@ struct Comm : FrontObj {
   int nranks;
   int rank;
   int device;
-  ncclUniqueId id;       // INIT_RANK
+  // INIT_RANK: the names of its unique ids, which are used now.
+  std::vector<uint64_t> ids;
   int color;             // SPLIT
   int key;
-  ncclComm_t parent_real;  // SPLIT, until NCCL has made it (wait_made())
+  // SPLIT, SHRINK, until NCCL has made it (wait_made()).
+  ncclComm_t parent_real;
   int clique;            // INIT_ALL: the call's number
   // The config, for the restart; a split without one has its parent's, as
   // NCCL gives it.
@@ -100,21 +156,28 @@ struct Comm : FrontObj {
   // only destroy it.
   bool finalized;
   // Its name in the drain, the same in every member: a digest of the unique
-  // id, or of the parent's name, the split's number on the parent and the
-  // color.  A clique of ncclCommInitAll is in this process alone.
+  // ids; of the parent's name, the split's number on the parent and the
+  // color; or of the parent's name, the ranks that a shrink left out and
+  // its number among the parent's shrinks without them.  A clique of
+  // ncclCommInitAll is in this process alone.
   uint64_t ident;
   int splits;            // the splits of this one so far
-  // Under nccl_lock.  A step is a collective, a split, or the first of
-  // ncclCommFinalize and ncclCommDestroy.  The targets are what the members
-  // have published: target, the steps (-1: not known yet); send_target, the
-  // bytes each peer has posted to receive from this rank; recv_target, to
-  // send to it.
+  // The shrinks of this one so far: a digest of the ranks left out, and how
+  // many.
+  std::vector<std::pair<uint64_t, int>> shrinks;
+  // Under nccl_lock.  A step is a collective, a split, a window's
+  // registration, or the first of ncclCommFinalize and ncclCommDestroy.  The
+  // targets are what the members have published: target, the steps (-1:
+  // not known yet), and each kind of traffic's.
   int64_t seq;
   int64_t target;
-  std::vector<int64_t> sent;
-  std::vector<int64_t> received;
-  std::vector<int64_t> send_target;
-  std::vector<int64_t> recv_target;
+  Traffic traffic[KINDS];
+  // Under nccl_lock: what the program made on it.
+  std::vector<Reg *> regs;
+  std::vector<Win *> wins;
+  std::vector<Op> ops;
+  bool suspended;        // by ncclCommSuspend, with these flags
+  int suspend_flags;
   // Destroyed: kept for the drain, with its last step, until a drain
   // converges, when every member has destroyed it too.
   bool destroyed;
@@ -135,10 +198,14 @@ int cliques;
 // The names of the unique ids that this process made and has not used.
 std::vector<uint64_t> unused_ids;
 
-// The application's thread: its depth in group regions, and the
-// communicators that NCCL makes at the region's end.
+// The application's thread: its depth in group regions; the communicators
+// and windows that NCCL makes at the region's end, a window into the
+// application's variable; and what the region's calls added to the counts,
+// which ncclGroupSimulateEnd takes back.
 __thread int group_depth;
 __thread std::vector<Comm *> *group_made;
+__thread std::vector<std::pair<Win *, void **>> *group_wins;
+__thread std::vector<std::pair<int64_t *, int64_t>> *group_counts;
 
 const char *const KV = "nccl";  // the drain's database (mana_core.h)
 
@@ -165,17 +232,19 @@ comm_of(ncclComm_t comm)
 }
 
 // Whether this communicator's members wait for this rank: a step that they
-// have posted, or a send or a receive.
+// have posted, or traffic.
 bool
 owes_locked(const Comm *c)
 {
   if (c->target >= 0 && c->seq < c->target) {
     return true;
   }
-  for (size_t peer = 0; peer < c->sent.size(); peer++) {
-    if (c->sent[peer] < c->send_target[peer] ||
-        c->received[peer] < c->recv_target[peer]) {
-      return true;
+  for (const Traffic &t : c->traffic) {
+    for (size_t peer = 0; peer < t.out.size(); peer++) {
+      if (t.out[peer] < t.out_target[peer] ||
+          t.in[peer] < t.in_target[peer]) {
+        return true;
+      }
     }
   }
   return false;
@@ -223,13 +292,20 @@ gate_closed_locked()
   return live;
 }
 
+// What a call adds to the counts: n to *at (a step, bytes or signals).
+struct Count {
+  int64_t *at;
+  int64_t n;
+};
+
 // Before a call that posts on a communicator or makes one: waits at the
 // gate, except in a group region, whose ncclGroupStart passed it.  Then
-// counts the call in activity, and adds n to *count (a step, or bytes to a
-// peer), under the same lock: the drain sees a call either before the gate
-// or posted.  create: a creation by unique id, in flight until leave().
+// counts the call in activity, and adds its counts, under the same lock:
+// the drain sees a call either before the gate or posted.  create: a
+// creation that every member must join (by unique id, or a shrink), in
+// flight until leave().
 void
-enter(int64_t *count, int64_t n, bool create)
+enter_counts(const Count *counts, size_t ncounts, bool create)
 {
   std::unique_lock<std::mutex> lock(nccl_lock);
   if (group_depth == 0) {
@@ -240,8 +316,10 @@ enter(int64_t *count, int64_t n, bool create)
       gate_cv.wait_for(lock, std::chrono::milliseconds(50));
     }
   }
-  if (count != NULL) {
-    *count += n;
+  for (size_t i = 0; i < ncounts; i++) {
+    if (counts[i].at != NULL) {
+      *counts[i].at += counts[i].n;
+    }
   }
   activity++;
   if (create) {
@@ -249,19 +327,44 @@ enter(int64_t *count, int64_t n, bool create)
   }
 }
 
-// After the call; a call that failed takes back what enter() added.  In a
-// group region, a creation stays in flight until the region ends.
+// After the call; a call that failed takes back what enter_counts() added.
+// In a group region, a creation stays in flight until the region ends, and
+// the counts are kept for ncclGroupSimulateEnd.
 void
-leave(bool ok, int64_t *count, int64_t n, bool create)
+leave_counts(bool ok, const Count *counts, size_t ncounts, bool create)
 {
   std::lock_guard<std::mutex> guard(nccl_lock);
-  if (!ok && count != NULL) {
-    *count -= n;
+  for (size_t i = 0; i < ncounts; i++) {
+    if (counts[i].at == NULL) {
+      continue;
+    }
+    if (!ok) {
+      *counts[i].at -= counts[i].n;
+    } else if (group_depth > 0) {
+      if (group_counts == NULL) {
+        group_counts = new std::vector<std::pair<int64_t *, int64_t>>();
+      }
+      group_counts->push_back({ counts[i].at, counts[i].n });
+    }
   }
   activity--;
   if (create && (group_depth == 0 || !ok)) {
     creating--;
   }
+}
+
+void
+enter(int64_t *count, int64_t n, bool create)
+{
+  Count one = { count, n };
+  enter_counts(&one, 1, create);
+}
+
+void
+leave(bool ok, int64_t *count, int64_t n, bool create)
+{
+  Count one = { count, n };
+  leave_counts(ok, &one, 1, create);
 }
 
 bool
@@ -290,20 +393,22 @@ link_comm(Comm *c)
   c->parent_real = NULL;
   c->target = -1;
   size_t n = c->nranks > 0 ? c->nranks : 0;
-  c->sent.assign(n, 0);
-  c->received.assign(n, 0);
-  c->send_target.assign(n, 0);
-  c->recv_target.assign(n, 0);
+  for (Traffic &t : c->traffic) {
+    t.out.assign(n, 0);
+    t.in.assign(n, 0);
+    t.out_target.assign(n, 0);
+    t.in_target.assign(n, 0);
+  }
   {
     std::lock_guard<std::mutex> guard(objs_lock);
     obj_link(c, FRONT_NCCL);
   }
   std::lock_guard<std::mutex> guard(nccl_lock);
   comms.push_back(c);
-  if (c->made == INIT_RANK) {
-    // Its members have met at the unique id's bootstrap root.
+  // Its members have met at its unique ids' bootstrap roots.
+  for (uint64_t ident : c->ids) {
     unused_ids.erase(std::remove(unused_ids.begin(), unused_ids.end(),
-                                 c->ident),
+                                 ident),
                      unused_ids.end());
   }
 }
@@ -350,7 +455,8 @@ wait_made(Comm *c)
 bool
 pending(const Comm *c, ncclResult_t rc)
 {
-  return c->real == NULL || (rc == ncclInProgress && c->made == SPLIT);
+  return c->real == NULL ||
+         (rc == ncclInProgress && (c->made == SPLIT || c->made == SHRINK));
 }
 
 // A creation's record: linked now, or at the end of the group region it is
@@ -376,17 +482,29 @@ made_comm(Comm *c, ncclResult_t rc)
   return (ncclComm_t)c;
 }
 
-// The outermost ncclGroupEnd.  Its creations by unique id are no longer in
-// flight; the others were steps on their parent.
+void win_made(Win *w, void **app);
+bool wait_made(Comm *c);
+
+// The outermost ncclGroupEnd, or ncclGroupSimulateEnd (simulated), which
+// runs nothing: its calls' counts are taken back, and what they would have
+// made is not.  The region's creations by unique id or shrink are no longer
+// in flight; the others were steps on their parent.
 void
-end_group(ncclResult_t rc)
+end_group(ncclResult_t rc, bool simulated)
 {
   std::vector<Comm *> *made = group_made;
   group_made = NULL;
-  int unique = 0;
+  std::vector<std::pair<Win *, void **>> *wins = group_wins;
+  group_wins = NULL;
+  std::vector<std::pair<int64_t *, int64_t>> *counts = group_counts;
+  group_counts = NULL;
+  if (simulated) {
+    rc = ncclInternalError;  // nothing made
+  }
+  int joined = 0;
   if (made != NULL) {
     for (Comm *c : *made) {
-      unique += c->made == INIT_RANK;
+      joined += c->made == INIT_RANK || c->made == SHRINK;
       if (!posted(rc)) {
         delete c;
       } else if (!pending(c, rc) || wait_made(c)) {
@@ -395,8 +513,27 @@ end_group(ncclResult_t rc)
     }
     delete made;
   }
+  if (wins != NULL) {
+    for (auto &w : *wins) {
+      // A non-blocking communicator's window is there once it is ready.
+      if (posted(rc) && (rc == ncclSuccess || wait_made(w.first->c))) {
+        win_made(w.first, w.second);
+      } else {
+        delete w.first;
+      }
+    }
+    delete wins;
+  }
   std::lock_guard<std::mutex> guard(nccl_lock);
-  creating -= unique;
+  if (counts != NULL) {
+    if (simulated) {
+      for (auto &count : *counts) {
+        *count.first -= count.second;
+      }
+    }
+    delete counts;
+  }
+  creating -= joined;
   activity--;
 }
 
@@ -411,6 +548,127 @@ keep_config(Comm *c, const ncclConfig_t *config)
   c->net_name = config->netName != NULL ? config->netName : "";
   c->comm_name = config->commName != NULL ? config->commName : "";
   c->nonblocking = config->blocking == 0;
+}
+
+// A split's or a shrink's config: its own, else its parent's, as NCCL gives
+// it.
+void
+child_config(Comm *c, const Comm *parent, const ncclConfig_t *config)
+{
+  keep_config(c, config);
+  if (config == NULL && parent != NULL) {
+    c->has_config = parent->has_config;
+    c->config = parent->config;
+    c->net_name = parent->net_name;
+    c->comm_name = parent->comm_name;
+    c->nonblocking = parent->nonblocking;
+  }
+}
+
+bool
+custom_op(ncclRedOp_t op)
+{
+  return (int)op >= (int)ncclNumOps;
+}
+
+// NCCL's value of an operator of the communicator.
+ncclRedOp_t
+real_op(Comm *c, ncclRedOp_t op)
+{
+  if (c == NULL || !custom_op(op)) {
+    return op;
+  }
+  std::lock_guard<std::mutex> guard(nccl_lock);
+  for (const Op &o : c->ops) {
+    if (o.value == op) {
+      return o.real;
+    }
+  }
+  return op;
+}
+
+bool
+op_used_locked(const Comm *c, ncclRedOp_t value)
+{
+  for (const Op &o : c->ops) {
+    if (o.value == value) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// The record of the communicator's window that the application holds as
+// win, if it is one.
+Win *
+win_of(Comm *c, const void *win)
+{
+  if (c == NULL || win == NULL) {
+    return NULL;
+  }
+  std::lock_guard<std::mutex> guard(nccl_lock);
+  for (Win *w : c->wins) {
+    if (w == win) {
+      return w;
+    }
+  }
+  return NULL;
+}
+
+// NCCL's window for the application's.
+void *
+real_win(Comm *c, void *win)
+{
+  Win *w = win_of(c, win);
+  return w != NULL ? w->real : win;
+}
+
+// A window that NCCL has written into the application's variable *app: the
+// application gets the record instead.  NCCL makes none across nodes, and
+// writes NULL, which the application then sees.
+void
+win_made(Win *w, void **app)
+{
+  w->real = *app;
+  if (w->real == NULL) {
+    delete w;
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> guard(nccl_lock);
+    w->c->wins.push_back(w);
+  }
+  *app = w;
+}
+
+// Where a call's traffic with a peer is counted.
+int64_t *
+traffic_count(Comm *c, Kind kind, bool out, int peer)
+{
+  if (c == NULL) {
+    return NULL;
+  }
+  Traffic &t = c->traffic[kind];
+  std::vector<int64_t> &v = out ? t.out : t.in;
+  if (peer < 0 || peer >= (int)v.size()) {
+    return NULL;
+  }
+  return &v[peer];
+}
+
+// What the program made on a communicator, which goes with it.
+void
+forget_made_locked(Comm *c)
+{
+  for (Reg *r : c->regs) {
+    delete r;
+  }
+  c->regs.clear();
+  for (Win *w : c->wins) {
+    delete w;
+  }
+  c->wins.clear();
+  c->ops.clear();
 }
 
 // The communicators are not in the restart's replay of the records: they
@@ -467,22 +725,28 @@ struct Published {
   uint64_t ident;
   int rank;
   int64_t seq;
-  std::vector<int64_t> sent;
-  std::vector<int64_t> received;
+  std::vector<int64_t> out[KINDS];
+  std::vector<int64_t> in[KINDS];
 };
 
 // What the members published in the last round, for one communicator.
 struct Read {
   Comm *c;
   int64_t seq;           // the largest step, plus 1; 0 if none
-  std::vector<int64_t> send_target;
-  std::vector<int64_t> recv_target;
+  std::vector<int64_t> out_target[KINDS];
+  std::vector<int64_t> in_target[KINDS];
 };
 
-// Keys in KV: s/<ident>, the members' largest step plus 1; q/<ident>, 1 if
-// a member has sent or received; p/<ident>/<src>/<dst>, the bytes that
-// src has posted to send to dst; r/<ident>/<src>/<dst>, the bytes that dst
-// has posted to receive from src.  Values only grow (MANA_KV_MAX).
+// Keys in KV: s/<ident>, the members' largest step plus 1.  For bytes:
+// q/<ident>, 1 if a member has sent or received; p/<ident>/<src>/<dst>, the
+// bytes that src has posted to send to dst; r/<ident>/<src>/<dst>, the bytes
+// that dst has posted to receive from src.  For signals, the same with z, x
+// and y: the signals that src has posted to dst, and the ones dst has
+// posted to wait for from src.  Values only grow (MANA_KV_MAX).
+const char USED_KEY[KINDS] = { 'q', 'z' };
+const char OUT_KEY[KINDS] = { 'p', 'x' };
+const char IN_KEY[KINDS] = { 'r', 'y' };
+
 void
 key(char *buf, size_t size, char kind, uint64_t ident, int src = -1,
     int dst = -1)
@@ -514,20 +778,22 @@ adopt_targets()
     Comm *c = r.c;  // its identity, size and rank do not change
     key(k, sizeof k, 's', c->ident);
     r.seq = mana_ckpt_kv_get(KV, k);
-    key(k, sizeof k, 'q', c->ident);
-    if (mana_ckpt_kv_get(KV, k) == 0) {
-      continue;
-    }
-    r.send_target.assign(c->nranks, 0);
-    r.recv_target.assign(c->nranks, 0);
-    for (int peer = 0; peer < c->nranks; peer++) {
-      if (peer == c->rank) {
+    for (int kind = 0; kind < KINDS; kind++) {
+      key(k, sizeof k, USED_KEY[kind], c->ident);
+      if (mana_ckpt_kv_get(KV, k) == 0) {
         continue;
       }
-      key(k, sizeof k, 'r', c->ident, c->rank, peer);
-      r.send_target[peer] = mana_ckpt_kv_get(KV, k);
-      key(k, sizeof k, 'p', c->ident, peer, c->rank);
-      r.recv_target[peer] = mana_ckpt_kv_get(KV, k);
+      r.out_target[kind].assign(c->nranks, 0);
+      r.in_target[kind].assign(c->nranks, 0);
+      for (int peer = 0; peer < c->nranks; peer++) {
+        if (peer == c->rank) {
+          continue;
+        }
+        key(k, sizeof k, IN_KEY[kind], c->ident, c->rank, peer);
+        r.out_target[kind][peer] = mana_ckpt_kv_get(KV, k);
+        key(k, sizeof k, OUT_KEY[kind], c->ident, peer, c->rank);
+        r.in_target[kind][peer] = mana_ckpt_kv_get(KV, k);
+      }
     }
   }
   std::lock_guard<std::mutex> guard(nccl_lock);
@@ -536,11 +802,14 @@ adopt_targets()
     if (r.seq > 0) {
       c->target = std::max(c->target, r.seq - 1);
     }
-    for (size_t peer = 0; peer < r.send_target.size(); peer++) {
-      c->send_target[peer] = std::max(c->send_target[peer],
-                                      r.send_target[peer]);
-      c->recv_target[peer] = std::max(c->recv_target[peer],
-                                      r.recv_target[peer]);
+    for (int kind = 0; kind < KINDS; kind++) {
+      Traffic &t = c->traffic[kind];
+      for (size_t peer = 0; peer < r.out_target[kind].size(); peer++) {
+        t.out_target[peer] = std::max(t.out_target[peer],
+                                      r.out_target[kind][peer]);
+        t.in_target[peer] = std::max(t.in_target[peer],
+                                     r.in_target[kind][peer]);
+      }
     }
   }
   for (Comm *c : comms) {
@@ -611,17 +880,24 @@ settle(int progress, std::vector<Published> *out, bool *behind,
       settled = settled && (c->destroyed || c->seq == c->target);
       continue;
     }
-    out->push_back({ c->ident, c->rank, c->seq, c->sent, c->received });
+    Published p = { c->ident, c->rank, c->seq, {}, {} };
+    for (int kind = 0; kind < KINDS; kind++) {
+      p.out[kind] = c->traffic[kind].out;
+      p.in[kind] = c->traffic[kind].in;
+    }
+    out->push_back(std::move(p));
     if (c->destroyed) {
       continue;
     }
     if (c->target < 0 || c->seq != c->target) {
       settled = false;
     }
-    for (size_t peer = 0; peer < c->sent.size(); peer++) {
-      if (c->sent[peer] != c->send_target[peer] ||
-          c->received[peer] != c->recv_target[peer]) {
-        settled = false;
+    for (const Traffic &t : c->traffic) {
+      for (size_t peer = 0; peer < t.out.size(); peer++) {
+        if (t.out[peer] != t.out_target[peer] ||
+            t.in[peer] != t.in_target[peer]) {
+          settled = false;
+        }
       }
     }
   }
@@ -640,22 +916,24 @@ publish(const std::vector<Published> &pubs)
   for (const Published &p : pubs) {
     key(k, sizeof k, 's', p.ident);
     mana_ckpt_kv_update(KV, k, MANA_KV_MAX, p.seq + 1);
-    bool p2p = false;
-    for (size_t peer = 0; peer < p.sent.size(); peer++) {
-      if (p.sent[peer] > 0) {
-        key(k, sizeof k, 'p', p.ident, p.rank, peer);
-        mana_ckpt_kv_update(KV, k, MANA_KV_MAX, p.sent[peer]);
-        p2p = true;
+    for (int kind = 0; kind < KINDS; kind++) {
+      bool used = false;
+      for (size_t peer = 0; peer < p.out[kind].size(); peer++) {
+        if (p.out[kind][peer] > 0) {
+          key(k, sizeof k, OUT_KEY[kind], p.ident, p.rank, peer);
+          mana_ckpt_kv_update(KV, k, MANA_KV_MAX, p.out[kind][peer]);
+          used = true;
+        }
+        if (p.in[kind][peer] > 0) {
+          key(k, sizeof k, IN_KEY[kind], p.ident, peer, p.rank);
+          mana_ckpt_kv_update(KV, k, MANA_KV_MAX, p.in[kind][peer]);
+          used = true;
+        }
       }
-      if (p.received[peer] > 0) {
-        key(k, sizeof k, 'r', p.ident, peer, p.rank);
-        mana_ckpt_kv_update(KV, k, MANA_KV_MAX, p.received[peer]);
-        p2p = true;
+      if (used) {
+        key(k, sizeof k, USED_KEY[kind], p.ident);
+        mana_ckpt_kv_update(KV, k, MANA_KV_MAX, 1);
       }
-    }
-    if (p2p) {
-      key(k, sizeof k, 'q', p.ident);
-      mana_ckpt_kv_update(KV, k, MANA_KV_MAX, 1);
     }
   }
 }
@@ -667,8 +945,9 @@ posted_locked(int64_t *steps, int64_t *bytes)
   *steps = *bytes = 0;
   for (Comm *c : comms) {
     *steps += c->seq;
-    for (size_t peer = 0; peer < c->sent.size(); peer++) {
-      *bytes += c->sent[peer] + c->received[peer];
+    const Traffic &t = c->traffic[BYTES];
+    for (size_t peer = 0; peer < t.out.size(); peer++) {
+      *bytes += t.out[peer] + t.in[peer];
     }
   }
 }
@@ -688,18 +967,26 @@ report_owed(long seconds)
               "%lld\n", seconds, (unsigned long long)c->ident, c->rank,
               c->nranks, (long long)c->seq, (long long)c->target);
     }
-    for (size_t peer = 0; peer < c->sent.size(); peer++) {
-      if (c->sent[peer] < c->send_target[peer]) {
-        fprintf(stderr, "MANA: --cuda: %ld s into the checkpoint, NCCL "
-                "communicator %016llx: rank %d owes rank %zu sends of %lld "
-                "B\n", seconds, (unsigned long long)c->ident, c->rank, peer,
-                (long long)(c->send_target[peer] - c->sent[peer]));
-      }
-      if (c->received[peer] < c->recv_target[peer]) {
-        fprintf(stderr, "MANA: --cuda: %ld s into the checkpoint, NCCL "
-                "communicator %016llx: rank %d owes rank %zu receives of "
-                "%lld B\n", seconds, (unsigned long long)c->ident, c->rank,
-                peer, (long long)(c->recv_target[peer] - c->received[peer]));
+    static const char *const out_what[KINDS] = { "sends of", "signals:" };
+    static const char *const in_what[KINDS] = { "receives of", "waits:" };
+    static const char *const unit[KINDS] = { " B", "" };
+    for (int kind = 0; kind < KINDS; kind++) {
+      const Traffic &t = c->traffic[kind];
+      for (size_t peer = 0; peer < t.out.size(); peer++) {
+        if (t.out[peer] < t.out_target[peer]) {
+          fprintf(stderr, "MANA: --cuda: %ld s into the checkpoint, NCCL "
+                  "communicator %016llx: rank %d owes rank %zu %s %lld%s\n",
+                  seconds, (unsigned long long)c->ident, c->rank, peer,
+                  out_what[kind], (long long)(t.out_target[peer] - t.out[peer]),
+                  unit[kind]);
+        }
+        if (t.in[peer] < t.in_target[peer]) {
+          fprintf(stderr, "MANA: --cuda: %ld s into the checkpoint, NCCL "
+                  "communicator %016llx: rank %d owes rank %zu %s %lld%s\n",
+                  seconds, (unsigned long long)c->ident, c->rank, peer,
+                  in_what[kind], (long long)(t.in_target[peer] - t.in[peer]),
+                  unit[kind]);
+        }
       }
     }
   }
@@ -895,6 +1182,147 @@ rebuild_group(const char *db, bool nonblocking)
   return todo.size();
 }
 
+bool
+live(const Comm *c)
+{
+  return !c->destroyed && c->real != NULL;
+}
+
+// The buffer registrations, each local to its rank.  The buffers are at the
+// same addresses, unless the program freed one without deregistering it,
+// which NCCL lets pass: then the registration is gone, with a warning.
+size_t
+restore_regs()
+{
+  size_t n = 0;
+  for (Comm *c : comms) {
+    for (Reg *r : c->regs) {
+      r->real = NULL;
+#ifdef FRONT_IDX_nccl_ncclCommRegister
+      if (!live(c)) {
+        continue;
+      }
+      front_use_device(c->device);
+      ncclResult_t rc;
+      NCCL_LH(rc = NCCL(ncclCommRegister)((ncclComm_t)c->real, r->buff,
+                                          r->size, &r->real));
+      if (rc != ncclSuccess) {
+        r->real = NULL;
+        fprintf(stderr, "MANA: --cuda: registering %zu B at %p with NCCL "
+                "communicator %016llx again failed (error %d); freed "
+                "without ncclCommDeregister?\n", r->size, r->buff,
+                (unsigned long long)c->ident, rc);
+        continue;
+      }
+      n++;
+#endif
+    }
+  }
+  return n;
+}
+
+// The windows of the communicators, blocking or not, in one group region:
+// registering a window is collective.
+size_t
+restore_wins(bool nonblocking)
+{
+  std::vector<Win *> todo;
+  for (Comm *c : comms) {
+    for (Win *w : c->wins) {
+      if (!live(c)) {
+        w->real = NULL;
+      } else if (c->nonblocking == nonblocking) {
+        todo.push_back(w);
+      }
+    }
+  }
+  if (todo.empty()) {
+    return 0;
+  }
+#ifdef FRONT_IDX_nccl_ncclCommWindowRegister
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclGroupStart)());
+  for (size_t i = 0; i < todo.size() && posted(rc); i++) {
+    Win *w = todo[i];
+    front_use_device(w->c->device);
+    w->real = NULL;
+    NCCL_LH(rc = NCCL(ncclCommWindowRegister)((ncclComm_t)w->c->real,
+                                              w->buff, w->size,
+                                              (ncclWindow_t *)&w->real,
+                                              w->flags));
+  }
+  ncclResult_t end_rc;
+  NCCL_LH(end_rc = NCCL(ncclGroupEnd)());
+  if (posted(rc)) {
+    rc = end_rc;
+  }
+  for (Win *w : todo) {
+    if (posted(rc) && nonblocking && !wait_made(w->c)) {
+      rc = ncclInternalError;
+    }
+    if (!posted(rc) || w->real == NULL) {
+      front_fatal("registering NCCL window of %zu B at %p again: error %d\n",
+                  w->size, w->buff, rc);
+    }
+  }
+#endif
+  return todo.size();
+}
+
+// The PreMulSum operators: NCCL's values change, the application's do not.
+size_t
+restore_ops()
+{
+  size_t n = 0;
+#ifdef FRONT_IDX_nccl_ncclRedOpCreatePreMulSum
+  for (Comm *c : comms) {
+    if (!live(c)) {
+      continue;
+    }
+    for (Op &o : c->ops) {
+      front_use_device(c->device);
+      void *scalar =
+        o.residence == ncclScalarHostImmediate ? &o.immediate : o.scalar;
+      ncclResult_t rc;
+      NCCL_LH(rc = NCCL(ncclRedOpCreatePreMulSum)(&o.real, scalar, o.datatype,
+                                                  o.residence,
+                                                  (ncclComm_t)c->real));
+      if (rc != ncclSuccess) {
+        front_fatal("making NCCL operator %d of communicator %016llx again: "
+                    "error %d\n", (int)o.value, (unsigned long long)c->ident,
+                    rc);
+      }
+      n++;
+    }
+  }
+#endif
+  return n;
+}
+
+// The communicators that were suspended, last: a suspended one takes no
+// other call.
+size_t
+restore_suspended()
+{
+  size_t n = 0;
+#ifdef FRONT_IDX_nccl_ncclCommSuspend
+  for (Comm *c : comms) {
+    if (!live(c) || !c->suspended) {
+      continue;
+    }
+    front_use_device(c->device);
+    ncclResult_t rc;
+    NCCL_LH(rc = NCCL(ncclCommSuspend)((ncclComm_t)c->real, c->suspend_flags));
+    if (!posted(rc) || (rc == ncclInProgress && !wait_made(c))) {
+      front_fatal("suspending NCCL communicator %016llx again: error %d\n",
+                  (unsigned long long)c->ident, rc);
+    }
+    n++;
+  }
+#endif
+  return n;
+}
+
 }  // namespace
 
 // MANA_STEP_DRAIN, before MPI's drain, with the application's threads
@@ -919,8 +1347,10 @@ front_nccl_drain()
     creation_pending = false;
     for (Comm *c : comms) {
       c->target = -1;
-      std::fill(c->send_target.begin(), c->send_target.end(), 0);
-      std::fill(c->recv_target.begin(), c->recv_target.end(), 0);
+      for (Traffic &t : c->traffic) {
+        std::fill(t.out_target.begin(), t.out_target.end(), 0);
+        std::fill(t.in_target.begin(), t.in_target.end(), 0);
+      }
     }
   }
   long slice_ms = 10;
@@ -1042,10 +1472,16 @@ front_nccl_rebuild()
     }
     n += rebuild_group(db, false);
     n += rebuild_group(db, true);
+    size_t regs = restore_regs();
+    size_t wins = restore_wins(false) + restore_wins(true);
+    size_t ops = restore_ops();
+    size_t suspended = restore_suspended();
     std::chrono::duration<double> took =
       std::chrono::steady_clock::now() - start;
-    front_log("NCCL: %zu of %zu communicator(s) made again in %.2f s\n", n,
-              comms.size(), took.count());
+    front_log("NCCL: %zu of %zu communicator(s) made again in %.2f s; %zu "
+              "buffer registration(s), %zu window(s), %zu operator(s), %zu "
+              "suspended\n", n, comms.size(), took.count(), regs, wins, ops,
+              suspended);
   }
   draining = false;
   gate_cv.notify_all();
@@ -1067,11 +1503,13 @@ ncclGetUniqueId(ncclUniqueId *uniqueId)
   return rc;
 }
 
-extern "C" ncclResult_t
-ncclCommInitRankConfig(ncclComm_t *comm, int nranks, ncclUniqueId commId,
-                       int rank, ncclConfig_t *config)
+// ncclCommInitRank(Config) with one unique id, ncclCommInitRankScalable with
+// several.  A restart makes either again by one.
+static ncclResult_t
+init_rank(ncclComm_t *comm, int nranks, int nids, const ncclUniqueId *commIds,
+          int rank, ncclConfig_t *config, bool scalable)
 {
-  if (comm == NULL) {
+  if (comm == NULL || commIds == NULL || nids <= 0) {
     return ncclInvalidArgument;
   }
   enter(NULL, 0, true);
@@ -1079,10 +1517,12 @@ ncclCommInitRankConfig(ncclComm_t *comm, int nranks, ncclUniqueId commId,
   front_before_library();
   Comm *c = new Comm();
   c->made = INIT_RANK;
-  c->id = commId;
-  c->ident = digest(DIGEST_START, &commId, sizeof commId);
-  ncclUniqueId id = commId;
-  renewed_id(c->ident, &id);
+  c->ident = digest(DIGEST_START, commIds, nids * sizeof *commIds);
+  std::vector<ncclUniqueId> ids(commIds, commIds + nids);
+  for (ncclUniqueId &id : ids) {
+    c->ids.push_back(digest(DIGEST_START, &id, sizeof id));
+    renewed_id(c->ids.back(), &id);
+  }
   c->nranks = nranks;
   c->rank = rank;
   keep_config(c, config);
@@ -1094,12 +1534,17 @@ ncclCommInitRankConfig(ncclComm_t *comm, int nranks, ncclUniqueId commId,
   // In a group region, NCCL writes the communicator at ncclGroupEnd: into
   // the record, which lives on.
   ncclComm_t *real = (ncclComm_t *)&c->real;
-  ncclResult_t rc;
-  if (config != NULL) {
-    NCCL_LH(rc = NCCL(ncclCommInitRankConfig)(real, nranks, id, rank,
+  ncclResult_t rc = ncclInvalidUsage;
+  if (scalable) {
+#ifdef FRONT_IDX_nccl_ncclCommInitRankScalable
+    NCCL_LH(rc = NCCL(ncclCommInitRankScalable)(real, nranks, rank, nids,
+                                                ids.data(), config));
+#endif
+  } else if (config != NULL) {
+    NCCL_LH(rc = NCCL(ncclCommInitRankConfig)(real, nranks, ids[0], rank,
                                               config));
   } else {
-    NCCL_LH(rc = NCCL(ncclCommInitRank)(real, nranks, id, rank));
+    NCCL_LH(rc = NCCL(ncclCommInitRank)(real, nranks, ids[0], rank));
   }
   ncclComm_t made = made_comm(c, rc);
   if (made != NULL) {
@@ -1111,10 +1556,26 @@ ncclCommInitRankConfig(ncclComm_t *comm, int nranks, ncclUniqueId commId,
 }
 
 extern "C" ncclResult_t
+ncclCommInitRankConfig(ncclComm_t *comm, int nranks, ncclUniqueId commId,
+                       int rank, ncclConfig_t *config)
+{
+  return init_rank(comm, nranks, 1, &commId, rank, config, false);
+}
+
+extern "C" ncclResult_t
 ncclCommInitRank(ncclComm_t *comm, int nranks, ncclUniqueId commId, int rank)
 {
-  return ncclCommInitRankConfig(comm, nranks, commId, rank, NULL);
+  return init_rank(comm, nranks, 1, &commId, rank, NULL, false);
 }
+
+#ifdef FRONT_IDX_nccl_ncclCommInitRankScalable
+extern "C" ncclResult_t
+ncclCommInitRankScalable(ncclComm_t *newcomm, int nranks, int myrank, int nId,
+                         ncclUniqueId *commIds, ncclConfig_t *config)
+{
+  return init_rank(newcomm, nranks, nId, commIds, myrank, config, true);
+}
+#endif
 
 extern "C" ncclResult_t
 ncclCommInitAll(ncclComm_t *comms, int ndev, const int *devlist)
@@ -1187,14 +1648,7 @@ ncclCommSplit(ncclComm_t comm, int color, int key, ncclComm_t *newcomm,
     c->ident = digest(c->ident, &index, sizeof index);
     c->ident = digest(c->ident, &color, sizeof color);
   }
-  keep_config(c, config);
-  if (config == NULL && parent != NULL) {
-    c->has_config = parent->has_config;
-    c->config = parent->config;
-    c->net_name = parent->net_name;
-    c->comm_name = parent->comm_name;
-    c->nonblocking = parent->nonblocking;
-  }
+  child_config(c, parent, config);
   c->parent_real = front_translate(comm);
   NCCL_LH(rc = NCCL(ncclCommSplit)(c->parent_real, color, key,
                                    (ncclComm_t *)&c->real, config));
@@ -1206,6 +1660,68 @@ ncclCommSplit(ncclComm_t comm, int color, int key, ncclComm_t *newcomm,
   leave(posted(rc), parent != NULL ? &parent->seq : NULL, 1, false);
   return rc;
 }
+
+#ifdef FRONT_IDX_nccl_ncclCommShrink
+// A shrink makes a communicator of the parent's members that call it, the
+// ranks not left out: a creation that they must all join, but not a step
+// on the parent, which the ranks left out do not take.  A restart makes it
+// again as a split.
+extern "C" ncclResult_t
+ncclCommShrink(ncclComm_t comm, int *excludeRanksList, int excludeRanksCount,
+               ncclComm_t *newcomm, ncclConfig_t *config, int shrinkFlags)
+{
+  if (newcomm == NULL || excludeRanksCount < 0 ||
+      (excludeRanksCount > 0 && excludeRanksList == NULL)) {
+    return ncclInvalidArgument;
+  }
+  Comm *parent = comm_of(comm);
+  enter(NULL, 0, true);
+  FRONT_ENTER();
+  Comm *c = new Comm();
+  c->made = SHRINK;
+  c->nranks = c->rank = c->device = -1;
+  if (parent != NULL) {
+    std::vector<int> out(excludeRanksList,
+                         excludeRanksList + excludeRanksCount);
+    std::sort(out.begin(), out.end());
+    uint64_t left_out = digest(DIGEST_START, out.data(),
+                               out.size() * sizeof(int));
+    int index;
+    {
+      std::lock_guard<std::mutex> guard(nccl_lock);
+      auto it = std::find_if(parent->shrinks.begin(), parent->shrinks.end(),
+                             [&](const std::pair<uint64_t, int> &s) {
+                               return s.first == left_out;
+                             });
+      if (it == parent->shrinks.end()) {
+        parent->shrinks.push_back({ left_out, 0 });
+        it = parent->shrinks.end() - 1;
+      }
+      index = it->second++;
+    }
+    c->ident = digest(DIGEST_START, &parent->ident, sizeof parent->ident);
+    c->ident = digest(c->ident, "shrink", 6);
+    c->ident = digest(c->ident, &left_out, sizeof left_out);
+    c->ident = digest(c->ident, &index, sizeof index);
+  }
+  child_config(c, parent, config);
+  // NCCL_SHRINK_ABORT aborts the parent, so its error says nothing.
+  if (!(shrinkFlags & NCCL_SHRINK_ABORT)) {
+    c->parent_real = front_translate(comm);
+  }
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclCommShrink)(front_translate(comm), excludeRanksList,
+                                    excludeRanksCount, (ncclComm_t *)&c->real,
+                                    config, shrinkFlags));
+  ncclComm_t made = made_comm(c, rc);
+  if (made != NULL) {
+    *newcomm = made;
+  }
+  FRONT_LEAVE();
+  leave(made != NULL, NULL, 0, true);
+  return rc;
+}
+#endif
 
 extern "C" ncclResult_t
 ncclCommFinalize(ncclComm_t comm)
@@ -1249,6 +1765,7 @@ end_comm(ncclComm_t comm, bool abort)
     std::lock_guard<std::mutex> guard(nccl_lock);
     c->destroyed = true;
     c->real = NULL;
+    forget_made_locked(c);
   }
   FRONT_LEAVE();
   leave(rc == ncclSuccess, step, 1, false);
@@ -1314,14 +1831,30 @@ ncclGroupEnd()
   ncclResult_t rc;
   NCCL_LH(rc = NCCL(ncclGroupEnd)());
   if (group_depth > 0 && --group_depth == 0) {
-    end_group(rc);
+    end_group(rc, false);
   }
   FRONT_LEAVE();
   return rc;
 }
 
-// The collectives: a step each; the communicator and the stream
-// translated.
+#ifdef FRONT_IDX_nccl_ncclGroupSimulateEnd
+// Ends the group region as ncclGroupEnd does, without running it.
+extern "C" ncclResult_t
+ncclGroupSimulateEnd(ncclSimInfo_t *simInfo)
+{
+  FRONT_ENTER();
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclGroupSimulateEnd)(simInfo));
+  if (group_depth > 0 && --group_depth == 0) {
+    end_group(rc, true);
+  }
+  FRONT_LEAVE();
+  return rc;
+}
+#endif
+
+// The collectives: a step each; the communicator, the stream and the
+// operator translated.
 #define NCCL_COLLECTIVE(name, params, args)                         \
   extern "C" ncclResult_t name params                               \
   {                                                                 \
@@ -1342,8 +1875,8 @@ NCCL_COLLECTIVE(ncclAllReduce,
                 (const void *sendbuff, void *recvbuff, size_t count,
                  ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
                  cudaStream_t stream),
-                (sendbuff, recvbuff, count, datatype, op, real_comm,
-                 real_stream))
+                (sendbuff, recvbuff, count, datatype, real_op(c, op),
+                 real_comm, real_stream))
 NCCL_COLLECTIVE(ncclBroadcast,
                 (const void *sendbuff, void *recvbuff, size_t count,
                  ncclDataType_t datatype, int root, ncclComm_t comm,
@@ -1358,8 +1891,8 @@ NCCL_COLLECTIVE(ncclReduce,
                 (const void *sendbuff, void *recvbuff, size_t count,
                  ncclDataType_t datatype, ncclRedOp_t op, int root,
                  ncclComm_t comm, cudaStream_t stream),
-                (sendbuff, recvbuff, count, datatype, op, root, real_comm,
-                 real_stream))
+                (sendbuff, recvbuff, count, datatype, real_op(c, op), root,
+                 real_comm, real_stream))
 NCCL_COLLECTIVE(ncclAllGather,
                 (const void *sendbuff, void *recvbuff, size_t sendcount,
                  ncclDataType_t datatype, ncclComm_t comm,
@@ -1370,8 +1903,8 @@ NCCL_COLLECTIVE(ncclReduceScatter,
                 (const void *sendbuff, void *recvbuff, size_t recvcount,
                  ncclDataType_t datatype, ncclRedOp_t op, ncclComm_t comm,
                  cudaStream_t stream),
-                (sendbuff, recvbuff, recvcount, datatype, op, real_comm,
-                 real_stream))
+                (sendbuff, recvbuff, recvcount, datatype, real_op(c, op),
+                 real_comm, real_stream))
 #ifdef FRONT_IDX_nccl_ncclAlltoAll
 NCCL_COLLECTIVE(ncclAlltoAll,
                 (const void *sendbuff, void *recvbuff, size_t count,
@@ -1400,21 +1933,12 @@ NCCL_COLLECTIVE(ncclScatter,
 // Point-to-point: the bytes to or from the peer.  NCCL has no wildcard
 // receive, and a pair's sends and receives match in the order posted, so
 // the counts say which operations still lack their counterpart.
-static int64_t *
-p2p_count(Comm *c, std::vector<int64_t> Comm::*counts, int peer)
-{
-  if (c == NULL || peer < 0 || peer >= (int)(c->*counts).size()) {
-    return NULL;
-  }
-  return &(c->*counts)[peer];
-}
-
 extern "C" ncclResult_t
 ncclSend(const void *sendbuff, size_t count, ncclDataType_t datatype, int peer,
          ncclComm_t comm, cudaStream_t stream)
 {
   Comm *c = comm_of(comm);
-  int64_t *sent = p2p_count(c, &Comm::sent, peer);
+  int64_t *sent = traffic_count(c, BYTES, true, peer);
   int64_t bytes = (int64_t)(count * type_size(datatype));
   enter(sent, bytes, false);
   FRONT_ENTER();
@@ -1432,7 +1956,7 @@ ncclRecv(void *recvbuff, size_t count, ncclDataType_t datatype, int peer,
          ncclComm_t comm, cudaStream_t stream)
 {
   Comm *c = comm_of(comm);
-  int64_t *received = p2p_count(c, &Comm::received, peer);
+  int64_t *received = traffic_count(c, BYTES, false, peer);
   int64_t bytes = (int64_t)(count * type_size(datatype));
   enter(received, bytes, false);
   FRONT_ENTER();
@@ -1474,3 +1998,308 @@ ncclMemFree(void *ptr)
   }
   return result == cudaSuccess ? ncclSuccess : ncclUnhandledCudaError;
 }
+
+#ifdef FRONT_IDX_nccl_ncclCommRegister
+// A buffer registration is local to the rank.  The application's handle is
+// the record, which a restart registers again.
+extern "C" ncclResult_t
+ncclCommRegister(const ncclComm_t comm, void *buff, size_t size, void **handle)
+{
+  if (handle == NULL) {
+    return ncclInvalidArgument;
+  }
+  Comm *c = comm_of(comm);
+  FRONT_ENTER();
+  void *real = NULL;
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclCommRegister)(front_translate(comm), buff, size,
+                                      &real));
+  FRONT_LEAVE();
+  if (rc != ncclSuccess || c == NULL) {
+    *handle = real;
+    return rc;
+  }
+  Reg *r = new Reg{ c, buff, size, real };
+  std::lock_guard<std::mutex> guard(nccl_lock);
+  c->regs.push_back(r);
+  *handle = r;
+  return rc;
+}
+
+extern "C" ncclResult_t
+ncclCommDeregister(const ncclComm_t comm, void *handle)
+{
+  Comm *c = comm_of(comm);
+  Reg *r = NULL;
+  if (c != NULL) {
+    std::lock_guard<std::mutex> guard(nccl_lock);
+    auto it = std::find(c->regs.begin(), c->regs.end(), (Reg *)handle);
+    if (it != c->regs.end()) {
+      r = *it;
+    }
+  }
+  ncclResult_t rc = ncclSuccess;
+  FRONT_ENTER();
+  if (r == NULL) {
+    NCCL_LH(rc = NCCL(ncclCommDeregister)(front_translate(comm), handle));
+  } else if (r->real != NULL) {  // else gone with a finalized communicator
+    NCCL_LH(rc = NCCL(ncclCommDeregister)(front_translate(comm), r->real));
+  }
+  FRONT_LEAVE();
+  if (r != NULL && rc == ncclSuccess) {
+    std::lock_guard<std::mutex> guard(nccl_lock);
+    c->regs.erase(std::remove(c->regs.begin(), c->regs.end(), r),
+                  c->regs.end());
+    delete r;
+  }
+  return rc;
+}
+#endif
+
+#ifdef FRONT_IDX_nccl_ncclCommWindowRegister
+// Registering a window is collective: a step on its communicator.  NCCL
+// writes its window into the application's variable, at ncclGroupEnd in a
+// group region; then the front puts its record there (win_made()).
+extern "C" ncclResult_t
+ncclCommWindowRegister(ncclComm_t comm, void *buff, size_t size,
+                       ncclWindow_t *win, int winFlags)
+{
+  if (win == NULL) {
+    return ncclInvalidArgument;
+  }
+  Comm *c = comm_of(comm);
+  int64_t *step = c != NULL ? &c->seq : NULL;
+  enter(step, 1, false);
+  FRONT_ENTER();
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclCommWindowRegister)(front_translate(comm), buff, size,
+                                            win, winFlags));
+  if (posted(rc) && c != NULL) {
+    Win *w = new Win{ c, buff, size, winFlags, NULL };
+    if (group_depth > 0) {
+      if (group_wins == NULL) {
+        group_wins = new std::vector<std::pair<Win *, void **>>();
+      }
+      group_wins->push_back({ w, (void **)win });
+    } else if (rc == ncclSuccess || wait_made(c)) {
+      win_made(w, (void **)win);
+    } else {
+      delete w;
+    }
+  }
+  FRONT_LEAVE();
+  leave(posted(rc), step, 1, false);
+  return rc;
+}
+
+// Deregistering a window is local.
+extern "C" ncclResult_t
+ncclCommWindowDeregister(ncclComm_t comm, ncclWindow_t win)
+{
+  Comm *c = comm_of(comm);
+  Win *w = win_of(c, win);
+  ncclResult_t rc = ncclSuccess;
+  FRONT_ENTER();
+  if (w == NULL) {
+    NCCL_LH(rc = NCCL(ncclCommWindowDeregister)(front_translate(comm), win));
+  } else if (w->real != NULL) {  // else gone with a finalized communicator
+    NCCL_LH(rc = NCCL(ncclCommWindowDeregister)(front_translate(comm),
+                                                (ncclWindow_t)w->real));
+  }
+  FRONT_LEAVE();
+  if (w != NULL && rc == ncclSuccess) {
+    std::lock_guard<std::mutex> guard(nccl_lock);
+    c->wins.erase(std::remove(c->wins.begin(), c->wins.end(), w),
+                  c->wins.end());
+    delete w;
+  }
+  return rc;
+}
+#endif
+
+#ifdef FRONT_IDX_nccl_ncclWinGetUserPtr
+extern "C" ncclResult_t
+ncclWinGetUserPtr(ncclComm_t comm, ncclWindow_t win, void **outUserPtr)
+{
+  Comm *c = comm_of(comm);
+  ncclWindow_t real = (ncclWindow_t)real_win(c, win);
+  FRONT_ENTER();
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclWinGetUserPtr)(front_translate(comm), real,
+                                       outUserPtr));
+  FRONT_LEAVE();
+  return rc;
+}
+#endif
+
+#ifdef FRONT_IDX_nccl_ncclPutSignal
+// One-sided operations: each signal to a peer, and each that a wait takes
+// from it, is traffic for the drain, which needs every signal taken: NCCL's
+// signals do not outlive a restart.  What a put writes is in the peer's
+// window, which is the front's memory.
+extern "C" ncclResult_t
+ncclPutSignal(const void *localbuff, size_t count, ncclDataType_t datatype,
+              int peer, ncclWindow_t peerWin, size_t peerWinOffset, int sigIdx,
+              int ctx, unsigned int flags, ncclComm_t comm,
+              cudaStream_t stream)
+{
+  Comm *c = comm_of(comm);
+  int64_t *signals = traffic_count(c, SIGNALS, true, peer);
+  ncclWindow_t real = (ncclWindow_t)real_win(c, peerWin);
+  enter(signals, 1, false);
+  FRONT_ENTER();
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclPutSignal)(localbuff, count, datatype, peer, real,
+                                   peerWinOffset, sigIdx, ctx, flags,
+                                   front_translate(comm),
+                                   front_real_stream(stream)));
+  FRONT_LEAVE();
+  leave(posted(rc), signals, 1, false);
+  return rc;
+}
+
+extern "C" ncclResult_t
+ncclSignal(int peer, int sigIdx, int ctx, unsigned int flags, ncclComm_t comm,
+           cudaStream_t stream)
+{
+  Comm *c = comm_of(comm);
+  int64_t *signals = traffic_count(c, SIGNALS, true, peer);
+  enter(signals, 1, false);
+  FRONT_ENTER();
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclSignal)(peer, sigIdx, ctx, flags,
+                                front_translate(comm),
+                                front_real_stream(stream)));
+  FRONT_LEAVE();
+  leave(posted(rc), signals, 1, false);
+  return rc;
+}
+
+extern "C" ncclResult_t
+ncclWaitSignal(int nDesc, ncclWaitSignalDesc_t *signalDescs, ncclComm_t comm,
+               cudaStream_t stream)
+{
+  Comm *c = comm_of(comm);
+  std::vector<Count> waits;
+  for (int i = 0; i < nDesc && signalDescs != NULL; i++) {
+    waits.push_back({ traffic_count(c, SIGNALS, false, signalDescs[i].peer),
+                      signalDescs[i].opCnt });
+  }
+  enter_counts(waits.data(), waits.size(), false);
+  FRONT_ENTER();
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclWaitSignal)(nDesc, signalDescs, front_translate(comm),
+                                    front_real_stream(stream)));
+  FRONT_LEAVE();
+  leave_counts(posted(rc), waits.data(), waits.size(), false);
+  return rc;
+}
+#endif
+
+#ifdef FRONT_IDX_nccl_ncclRedOpCreatePreMulSum
+// A PreMulSum operator is local to the rank.  The application keeps the
+// value it got; a restart makes the operator again (restore_ops()).
+extern "C" ncclResult_t
+ncclRedOpCreatePreMulSum(ncclRedOp_t *op, void *scalar,
+                         ncclDataType_t datatype,
+                         ncclScalarResidence_t residence, ncclComm_t comm)
+{
+  if (op == NULL) {
+    return ncclInvalidArgument;
+  }
+  Comm *c = comm_of(comm);
+  FRONT_ENTER();
+  ncclRedOp_t real;
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclRedOpCreatePreMulSum)(&real, scalar, datatype,
+                                              residence,
+                                              front_translate(comm)));
+  FRONT_LEAVE();
+  if (rc != ncclSuccess || c == NULL) {
+    if (rc == ncclSuccess) {
+      *op = real;
+    }
+    return rc;
+  }
+  Op o = {};
+  o.real = real;
+  o.datatype = datatype;
+  o.residence = residence;
+  o.scalar = scalar;
+  if (residence == ncclScalarHostImmediate && scalar != NULL) {
+    memcpy(&o.immediate, scalar,
+           std::min(type_size(datatype), sizeof o.immediate));
+  }
+  std::lock_guard<std::mutex> guard(nccl_lock);
+  o.value = real;
+  while (op_used_locked(c, o.value)) {
+    o.value = o.value == ncclMaxRedOp ? (ncclRedOp_t)ncclNumOps
+                                      : (ncclRedOp_t)(o.value + 1);
+  }
+  c->ops.push_back(o);
+  *op = o.value;
+  return rc;
+}
+
+extern "C" ncclResult_t
+ncclRedOpDestroy(ncclRedOp_t op, ncclComm_t comm)
+{
+  Comm *c = comm_of(comm);
+  ncclRedOp_t real = real_op(c, op);
+  bool ours = false;
+  if (c != NULL && custom_op(op)) {
+    std::lock_guard<std::mutex> guard(nccl_lock);
+    ours = op_used_locked(c, op);
+  }
+  ncclResult_t rc = ncclSuccess;
+  FRONT_ENTER();
+  if (!ours || c->real != NULL) {  // else gone with a finalized communicator
+    NCCL_LH(rc = NCCL(ncclRedOpDestroy)(real, front_translate(comm)));
+  }
+  FRONT_LEAVE();
+  if (ours && rc == ncclSuccess) {
+    std::lock_guard<std::mutex> guard(nccl_lock);
+    c->ops.erase(std::remove_if(c->ops.begin(), c->ops.end(),
+                                [op](const Op &o) { return o.value == op; }),
+                 c->ops.end());
+  }
+  return rc;
+}
+#endif
+
+#ifdef FRONT_IDX_nccl_ncclCommSuspend
+// Suspending a communicator is local; a restart suspends it again, so that
+// the program's ncclCommResume finds it so.
+extern "C" ncclResult_t
+ncclCommSuspend(ncclComm_t comm, int flags)
+{
+  Comm *c = comm_of(comm);
+  FRONT_ENTER();
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclCommSuspend)(front_translate(comm), flags));
+  FRONT_LEAVE();
+  if (posted(rc) && c != NULL) {
+    std::lock_guard<std::mutex> guard(nccl_lock);
+    c->suspended = true;
+    c->suspend_flags = flags;
+  }
+  return rc;
+}
+#endif
+
+#ifdef FRONT_IDX_nccl_ncclCommResume
+extern "C" ncclResult_t
+ncclCommResume(ncclComm_t comm)
+{
+  Comm *c = comm_of(comm);
+  FRONT_ENTER();
+  ncclResult_t rc;
+  NCCL_LH(rc = NCCL(ncclCommResume)(front_translate(comm)));
+  FRONT_LEAVE();
+  if (posted(rc) && c != NULL) {
+    std::lock_guard<std::mutex> guard(nccl_lock);
+    c->suspended = false;
+  }
+  return rc;
+}
+#endif

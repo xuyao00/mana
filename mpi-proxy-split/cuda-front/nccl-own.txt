@@ -2,19 +2,27 @@
 # communicators' lifecycle, which their records follow, and the unique ids,
 # which a restart makes again; the operations, which translate the stream
 # and count for the drain, and the group regions, which the drain waits
-# for; and ncclMemAlloc and ncclMemFree, through the front's allocator.
-# See gen-cuda-front.py and cuda/PLAN-nccl-front.md.
+# for; ncclMemAlloc and ncclMemFree, through the front's allocator; and what
+# a restart makes again on a communicator: buffer registrations, windows,
+# PreMulSum operators, and its suspension.  A name that ends in '?' is in
+# newer NCCLs only.  Not supported (they abort with their name): the device
+# API (ncclDevCommCreate, the device pointers of a window), whose addresses
+# a restart cannot keep; ncclCommGrow, ncclCommGetUniqueId and
+# ncclCommRevoke.  See gen-cuda-front.py and cuda/PLAN-nccl-front.md.
 ncclGetUniqueId
 ncclCommInitRank
 ncclCommInitRankConfig
 ncclCommInitAll
+ncclCommInitRankScalable?
 ncclCommSplit
+ncclCommShrink?
 ncclCommFinalize
 ncclCommDestroy
 ncclCommAbort
 ncclCommGetAsyncError
 ncclGroupStart
 ncclGroupEnd
+ncclGroupSimulateEnd?
 ncclAllReduce
 ncclBroadcast
 ncclBcast
@@ -28,3 +36,15 @@ ncclSend
 ncclRecv
 ncclMemAlloc
 ncclMemFree
+ncclCommRegister?
+ncclCommDeregister?
+ncclCommWindowRegister?
+ncclCommWindowDeregister?
+ncclWinGetUserPtr?
+ncclPutSignal?
+ncclSignal?
+ncclWaitSignal?
+ncclRedOpCreatePreMulSum?
+ncclRedOpDestroy?
+ncclCommSuspend?
+ncclCommResume?
