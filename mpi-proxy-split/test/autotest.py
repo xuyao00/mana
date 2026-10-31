@@ -182,6 +182,19 @@ TESTS = [
   # restart (cuda-front/front_nccl.cpp).
   Test("nccl", 2, nccl=True),
   Test("nccl_nompi", 2, nccl=True, no_mpi=True),
+  # NCCL and MPI calls interleaved: in the same order on every rank, in
+  # orders that differ by rank, and a message sent after NCCL calls that its
+  # receiver posts after it.
+  Test("nccl_mpi_spmd", 2, args=["spmd"], program="nccl_mpi",
+       reports="nccl_mpi", nccl=True),
+  Test("nccl_mpi_order", 2, args=["order"], program="nccl_mpi",
+       reports="nccl_mpi", nccl=True),
+  Test("nccl_mpi_send", 2, args=["send"], program="nccl_mpi",
+       reports="nccl_mpi", nccl=True,
+       known_bug="NCCL connects a communicator made again at a restart at "
+                 "its first all-reduce, which waits for the rank in MPI_Recv; "
+                 "NCCL_RUNTIME_CONNECT=0 connects it at once, but then NCCL "
+                 "2.29.7 sometimes fails ncclPutSignal after a restart"),
   Test("fortran_nonblocking", 2),
   Test("fortran_handles", 2),
   Test("fortran_attributes", 2),

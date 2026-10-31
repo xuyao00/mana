@@ -9,6 +9,7 @@
 #include "dmtcp_assert.h"
 #include "jconvert.h"
 #include "kvdb.h"
+#include "mana_core.h"
 #include "seq_num.h"
 #include "mpi_nextfunc.h"
 #include "virtual_id.h"
@@ -50,6 +51,7 @@ void seq_num_destroy() {
 
 void seq_num_reset() {
   ckpt_pending = false;
+  mana_drain_set_behind(MANA_LAYER_MPI, 0);
 }
 
 void print_seq_nums() {
@@ -74,6 +76,18 @@ int check_seq_nums() {
     }
   }
   return target_reached;
+}
+
+// This rank's flag in the layers' agreement (mana_core.h): whether it owes
+// its peers a collective, while a checkpoint is pending.  Whoever clears
+// ckpt_pending clears the flag, so that a collective outside a checkpoint
+// does not look at every communicator.
+static void
+update_behind()
+{
+  if (ckpt_pending) {
+    mana_drain_set_behind(MANA_LAYER_MPI, !check_seq_nums());
+  }
 }
 
 void seq_num_broadcast(MPI_Comm comm, unsigned long new_target) {
@@ -136,9 +150,11 @@ void commit_begin(MPI_Comm comm) {
   }
   // Checking ckpt_pending and incrementing the sequence number should be
   // atomic.  drain_mpi_collective() sets ckpt_pending and shares the
-  // sequence numbers under this lock.
+  // sequence numbers under this lock.  A rank that owes another layer (NCCL)
+  // passes: it may need this collective to get there.
   pthread_mutex_lock(&seq_num_lock);
-  while (ckpt_pending && check_seq_nums()) {
+  while (ckpt_pending && check_seq_nums() &&
+         !mana_drain_behind_elsewhere(MANA_LAYER_MPI)) {
     pthread_mutex_unlock(&seq_num_lock);
     MPI_Status status;
     int flag;
@@ -158,6 +174,7 @@ void commit_begin(MPI_Comm comm) {
         target.find(updated_comm);
       if (it != target.end() && it->second < updated_target) {
         target[updated_comm] = updated_target;
+        update_behind();
 #ifdef DEBUG_SEQ_NUM
         printf("rank %d received new target comm %u seq %lu target %lu\n",
             g_world_rank, updated_comm, it->second->seq_num, updated_target);
@@ -172,9 +189,13 @@ void commit_begin(MPI_Comm comm) {
   current_phase = IN_CS;
   lookup_comm_clock(comm, &comm_gid, &comm_seq, &comm_target);
   (*comm_seq)++;
-  pthread_mutex_unlock(&seq_num_lock);
-  if (ckpt_pending && *comm_seq > *comm_target) {
+  bool raised = ckpt_pending && *comm_seq > *comm_target;
+  if (raised) {
     *comm_target = *comm_seq;
+  }
+  update_behind();
+  pthread_mutex_unlock(&seq_num_lock);
+  if (raised) {
     seq_num_broadcast(comm, *comm_seq);
   }
 }
@@ -184,7 +205,8 @@ void commit_finish(MPI_Comm comm) {
     return;
   }
   current_phase = IS_READY;
-  while (ckpt_pending && check_seq_nums()) {
+  while (ckpt_pending && check_seq_nums() &&
+         !mana_drain_behind_elsewhere(MANA_LAYER_MPI)) {
     MPI_Status status;
     int flag;
     MPI_Iprobe_internal(MPI_ANY_SOURCE, MPI_ANY_TAG, g_world_comm, &flag,
@@ -203,6 +225,7 @@ void commit_finish(MPI_Comm comm) {
         target.find(updated_comm);
       if (it != target.end() && it->second < updated_target) {
         target[updated_comm] = updated_target;
+        update_behind();
 #ifdef DEBUG_SEQ_NUM
         printf("rank %d received new target comm %u seq %lu target %lu\n",
             g_world_rank, updated_comm, it->second->seq_num, updated_target);
@@ -318,19 +341,29 @@ try_drain_mpi_collective(int attemptId)
   return false;
 }
 
+// The attempt that the next drain_mpi_collective() starts with: each pass of
+// the layers' agreements (mana_core.h) goes on with the attempts' numbers,
+// whose names the KVDB and the barriers take.
+static int next_attempt;
+
 void
 drain_mpi_collective()
 {
-  int attemptId = 0;
+  if (mana_drain_pass() == 0) {
+    next_attempt = 0;
+  }
+  int attemptId = next_attempt;
 
   while (true) {
     // Publish our seq_num to kvdb.
     pthread_mutex_lock(&seq_num_lock);
     ckpt_pending = true;
     share_seq_nums(attemptId);
+    update_behind();
     pthread_mutex_unlock(&seq_num_lock);
 
     if (try_drain_mpi_collective(attemptId)) {
+      next_attempt = attemptId + 1;
       return;
     }
 
@@ -339,6 +372,7 @@ drain_mpi_collective()
     // continue for a bit.
     pthread_mutex_lock(&seq_num_lock);
     ckpt_pending = false;
+    mana_drain_set_behind(MANA_LAYER_MPI, 0);
     pthread_mutex_unlock(&seq_num_lock);
 
     sleep(1);

@@ -389,19 +389,24 @@ front_register()
 }
 
 // The CUDA layer's steps (mana_core.h).  Called by libmana.so (mana_core.cpp)
-// on the checkpoint thread: MANA_STEP_DRAIN while the application's threads
-// run, the others with the lower half closed to them; MANA_STEP_THREAD_EXIT,
-// on an exiting thread; MANA_STEP_DRAIN_MEMOPS, in an MPI call.  The other
-// steps are not the front's.
+// on the checkpoint thread: MANA_STEP_AGREE and MANA_STEP_AGREED while the
+// application's threads run, the others with the lower half closed to them;
+// MANA_STEP_THREAD_EXIT, on an exiting thread; MANA_STEP_DRAIN_MEMOPS, in an
+// MPI call.  The other steps are not the front's.
 extern "C" void
 mana_cuda_event(int event)
 {
   switch (event) {
-    case MANA_STEP_DRAIN:
+    case MANA_STEP_AGREE:
       // NCCL's kernels wait for every member of their communicator: the
       // ranks agree where to stop before the GPUs can quiesce.
       if (front_nccl_drain != NULL) {
         front_nccl_drain();
+      }
+      break;
+    case MANA_STEP_AGREED:
+      if (front_nccl_agreed != NULL) {
+        front_nccl_agreed();
       }
       break;
     case MANA_STEP_QUIESCE: {

@@ -727,6 +727,67 @@ mana_global_barrier(const char *id)
   dmtcp_global_barrier(id);
 }
 
+// The agreement (MANA_STEP_AGREE): each layer's flag, whether this rank owes
+// its peers in that layer; the pass; whether a layer asked for another.
+static int drain_behind[MANA_NUM_LAYERS];
+static int drain_pass;
+static bool drain_again;
+
+extern "C" void
+mana_drain_set_behind(int layer, int behind)
+{
+  if (layer >= 0 && layer < MANA_NUM_LAYERS) {
+    __atomic_store_n(&drain_behind[layer], behind != 0, __ATOMIC_RELEASE);
+  }
+}
+
+extern "C" int
+mana_drain_behind_elsewhere(int layer)
+{
+  for (int i = 0; i < MANA_NUM_LAYERS; i++) {
+    if (i != layer && __atomic_load_n(&drain_behind[i], __ATOMIC_ACQUIRE)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+extern "C" void
+mana_drain_again(void)
+{
+  drain_again = true;
+}
+
+extern "C" int
+mana_drain_pass(void)
+{
+  return drain_pass;
+}
+
+// The layers' agreements, in passes until one in which no layer asks for
+// another (mana_core.h).
+static void
+agree()
+{
+  for (drain_pass = 0;; drain_pass++) {
+    drain_again = false;
+    run_layers(MANA_STEP_AGREE, true);
+    run_layers(MANA_STEP_AGREED, true);
+    if (!drain_again) {
+      break;
+    }
+  }
+}
+
+// At the start of a checkpoint: no flag of the last one counts.
+static void
+forget_behind()
+{
+  for (int i = 0; i < MANA_NUM_LAYERS; i++) {
+    mana_drain_set_behind(i, 0);
+  }
+}
+
 static void
 mana_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 {
@@ -824,8 +885,10 @@ mana_event_hook(DmtcpEvent_t event, DmtcpEventData_t *data)
 
     case DMTCP_EVENT_PRESUSPEND: {
       printEventToStderr("EVENT_PRESUSPEND (finish collective op's)");
+      forget_behind();
       run_layers(MANA_STEP_WAIT_FOR_INIT);
       mana_state = CKPT_COLLECTIVE;  // Not RUNNING: the checkpoint has begun.
+      agree();
       run_layers(MANA_STEP_DRAIN, true);
       openCkptFileFds();
       // No thread may be in the lower half when DMTCP suspends the threads.

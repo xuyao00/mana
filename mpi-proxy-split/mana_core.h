@@ -49,11 +49,15 @@ enum ManaLayer {
 enum ManaStep {
   // DMTCP_EVENT_PRESUSPEND
   MANA_STEP_WAIT_FOR_INIT = 1,  // until the layer can drain (MPI_Init)
+  MANA_STEP_AGREE,      // in reverse order, in passes: bring the ranks to a
+                        // point where none waits for another (NCCL's drain,
+                        // MPI's Collective Clock), with the application's
+                        // threads running; see mana_drain_again()
+  MANA_STEP_AGREED,     // then, in reverse order: whether the rank has run
+                        // past where the layer's agreement left it
   MANA_STEP_DRAIN,      // in reverse order: complete the communication in
-                        // flight.  The CUDA layer's (NCCL) needs the
-                        // application's threads in the lower half, and the
-                        // MPI layer's closes it; the core closes it after
-                        // the step, if still open
+                        // flight.  The MPI layer's closes the lower half;
+                        // the core closes it after the step, if still open
   MANA_STEP_QUIESCE,    // --cuda, the lower half closed: wait for the GPUs
   MANA_STEP_STASH,      // then, after a global barrier: copy device data
   // DMTCP_EVENT_PRECHECKPOINT, with the threads suspended
@@ -103,6 +107,23 @@ void mana_ckpt_kv_update(const char *what, const char *key, int op,
 int64_t mana_ckpt_kv_get(const char *what, const char *key);
 // A barrier of every rank's checkpoint thread.
 void mana_global_barrier(const char *id);
+
+// The agreement (MANA_STEP_AGREE).  A layer's gate holds an application
+// thread at the layer's next call once this rank owes its peers nothing in
+// that layer.  But the program may interleave the layers' calls (NCCL and
+// MPI), so a rank that owes one layer must pass every gate: each layer says
+// whether this rank owes in it, from the application's threads or the
+// checkpoint thread, and its gate lets threads through while another layer
+// says so.
+void mana_drain_set_behind(int layer, int behind);
+int mana_drain_behind_elsewhere(int layer);
+// So a later layer's agreement may let a rank run past where an earlier
+// layer's left it.  A layer that finds so in its MANA_STEP_AGREED asks for
+// another pass, which every rank must do alike.  The core runs passes until
+// one in which no layer asks.
+void mana_drain_again(void);
+// The pass, from 0.
+int mana_drain_pass(void);
 
 #ifdef __cplusplus
 }

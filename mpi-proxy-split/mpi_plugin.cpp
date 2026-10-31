@@ -252,6 +252,9 @@ close_lower_half_except_blocked()
   g_drain_stats.t_wait_lower_half += drainStatsNow() - t;
 }
 
+// When this checkpoint's agreement began, for the drain's statistics.
+static uint64_t g_drain_t0;
+
 // The MPI layer's steps (mana_core.h), on the checkpoint thread.
 static void
 mpi_layer_step(int step)
@@ -267,13 +270,22 @@ mpi_layer_step(int step)
       break;
     }
 
-    case MANA_STEP_DRAIN: {
-      resetDrainStats();  // p2p_drain_send_recv.cpp
-      uint64_t t0 = drainStatsNow();
+    case MANA_STEP_AGREE: {
+      // In each pass of the layers' agreements (mana_core.h): the Collective
+      // Clock.  A later pass starts from the last one's targets.
+      if (mana_drain_pass() == 0) {
+        resetDrainStats();  // p2p_drain_send_recv.cpp
+        g_drain_t0 = drainStatsNow();
+      }
       mana_state = CKPT_COLLECTIVE;
       // preSuspendBarrier() will send coord response and get worker state.
       // FIXME:  See commant at: dmtcpplugin.cpp:'case DMTCP_EVENT_PRESUSPEND'
       drain_mpi_collective();
+      break;
+    }
+
+    case MANA_STEP_DRAIN: {
+      uint64_t t0 = g_drain_t0;
       // From here on, the checkpoint thread calls MPI.  With
       // MANA_P2P_WAIT=polling, no thread waits in the lower half for the
       // drain, so close it now (the lower half runs as MPI_THREAD_SINGLE).  In

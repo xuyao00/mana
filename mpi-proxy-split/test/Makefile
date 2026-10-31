@@ -45,9 +45,9 @@ E2E_CUDA = $(if $(NVCC),cuda_nompi cuda_quiesce cuda_pools cuda_managed \
              cuda_drvgraphs \
              $(if $(filter yes,${MANA_MPI}),${E2E_CUDA_MPI}))
 # NCCL, with NCCL's front (configure's MANA_NCCL, NCCL_LIB and NCCL_INCLUDE);
-# nccl_nompi without MPI.
+# nccl_nompi without MPI; nccl_mpi, NCCL and MPI calls interleaved.
 E2E_NCCL = $(if $(NVCC),$(if $(filter yes,${MANA_NCCL}),nccl_nompi $(if \
-             $(filter yes,${MANA_MPI}),nccl)))
+             $(filter yes,${MANA_MPI}),nccl nccl_mpi)))
 
 # What MANA builds (configure's MANA_MPI and MANA_CUDA): the MPI tests with
 # the MPI layer, and the suite also runs the example of ../examples
@@ -147,6 +147,10 @@ nccl: nccl.cu mana_test.h
 	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $< \
 	  $(NCCL_FLAGS)
 
+nccl_mpi: nccl_mpi.cu mana_test.h
+	$(NVCC) -g -O0 -ccbin $(firstword $(MPICXX)) -cudart=shared -o $@ $< \
+	  $(NCCL_FLAGS)
+
 nccl_nompi: nccl.cu mana_test.h
 	$(NVCC) -g -O0 -cudart=shared -DMT_NO_MPI -DTEST_NAME='"nccl_nompi"' \
 	  -o $@ $< $(NCCL_FLAGS)
@@ -190,6 +194,6 @@ tidy:
 clean: tidy
 	rm -f *.pyc *.so
 	rm -f ${E2E_TESTS} ${E2E_FORTRAN} ${BENCH_FILES} ${E2E_CUDA} nccl \
-	  nccl_nompi
+	  nccl_nompi nccl_mpi
 	rm -f cuda_driver_kernels.h cuda_driver_kernels.ptx \
 	  cuda_driver_kernels.fatbin

@@ -25,17 +25,23 @@
 // config; and what the drain needs: the steps posted on it, and the bytes
 // sent to and received from each peer.
 //
-// The drain (front_nccl_drain(), at MANA_STEP_DRAIN, before MPI's drain
-// closes the lower half).  NCCL's kernels wait for every member of their
+// The drain (front_nccl_drain(), at MANA_STEP_AGREE, before MPI's
+// Collective Clock).  NCCL's kernels wait for every member of their
 // communicator, so the GPUs quiesce only once the members have posted the
 // same operations.  As in netsplit's drain (~/nccl-mana-ckpt, branch
 // netsplit: nccl_wrappers.c and libncclplugin.c), the ranks agree on how
-// many steps each communicator takes and how many bytes each pair sends;
-// a rank that is behind lets its threads run until it is there, and the
-// others' threads wait at their next NCCL call (the gate).  This assumes
-// that the program does not interleave NCCL and MPI: a rank held at the
-// gate before NCCL operation k+1 never reaches an MPI_Send that a peer
-// waits for before it posts k.
+// many steps each communicator takes and how many bytes and signals each
+// pair sends; a rank that is behind lets its threads run until it is there,
+// and the others' threads wait at their next NCCL call (the gate).
+//
+// The program may interleave NCCL and MPI calls, in orders that differ by
+// rank.  A rank held at NCCL's gate may owe MPI a collective that comes after
+// the NCCL call in its program, and one held at MPI's may owe NCCL: a rank
+// that owes either passes both gates (mana_drain_behind_elsewhere()), and
+// the layers' agreements run in passes until neither moves
+// (front_nccl_agreed()).  A rank behind may also wait outside both, for an
+// MPI message that its peer sends after an NCCL call its gate holds: when
+// nothing moves for a second, every rank lets one more call through.
 //
 // A resume changes nothing in the lower half, so the communicators stay.  A
 // restart makes each again by ncclCommInitRank(Config), a split too (as
@@ -194,6 +200,13 @@ bool frozen;                   // settled in the drain's last round
 bool creation_pending;         // a rank had a creation in flight at the vote
 int activity;                  // threads in a call, or in a group region
 int creating;                  // creations by unique id in flight here
+// The calls that posted or made something, ever; and their number when the
+// drain agreed in this pass (front_nccl_agreed()).
+int64_t posts;
+int64_t posts_agreed;
+// Calls that may pass a closed gate, when the drain stalls
+// (front_nccl_drain()).
+int allowance;
 int cliques;
 // The names of the unique ids that this process made and has not used.
 std::vector<uint64_t> unused_ids;
@@ -261,16 +274,31 @@ behind_locked()
   return false;
 }
 
-// The gate holds a call during a drain unless this rank is behind, or a
-// creation is in flight somewhere: a unique id names no members, so nobody
-// knows who must still join it.  A rank without a communicator is not held
-// either, since its call makes one, with peers that may be in the
-// rendezvous already.  Once this rank settles, nothing passes until the
-// next round.
+// This rank's flag in the layers' agreement (mana_core.h), which opens the
+// other layers' gates (MPI's collectives): NCCL calls may come after their
+// calls in the program.
+void
+update_behind_locked()
+{
+  if (draining) {
+    mana_drain_set_behind(MANA_LAYER_CUDA, behind_locked());
+  }
+}
+
+// The gate holds a call during a drain unless this rank is behind, here or
+// in another layer (MPI), whose calls may come after this one in the
+// program; or a creation is in flight somewhere: a unique id names no
+// members, so nobody knows who must still join it.  A rank without a
+// communicator is not held either, since its call makes one, with peers that
+// may be in the rendezvous already.  Once this rank settles, nothing else
+// passes until the next round.
 bool
 gate_closed_locked()
 {
   if (!draining) {
+    return false;
+  }
+  if (mana_drain_behind_elsewhere(MANA_LAYER_CUDA)) {
     return false;
   }
   if (frozen) {
@@ -313,18 +341,26 @@ enter_counts(const Count *counts, size_t ncounts, bool create)
     // thread that DMTCP suspended here may hold; so a thread may miss
     // their notify, and looks again now and then.
     while (gate_closed_locked()) {
+      if (allowance > 0) {
+        allowance--;
+        break;
+      }
       gate_cv.wait_for(lock, std::chrono::milliseconds(50));
     }
   }
+  bool counted = create;
   for (size_t i = 0; i < ncounts; i++) {
     if (counts[i].at != NULL) {
       *counts[i].at += counts[i].n;
+      counted = true;
     }
   }
+  posts += counted;
   activity++;
   if (create) {
     creating++;
   }
+  update_behind_locked();
 }
 
 // After the call; a call that failed takes back what enter_counts() added.
@@ -351,6 +387,7 @@ leave_counts(bool ok, const Count *counts, size_t ncounts, bool create)
   if (create && (group_depth == 0 || !ok)) {
     creating--;
   }
+  update_behind_locked();
 }
 
 void
@@ -822,6 +859,7 @@ adopt_targets()
       }
     }
   }
+  update_behind_locked();
   gate_cv.notify_all();
 }
 
@@ -1325,19 +1363,26 @@ restore_suspended()
 
 }  // namespace
 
-// MANA_STEP_DRAIN, before MPI's drain, with the application's threads
-// running.  In rounds: (1) adopt the targets that the members published;
-// (2) let this rank's threads catch up, for one slice at most; (3) publish
-// this rank's position and decide whether it is settled; (4) vote, with a
-// barrier of every rank.  Done when no rank is unsettled.  Targets only
-// grow, so the rounds converge: a rank told to catch up on one
+// MANA_STEP_AGREE, in each pass before MPI's, with the application's
+// threads running.  In rounds: (1) adopt the targets that the members
+// published; (2) let this rank's threads catch up, for one slice at most;
+// (3) publish this rank's position and decide whether it is settled; (4)
+// vote, with a barrier of every rank.  Done when no rank is unsettled.
+// Targets only grow, so the rounds converge: a rank told to catch up on one
 // communicator may overshoot on another, and the next round takes it.  A
 // slice is short (10 ms, doubling up to 1 s while a rank catches up),
 // because catching up may need a peer that learns of it only from this
-// rank's next publication.  Then the gate stays closed until the resume.
+// rank's next publication.  Then the gate stays closed until the resume,
+// but for a rank that owes MPI (mana_core.h).
+//
+// A rank behind may wait for a peer outside NCCL: an MPI message that the
+// peer sends after an NCCL call that its gate holds.  When ranks are behind
+// and no rank has posted anything for a second, every rank lets one more
+// call through its gate.
 void
 front_nccl_drain()
 {
+  int pass = mana_drain_pass();
   int64_t steps0, bytes0;
   {
     std::lock_guard<std::mutex> guard(nccl_lock);
@@ -1345,6 +1390,7 @@ front_nccl_drain()
     draining = true;
     frozen = false;
     creation_pending = false;
+    allowance = 0;
     for (Comm *c : comms) {
       c->target = -1;
       for (Traffic &t : c->traffic) {
@@ -1356,6 +1402,9 @@ front_nccl_drain()
   long slice_ms = 10;
   long waited_ms = 0;
   long next_report_ms = 60000;
+  long stalled_ms = 0;
+  int64_t last_posts = -1;
+  int stalls = 0;
   for (int round = 0;; round++) {
     adopt_targets();
 
@@ -1370,23 +1419,29 @@ front_nccl_drain()
     int in_flight = 0;
     bool settled = settle(in_progress(), &pubs, &behind, &in_flight);
     publish(pubs);
+    int64_t my_posts;
+    {
+      std::lock_guard<std::mutex> guard(nccl_lock);
+      my_posts = posts;
+    }
 
-    char k[32];
+    // Keys and the barrier of this pass and round.
+    char k[4][48];
     char barrier[48];
-    snprintf(k, sizeof k, "u/%d", round);
-    mana_ckpt_kv_update(KV, k, MANA_KV_ADD, !settled);
-    snprintf(k, sizeof k, "w/%d", round);
-    mana_ckpt_kv_update(KV, k, MANA_KV_ADD, behind);
-    snprintf(k, sizeof k, "c/%d", round);
-    mana_ckpt_kv_update(KV, k, MANA_KV_ADD, in_flight);
-    snprintf(barrier, sizeof barrier, "MANA:NCCL-drain-%06d", round);
+    snprintf(k[0], sizeof k[0], "u/%d/%d", pass, round);
+    snprintf(k[1], sizeof k[1], "w/%d/%d", pass, round);
+    snprintf(k[2], sizeof k[2], "c/%d/%d", pass, round);
+    snprintf(k[3], sizeof k[3], "n/%d/%d", pass, round);
+    mana_ckpt_kv_update(KV, k[0], MANA_KV_ADD, !settled);
+    mana_ckpt_kv_update(KV, k[1], MANA_KV_ADD, behind);
+    mana_ckpt_kv_update(KV, k[2], MANA_KV_ADD, in_flight);
+    mana_ckpt_kv_update(KV, k[3], MANA_KV_ADD, my_posts);
+    snprintf(barrier, sizeof barrier, "MANA:NCCL-drain-%d-%06d", pass, round);
     mana_global_barrier(barrier);
-    snprintf(k, sizeof k, "u/%d", round);
-    int64_t unsettled = mana_ckpt_kv_get(KV, k);
-    snprintf(k, sizeof k, "w/%d", round);
-    int64_t waiting = mana_ckpt_kv_get(KV, k);
-    snprintf(k, sizeof k, "c/%d", round);
-    int64_t creations = mana_ckpt_kv_get(KV, k);
+    int64_t unsettled = mana_ckpt_kv_get(KV, k[0]);
+    int64_t waiting = mana_ckpt_kv_get(KV, k[1]);
+    int64_t creations = mana_ckpt_kv_get(KV, k[2]);
+    int64_t all_posts = mana_ckpt_kv_get(KV, k[3]);
 
     if (unsettled == 0) {
       // Every member of a destroyed communicator has destroyed it now.
@@ -1399,19 +1454,38 @@ front_nccl_drain()
         delete *it;
       }
       comms.erase(gone, comms.end());
+      posts_agreed = posts;
+      allowance = 0;
+      update_behind_locked();
       front_log("NCCL drain: %d round(s), %zu communicator(s); %lld step(s) "
-                "and %lld B of sends and receives posted meanwhile\n",
-                round + 1, comms.size(), (long long)(steps - steps0),
-                (long long)(bytes - bytes0));
+                "and %lld B of sends and receives posted meanwhile; %d "
+                "stall(s)\n", round + 1, comms.size(),
+                (long long)(steps - steps0), (long long)(bytes - bytes0),
+                stalls);
       return;
     }
+    // Every rank reads the same votes, so the slices and the stalls agree.
+    bool stalled = false;
+    if (waiting > 0 && creations == 0 && all_posts == last_posts) {
+      stalled_ms += slice_ms;
+      if (stalled_ms >= 1000) {
+        stalled = true;
+        stalled_ms = 0;
+        stalls++;
+      }
+    } else {
+      stalled_ms = 0;
+    }
+    last_posts = all_posts;
     {
       std::lock_guard<std::mutex> guard(nccl_lock);
       frozen = false;
       creation_pending = creations > 0;
+      if (stalled) {
+        allowance = 1;
+      }
     }
     gate_cv.notify_all();
-    // Every rank reads the same votes, so the slices agree.
     if (waiting > 0 || creations > 0) {
       waited_ms += slice_ms;
       slice_ms = std::min(2 * slice_ms, 1000L);
@@ -1423,12 +1497,40 @@ front_nccl_drain()
   }
 }
 
+// MANA_STEP_AGREED: whether a rank posted on NCCL after the drain agreed in
+// this pass, as one that owed MPI may; then the layers take another pass
+// (mana_core.h).
+void
+front_nccl_agreed()
+{
+  int pass = mana_drain_pass();
+  bool moved;
+  {
+    std::lock_guard<std::mutex> guard(nccl_lock);
+    moved = posts != posts_agreed;
+  }
+  char k[32];
+  char barrier[48];
+  snprintf(k, sizeof k, "m/%d", pass);
+  mana_ckpt_kv_update(KV, k, MANA_KV_ADD, moved);
+  snprintf(barrier, sizeof barrier, "MANA:NCCL-agreed-%d", pass);
+  mana_global_barrier(barrier);
+  int64_t ranks = mana_ckpt_kv_get(KV, k);
+  if (ranks > 0) {
+    front_log("NCCL: %lld rank(s) posted after the drain of pass %d\n",
+              (long long)ranks, pass);
+    mana_drain_again();
+  }
+}
+
 // MANA_STEP_RESUME: the gate opens.  Without the lock, which a thread that
 // DMTCP suspended at the gate may hold (see enter()).
 void
 front_nccl_resume()
 {
   draining = false;
+  allowance = 0;
+  mana_drain_set_behind(MANA_LAYER_CUDA, 0);
   gate_cv.notify_all();
 }
 
@@ -1484,6 +1586,7 @@ front_nccl_rebuild()
               suspended);
   }
   draining = false;
+  mana_drain_set_behind(MANA_LAYER_CUDA, 0);
   gate_cv.notify_all();
 }
 
